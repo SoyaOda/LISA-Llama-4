@@ -6,19 +6,24 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, BitsAndBytesConfig, CLIPImageProcessor
+from transformers import AutoTokenizer, BitsAndBytesConfig, AutoProcessor
 
-from model.LISA import LISAForCausalLM
-from model.llava import conversation as conversation_lib
-from model.llava.mm_utils import tokenizer_image_token
+from model.llama3_2 import Llama32SAMForCausalLM, Llama32SAMConfig
+from model.llama3_2.hf_auth import login_huggingface
+from model.llama3_2.processor_utils import prepare_llama32_prompt, postprocess_llama32_output
 from model.segment_anything.utils.transforms import ResizeLongestSide
-from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                         DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX)
+from model.llama3_2.utils import (
+    BEGIN_OF_TEXT_TOKEN, 
+    IMAGE_TOKEN, 
+    preprocess_image_for_sam
+)
 
 
 def parse_args(args):
-    parser = argparse.ArgumentParser(description="LISA chat")
-    parser.add_argument("--version", default="xinlai/LISA-13B-llama2-v1")
+    parser = argparse.ArgumentParser(description="Llama3.2 Vision + SAM chat")
+    parser.add_argument("--version", default="meta-llama/Llama-3.2-11B-Vision-Instruct")
+    parser.add_argument("--model_type", choices=["llama3_2"], default="llama3_2", 
+                        help="Model type to use: llama3_2 (Llama3.2 Vision + SAM)")
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument(
         "--precision",
@@ -33,16 +38,14 @@ def parse_args(args):
     parser.add_argument(
         "--vision-tower", default="openai/clip-vit-large-patch14", type=str
     )
+    parser.add_argument("--vision_pretrained", default="./checkpoints/sam_vit_h_4b8939.pth", type=str,
+                        help="Path to the SAM vision encoder checkpoint")
     parser.add_argument("--local-rank", default=0, type=int, help="node rank")
     parser.add_argument("--load_in_8bit", action="store_true", default=False)
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
     parser.add_argument("--use_mm_start_end", action="store_true", default=True)
-    parser.add_argument(
-        "--conv_type",
-        default="llava_v1",
-        type=str,
-        choices=["llava_v1", "llava_llama_2"],
-    )
+    parser.add_argument("--hf_token", default=None, type=str, 
+                        help="Hugging Face token for downloading models")
     return parser.parse_args(args)
 
 
@@ -67,7 +70,11 @@ def main(args):
     args = parse_args(args)
     os.makedirs(args.vis_save_path, exist_ok=True)
 
-    # Create model
+    # Hugging Faceにログイン
+    if args.hf_token:
+        login_huggingface(args.hf_token)
+
+    # トークナイザーの設定
     tokenizer = AutoTokenizer.from_pretrained(
         args.version,
         cache_dir=None,
@@ -76,9 +83,15 @@ def main(args):
         use_fast=False,
     )
     tokenizer.pad_token = tokenizer.unk_token
-    args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
+    
+    # [SEG]トークンをトークナイザーに追加
+    if "[SEG]" not in tokenizer.get_vocab():
+        tokenizer.add_tokens(["[SEG]"])
+    
+    # [SEG]トークンのIDを取得
+    args.seg_token_idx = tokenizer.convert_tokens_to_ids("[SEG]")
 
-
+    # 精度の設定
     torch_dtype = torch.float32
     if args.precision == "bf16":
         torch_dtype = torch.bfloat16
@@ -111,118 +124,122 @@ def main(args):
             }
         )
 
-    model = LISAForCausalLM.from_pretrained(
-        args.version, low_cpu_mem_usage=True, vision_tower=args.vision_tower, seg_token_idx=args.seg_token_idx, **kwargs
+    # Llama3.2 + SAMモデルの初期化
+    print(f"Loading Llama3.2 Vision + SAM model from {args.version}")
+    
+    # カスタム設定クラスの作成
+    config = Llama32SAMConfig(
+        model_id=args.version,
+        precision=args.precision,
+        train_mask_decoder=False,
+        out_dim=256,  # SAMのプロンプトエンコーダの次元数
+        hidden_size=4096,  # Llama3.2-11Bの隠れ次元
+        vision_tower=args.vision_tower,
+        mm_vision_tower=args.vision_tower,
+        mm_use_im_start_end=args.use_mm_start_end,
+        seg_token_idx=args.seg_token_idx,
+        vision_pretrained=args.vision_pretrained
+    )
+    
+    # モデルの初期化
+    model = Llama32SAMForCausalLM(
+        config, 
+        seg_token_idx=args.seg_token_idx,
+        vision_pretrained=args.vision_pretrained,
+        **kwargs
     )
 
-    model.config.eos_token_id = tokenizer.eos_token_id
-    model.config.bos_token_id = tokenizer.bos_token_id
-    model.config.pad_token_id = tokenizer.pad_token_id
-
-    model.get_model().initialize_vision_modules(model.get_model().config)
-    vision_tower = model.get_model().get_vision_tower()
-    vision_tower.to(dtype=torch_dtype)
-
+    # モデルの精度を設定
     if args.precision == "bf16":
         model = model.bfloat16().cuda()
-    elif (
-        args.precision == "fp16" and (not args.load_in_4bit) and (not args.load_in_8bit)
-    ):
-        vision_tower = model.get_model().get_vision_tower()
-        model.model.vision_tower = None
-        import deepspeed
-
-        model_engine = deepspeed.init_inference(
-            model=model,
-            dtype=torch.half,
-            replace_with_kernel_inject=True,
-            replace_method="auto",
-        )
-        model = model_engine.module
-        model.model.vision_tower = vision_tower.half().cuda()
+    elif args.precision == "fp16" and (not args.load_in_4bit) and (not args.load_in_8bit):
+        model = model.half().cuda()
     elif args.precision == "fp32":
         model = model.float().cuda()
 
-    vision_tower = model.get_model().get_vision_tower()
-    vision_tower.to(device=args.local_rank)
-
-    clip_image_processor = CLIPImageProcessor.from_pretrained(model.config.vision_tower)
+    # 画像変換用のtransform
     transform = ResizeLongestSide(args.image_size)
 
     model.eval()
+    
+    print(f"Model loaded: {args.model_type} - {args.version}")
+    print("Ready for conversation. Type 'exit' to quit.")
 
     while True:
-        conv = conversation_lib.conv_templates[args.conv_type].copy()
-        conv.messages = []
-
         prompt = input("Please input your prompt: ")
-        prompt = DEFAULT_IMAGE_TOKEN + "\n" + prompt
-        if args.use_mm_start_end:
-            replace_token = (
-                DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
-            )
-            prompt = prompt.replace(DEFAULT_IMAGE_TOKEN, replace_token)
-
-        conv.append_message(conv.roles[0], prompt)
-        conv.append_message(conv.roles[1], "")
-        prompt = conv.get_prompt()
+        if prompt.lower() == "exit":
+            break
 
         image_path = input("Please input the image path: ")
         if not os.path.exists(image_path):
             print("File not found in {}".format(image_path))
             continue
 
+        # 画像を読み込み
         image_np = cv2.imread(image_path)
         image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
         original_size_list = [image_np.shape[:2]]
 
-        image_clip = (
-            clip_image_processor.preprocess(image_np, return_tensors="pt")[
-                "pixel_values"
-            ][0]
-            .unsqueeze(0)
-            .cuda()
-        )
+        # SAM用の画像前処理
+        sam_tensor, resize_size, original_size = preprocess_image_for_sam(image_np, transform)
+        sam_tensor = sam_tensor.cuda()
+        
+        # 精度に合わせて変換
         if args.precision == "bf16":
-            image_clip = image_clip.bfloat16()
+            sam_tensor = sam_tensor.bfloat16()
         elif args.precision == "fp16":
-            image_clip = image_clip.half()
+            sam_tensor = sam_tensor.half()
         else:
-            image_clip = image_clip.float()
+            sam_tensor = sam_tensor.float()
 
-        image = transform.apply_image(image_np)
-        resize_list = [image.shape[:2]]
-
-        image = (
-            preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
-            .unsqueeze(0)
-            .cuda()
-        )
+        # Llama3.2 Vision用の処理
+        # 画像をプロセッサで処理
+        image_inputs = model.processor(
+            images=image_np, 
+            return_tensors="pt"
+        ).to("cuda")
+        
+        # 精度変換
         if args.precision == "bf16":
-            image = image.bfloat16()
+            image_inputs = {k: v.bfloat16() if isinstance(v, torch.Tensor) else v for k, v in image_inputs.items()}
         elif args.precision == "fp16":
-            image = image.half()
-        else:
-            image = image.float()
+            image_inputs = {k: v.half() if isinstance(v, torch.Tensor) else v for k, v in image_inputs.items()}
 
-        input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
-        input_ids = input_ids.unsqueeze(0).cuda()
-
+        # プロンプトをトークン化
+        input_text = f"{BEGIN_OF_TEXT_TOKEN}{IMAGE_TOKEN}{prompt}"
+        text_inputs = model.processor(
+            text=input_text,
+            return_tensors="pt"
+        ).to("cuda")
+        
+        # 入力を結合
+        combined_inputs = {
+            **image_inputs,
+            "input_ids": text_inputs["input_ids"],
+            "attention_mask": text_inputs["attention_mask"] if "attention_mask" in text_inputs else None
+        }
+        
+        # 推論
+        print("Generating response...")
         output_ids, pred_masks = model.evaluate(
-            image_clip,
-            image,
-            input_ids,
-            resize_list,
+            image_inputs,
+            sam_tensor,
+            combined_inputs["input_ids"],
+            [resize_size],
             original_size_list,
             max_new_tokens=512,
             tokenizer=tokenizer,
         )
-        output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
 
+        # テキスト出力の処理
+        if hasattr(output_ids, 'sequences'):
+            output_ids = output_ids.sequences[0]
+        
         text_output = tokenizer.decode(output_ids, skip_special_tokens=False)
         text_output = text_output.replace("\n", "").replace("  ", " ")
         print("text_output: ", text_output)
 
+        # マスク出力の処理
         for i, pred_mask in enumerate(pred_masks):
             if pred_mask.shape[0] == 0:
                 continue

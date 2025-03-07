@@ -6,15 +6,16 @@
 <font size=7><div align='center'><b>LISA</b>: Large <b>L</b>anguage <b>I</b>nstructed <b>S</b>egmentation <b>A</b>ssistant</div></font>
 
 <font size=7><div align='center'>
-    <a href="https://arxiv.org/pdf/2308.00692.pdf"><strong>Paper</strong></a> | 
-    <a href="https://huggingface.co/xinlai"><strong>Models</strong></a> | 
-    <a href="#training"><strong>Training</strong></a> | 
-    <a href="#inference"><strong>Inference</strong></a> | 
-    <a href="#deployment"><strong>Local Deployment</strong></a> | 
-    <a href="#dataset"><strong>Dataset</strong></a> | 
-    <a href=""><strong>Online Demo</strong></a> | 
-    <a href="https://huggingface.co/collections/Senqiao/lisa-67713837a32d6abf516a162e"><strong>LISA++ Dataset</strong></a> | 
-    <a href="https://huggingface.co/Senqiao/LISA_Plus_7b"><strong>LISA++ Model</strong></a>
+<a href="https://arxiv.org/pdf/2308.00692.pdf"><strong>Paper</strong></a> |
+<a href="https://huggingface.co/xinlai"><strong>Models</strong></a> |
+<a href="#training"><strong>Training</strong></a> |
+<a href="#inference"><strong>Inference</strong></a> |
+<a href="#deployment"><strong>Local Deployment</strong></a> |
+<a href="#dataset"><strong>Dataset</strong></a> |
+<a href=""><strong>Online Demo</strong></a> |
+<a href="https://huggingface.co/collections/Senqiao/lisa-67713837a32d6abf516a162e"><strong>LISA++ Dataset</strong></a> |
+<a href="https://huggingface.co/Senqiao/LISA_Plus_7b"><strong>LISA++ Model</strong></a>
+
 </div></font>
 
 <!-- <p align="center"> <img src="imgs/teaser.jpg" width="100%"> </p> -->
@@ -82,13 +83,14 @@
 <p align="center"> <img src="imgs/fig_overview.jpg" width="100%"> </p>
 
 ## News
-- [x] [2024.12.30] We released the [LISA++](https://arxiv.org/abs/2312.17240) model and datasets, available [here](https://huggingface.co/collections/Senqiao/lisa-67713837a32d6abf516a162e). Our findings show that incorporating Visual COT data can further enhance the model’s global understanding. We will update the paper soon, stay tuned!
+
+- [x] [2024.12.30] We released the [LISA++](https://arxiv.org/abs/2312.17240) model and datasets, available [here](https://huggingface.co/collections/Senqiao/lisa-67713837a32d6abf516a162e). Our findings show that incorporating Visual COT data can further enhance the model's global understanding. We will update the paper soon, stay tuned!
 - [x] [2024.6.21] LISA is selected as Oral Presentation in CVPR 2024!
 - [x] [2023.8.30] Release three new models [LISA-7B-v1](https://huggingface.co/xinlai/LISA-7B-v1), [LISA-7B-v1-explanatory](https://huggingface.co/xinlai/LISA-7B-v1-explanatory), and [LISA-13B-llama2-v1-explanatory](https://huggingface.co/xinlai/LISA-13B-llama2-v1-explanatory). Welcome to check them out!
 - [x] [2023.8.23] Refactor code, and release new model [LISA-13B-llama2-v1](https://huggingface.co/xinlai/LISA-13B-llama2-v1). Welcome to check it out!
 - [x] [2023.8.9] Training code is released!
-- [x] [2023.8.4] [Online Demo](http://103.170.5.190:7860/) is released! 
-- [x] [2023.8.4] [*ReasonSeg* Dataset](https://drive.google.com/drive/folders/125mewyg5Ao6tZ3ZdJ-1-E3n04LGVELqy?usp=sharing) and the [LISA-13B-llama2-v0-explanatory](https://huggingface.co/xinlai/LISA-13B-llama2-v0-explanatory) model are released! 
+- [x] [2023.8.4] [Online Demo](http://103.170.5.190:7860/) is released!
+- [x] [2023.8.4] [_ReasonSeg_ Dataset](https://drive.google.com/drive/folders/125mewyg5Ao6tZ3ZdJ-1-E3n04LGVELqy?usp=sharing) and the [LISA-13B-llama2-v0-explanatory](https://huggingface.co/xinlai/LISA-13B-llama2-v0-explanatory) model are released!
 - [x] [2023.8.3] Inference code and the [LISA-13B-llama2-v0](https://huggingface.co/xinlai/LISA-13B-llama2-v0) model are released. Welcome to check them out!
 - [x] [2023.8.2] [Paper](https://arxiv.org/pdf/2308.00692.pdf) is released and GitHub repo is created.
 
@@ -111,42 +113,49 @@ Tianyuan Qu,
 [Jiaya Jia](https://scholar.google.com/citations?user=XPAkzTEAAAAJ&hl=en)<br />
 
 ## Abstract
-In this work, we propose a new segmentation task --- ***reasoning segmentation***. The task is designed to output a segmentation mask given a complex and implicit query text. We establish a benchmark comprising over one thousand image-instruction pairs, incorporating intricate reasoning and world knowledge for evaluation purposes. Finally, we present LISA: Large-language Instructed Segmentation Assistant, which inherits the language generation capabilities of the multi-modal Large Language Model (LLM) while also possessing the ability to produce segmentation masks.
+
+In this work, we propose a new segmentation task --- **_reasoning segmentation_**. The task is designed to output a segmentation mask given a complex and implicit query text. We establish a benchmark comprising over one thousand image-instruction pairs, incorporating intricate reasoning and world knowledge for evaluation purposes. Finally, we present LISA: Large-language Instructed Segmentation Assistant, which inherits the language generation capabilities of the multi-modal Large Language Model (LLM) while also possessing the ability to produce segmentation masks.
 For more details, please refer to the [paper](https://arxiv.org/abs/2308.00692).
 
 ## Highlights
-**LISA** unlocks the new segmentation capabilities of multi-modal LLMs, and can handle cases involving: 
-1. complex reasoning; 
-2. world knowledge; 
-3. explanatory answers; 
-4. multi-turn conversation. 
+
+**LISA** unlocks the new segmentation capabilities of multi-modal LLMs, and can handle cases involving:
+
+1. complex reasoning;
+2. world knowledge;
+3. explanatory answers;
+4. multi-turn conversation.
 
 **LISA** also demonstrates robust zero-shot capability when trained exclusively on reasoning-free datasets. In addition, fine-tuning the model with merely 239 reasoning segmentation image-instruction pairs results in further performance enhancement.
 
 ## Experimental results
+
 <p align="center"> <img src="imgs/table1.jpg" width="80%"> </p>
 
 ## Installation
+
 ```
 pip install -r requirements.txt
 pip install flash-attn --no-build-isolation
 ```
 
 ## Training
+
 ### Training Data Preparation
+
 The training data consists of 4 types of data:
 
 1. Semantic segmentation datasets: [ADE20K](http://data.csail.mit.edu/places/ADEchallenge/ADEChallengeData2016.zip), [COCO-Stuff](http://calvin.inf.ed.ac.uk/wp-content/uploads/data/cocostuffdataset/stuffthingmaps_trainval2017.zip), [Mapillary](https://www.mapillary.com/dataset/vistas), [PACO-LVIS](https://github.com/facebookresearch/paco/tree/main#dataset-setup), [PASCAL-Part](https://github.com/facebookresearch/VLPart/tree/main/datasets#pascal-part), [COCO Images](http://images.cocodataset.org/zips/train2017.zip)
 
-    Note: For COCO-Stuff, we use the annotation file stuffthingmaps_trainval2017.zip. We only use the PACO-LVIS part in PACO. COCO Images should be put into the `dataset/coco/` directory.
+   Note: For COCO-Stuff, we use the annotation file stuffthingmaps_trainval2017.zip. We only use the PACO-LVIS part in PACO. COCO Images should be put into the `dataset/coco/` directory.
 
-3. Referring segmentation datasets: [refCOCO](https://web.archive.org/web/20220413011718/https://bvisionweb1.cs.unc.edu/licheng/referit/data/refcoco.zip), [refCOCO+](https://web.archive.org/web/20220413011656/https://bvisionweb1.cs.unc.edu/licheng/referit/data/refcoco+.zip), [refCOCOg](https://web.archive.org/web/20220413012904/https://bvisionweb1.cs.unc.edu/licheng/referit/data/refcocog.zip), [refCLEF](https://web.archive.org/web/20220413011817/https://bvisionweb1.cs.unc.edu/licheng/referit/data/refclef.zip) ([saiapr_tc-12](https://web.archive.org/web/20220515000000/http://bvisionweb1.cs.unc.edu/licheng/referit/data/images/saiapr_tc-12.zip)) 
+2. Referring segmentation datasets: [refCOCO](https://web.archive.org/web/20220413011718/https://bvisionweb1.cs.unc.edu/licheng/referit/data/refcoco.zip), [refCOCO+](https://web.archive.org/web/20220413011656/https://bvisionweb1.cs.unc.edu/licheng/referit/data/refcoco+.zip), [refCOCOg](https://web.archive.org/web/20220413012904/https://bvisionweb1.cs.unc.edu/licheng/referit/data/refcocog.zip), [refCLEF](https://web.archive.org/web/20220413011817/https://bvisionweb1.cs.unc.edu/licheng/referit/data/refclef.zip) ([saiapr_tc-12](https://web.archive.org/web/20220515000000/http://bvisionweb1.cs.unc.edu/licheng/referit/data/images/saiapr_tc-12.zip))
 
-    Note: the original links of refCOCO series data are down, and we update them with new ones. If the download speed is super slow or unstable, we also provide a [OneDrive link](https://mycuhk-my.sharepoint.com/:f:/g/personal/1155154502_link_cuhk_edu_hk/Em5yELVBvfREodKC94nOFLoBLro_LPxsOxNV44PHRWgLcA?e=zQPjsc) to download. **You must also follow the rules that the original datasets require.**
+   Note: the original links of refCOCO series data are down, and we update them with new ones. If the download speed is super slow or unstable, we also provide a [OneDrive link](https://mycuhk-my.sharepoint.com/:f:/g/personal/1155154502_link_cuhk_edu_hk/Em5yELVBvfREodKC94nOFLoBLro_LPxsOxNV44PHRWgLcA?e=zQPjsc) to download. **You must also follow the rules that the original datasets require.**
 
-4. Visual Question Answering dataset: [LLaVA-Instruct-150k](https://huggingface.co/datasets/liuhaotian/LLaVA-Instruct-150K/blob/main/llava_instruct_150k.json)
+3. Visual Question Answering dataset: [LLaVA-Instruct-150k](https://huggingface.co/datasets/liuhaotian/LLaVA-Instruct-150K/blob/main/llava_instruct_150k.json)
 
-5. Reasoning segmentation dataset: [ReasonSeg](https://github.com/dvlab-research/LISA#dataset)
+4. Reasoning segmentation dataset: [ReasonSeg](https://github.com/dvlab-research/LISA#dataset)
 
 Download them from the above links, and organize them as follows.
 
@@ -177,7 +186,7 @@ Download them from the above links, and organize them as follows.
 │   │       └── explanatory
 │   ├── refer_seg
 │   │   ├── images
-│   │   |   ├── saiapr_tc-12 
+│   │   |   ├── saiapr_tc-12
 │   │   |   └── mscoco
 │   │   |       └── images
 │   │   |           └── train2014
@@ -196,12 +205,15 @@ Download them from the above links, and organize them as follows.
 ### Pre-trained weights
 
 #### LLaVA
+
 To train LISA-7B or 13B, you need to follow the [instruction](https://github.com/haotian-liu/LLaVA/blob/main/docs/MODEL_ZOO.md) to merge the LLaVA delta weights. Typically, we use the final weights `LLaVA-Lightning-7B-v1-1` and `LLaVA-13B-v1-1` merged from `liuhaotian/LLaVA-Lightning-7B-delta-v1-1` and `liuhaotian/LLaVA-13b-delta-v1-1`, respectively. For Llama2, we can directly use the LLaVA full weights `liuhaotian/llava-llama-2-13b-chat-lightning-preview`.
 
 #### SAM ViT-H weights
+
 Download SAM ViT-H pre-trained weights from the [link](https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth).
 
 ### Training
+
 ```
 deepspeed --master_port=24999 train_ds.py \
   --version="PATH_TO_LLaVA" \
@@ -211,13 +223,17 @@ deepspeed --master_port=24999 train_ds.py \
   --sample_rates="9,3,3,1" \
   --exp_name="lisa-7b"
 ```
+
 When training is finished, to get the full model weight:
+
 ```
 cd ./runs/lisa-7b/ckpt_model && python zero_to_fp32.py . ../pytorch_model.bin
 ```
 
 ### Merge LoRA Weight
+
 Merge the LoRA weights of `pytorch_model.bin`, save the resulting model into your desired path in the Hugging Face format:
+
 ```
 CUDA_VISIBLE_DEVICES="" python merge_lora_weights_and_save_hf_model.py \
   --version="PATH_TO_LLaVA" \
@@ -226,6 +242,7 @@ CUDA_VISIBLE_DEVICES="" python merge_lora_weights_and_save_hf_model.py \
 ```
 
 For example:
+
 ```
 CUDA_VISIBLE_DEVICES="" python3 merge_lora_weights_and_save_hf_model.py \
   --version="./LLaVA/LLaVA-Lightning-7B-v1-1" \
@@ -234,6 +251,7 @@ CUDA_VISIBLE_DEVICES="" python3 merge_lora_weights_and_save_hf_model.py \
 ```
 
 ### Validation
+
 ```
 deepspeed --master_port=24999 train_ds.py \
   --version="PATH_TO_LISA_HF_Model_Directory" \
@@ -245,27 +263,33 @@ deepspeed --master_port=24999 train_ds.py \
 
 Note: the `v1` model is trained using both `train+val` sets, so please use the `v0` model to reproduce the validation results. (To use the `v0` models, please first checkout to the legacy version repo with `git checkout 0e26916`.)
 
- 
-## Inference 
+## Inference
 
 To chat with [LISA-13B-llama2-v1](https://huggingface.co/xinlai/LISA-13B-llama2-v1) or [LISA-13B-llama2-v1-explanatory](https://huggingface.co/xinlai/LISA-13B-llama2-v1-explanatory):
 (Note that `chat.py` currently does not support `v0` models (i.e., `LISA-13B-llama2-v0` and `LISA-13B-llama2-v0-explanatory`), if you want to use the `v0` models, please first checkout to the legacy version repo `git checkout 0e26916`.)
+
 ```
 CUDA_VISIBLE_DEVICES=0 python chat.py --version='xinlai/LISA-13B-llama2-v1'
 CUDA_VISIBLE_DEVICES=0 python chat.py --version='xinlai/LISA-13B-llama2-v1-explanatory'
 ```
+
 To use `bf16` or `fp16` data type for inference:
+
 ```
 CUDA_VISIBLE_DEVICES=0 python chat.py --version='xinlai/LISA-13B-llama2-v1' --precision='bf16'
 ```
+
 To use `8bit` or `4bit` data type for inference (this enables running 13B model on a single 24G or 12G GPU at some cost of generation quality):
+
 ```
 CUDA_VISIBLE_DEVICES=0 python chat.py --version='xinlai/LISA-13B-llama2-v1' --precision='fp16' --load_in_8bit
 CUDA_VISIBLE_DEVICES=0 python chat.py --version='xinlai/LISA-13B-llama2-v1' --precision='fp16' --load_in_4bit
 ```
+
 Hint: for 13B model, 16-bit inference consumes 30G VRAM with a single GPU, 8-bit inference consumes 16G, and 4-bit inference consumes 9G.
 
 After that, input the text prompt and then the image path. For example，
+
 ```
 - Please input your prompt: Where can the driver see the car speed in this image? Please output segmentation mask.
 - Please input the image path: imgs/example1.jpg
@@ -273,45 +297,53 @@ After that, input the text prompt and then the image path. For example，
 - Please input your prompt: Can you segment the food that tastes spicy and hot?
 - Please input the image path: imgs/example2.jpg
 ```
+
 The results should be like:
+
 <p align="center"> <img src="imgs/example1.jpg" width="22%"> <img src="vis_output/example1_masked_img_0.jpg" width="22%"> <img src="imgs/example2.jpg" width="25%"> <img src="vis_output/example2_masked_img_0.jpg" width="25%"> </p>
 
 ## Deployment
+
 ```
 CUDA_VISIBLE_DEVICES=0 python app.py --version='xinlai/LISA-13B-llama2-v1 --load_in_4bit'
 CUDA_VISIBLE_DEVICES=0 python app.py --version='xinlai/LISA-13B-llama2-v1-explanatory --load_in_4bit'
 ```
+
 By default, we use 4-bit quantization. Feel free to delete the `--load_in_4bit` argument for 16-bit inference or replace it with `--load_in_8bit` argument for 8-bit inference.
 
-
 ## Dataset
-In ReasonSeg, we have collected 1218 images (239 train, 200 val, and 779 test). The training and validation sets can be download from <a href="https://drive.google.com/drive/folders/125mewyg5Ao6tZ3ZdJ-1-E3n04LGVELqy?usp=sharing">**this link**</a>. 
+
+In ReasonSeg, we have collected 1218 images (239 train, 200 val, and 779 test). The training and validation sets can be download from <a href="https://drive.google.com/drive/folders/125mewyg5Ao6tZ3ZdJ-1-E3n04LGVELqy?usp=sharing">**this link**</a>.
 
 Each image is provided with an annotation JSON file:
+
 ```
 image_1.jpg, image_1.json
 image_2.jpg, image_2.json
 ...
 image_n.jpg, image_n.json
 ```
+
 Important keys contained in JSON files:
+
 ```
 - "text": text instructions.
 - "is_sentence": whether the text instructions are long sentences.
 - "shapes": target polygons.
 ```
 
-The elements of the "shapes" exhibit two categories, namely **"target"** and **"ignore"**. The former category is indispensable for evaluation, while the latter category denotes the ambiguous region and hence disregarded during the evaluation process. 
+The elements of the "shapes" exhibit two categories, namely **"target"** and **"ignore"**. The former category is indispensable for evaluation, while the latter category denotes the ambiguous region and hence disregarded during the evaluation process.
 
 We provide a <a href="https://github.com/dvlab-research/LISA/blob/main/utils/data_processing.py">**script**</a> that demonstrates how to process the annotations:
+
 ```
 python3 utils/data_processing.py
 ```
 
 Besides, we leveraged GPT-3.5 for rephrasing instructions, so images in the training set may have **more than one instructions (but fewer than six)** in the "text" field. During training, users may randomly select one as the text query to obtain a better model.
 
+## Citation
 
-## Citation 
 If you find this project useful in your research, please consider citing:
 
 ```
@@ -330,4 +362,73 @@ If you find this project useful in your research, please consider citing:
 ```
 
 ## Acknowledgement
--  This work is built upon the [LLaVA](https://github.com/haotian-liu/LLaVA) and [SAM](https://github.com/facebookresearch/segment-anything). 
+
+- This work is built upon the [LLaVA](https://github.com/haotian-liu/LLaVA) and [SAM](https://github.com/facebookresearch/segment-anything).
+
+# LISA-Llama-4
+
+このプロジェクトは、オリジナルの LISA（LLava と SAM の統合モデル）を改良し、Llama3.2 Vision 11B instruct と Segment Anything Model (SAM)を統合したモデルを実装しています。
+
+## 概要
+
+LISA はもともと[LLaVA](https://github.com/haotian-liu/LLaVA)と[Segment Anything Model (SAM)](https://github.com/facebookresearch/segment-anything)を組み合わせ、テキスト指示によるセグメンテーションを可能にした先駆的なモデルです。このプロジェクトでは、LLaVA の代わりに最新の Llama3.2 Vision 11B instruct モデルを使用し、高品質な視覚言語理解とセグメンテーション能力を両立させています。
+
+## 実行方法
+
+### 環境設定
+
+```bash
+# 必要なパッケージをインストール
+pip install -r requirements.txt
+
+# Hugging Faceにログイン（Llama3.2モデルへのアクセスに必要）
+huggingface-cli login --token <HUGGING_FACE_TOKEN>
+```
+
+### チャットデモの実行
+
+Llama3.2 Vision + SAM モデルを使ったチャットデモを実行：
+
+```bash
+python chat.py --model_type llama3_2 --version meta-llama/Llama-3.2-11B-Vision-Instruct --precision bf16 --vision_pretrained ./checkpoints/sam_vit_h_4b8939.pth
+```
+
+オリジナルの LISA モデルを使う場合：
+
+```bash
+python chat.py --model_type lisa --version xinlai/LISA-13B-llama2-v1 --precision bf16
+```
+
+### テストスクリプトの実行
+
+Llama3.2 Vision + SAM の機能をテストするための簡易スクリプト：
+
+```bash
+python test_llama32_sam.py --image_path <画像パス> --sam_checkpoint ./checkpoints/sam_vit_h_4b8939.pth --query "この画像の中の犬を[SEG]セグメンテーションしてください"
+```
+
+## モデル構成
+
+このプロジェクトでは、以下のコンポーネントを統合しています：
+
+1. **Llama3.2 Vision 11B instruct**: Meta の Llama3.2 シリーズの視覚言語モデルで、画像理解と言語生成を統合しています。
+2. **Segment Anything Model (SAM)**: Meta の高度なセグメンテーションモデルで、埋め込みプロンプトからオブジェクトをセグメント化します。
+
+統合アーキテクチャでは、Llama3.2 Vision モデルが画像とテキスト指示を処理し、特殊な`[SEG]`トークンを生成すると、そのトークンの埋め込みが SAM モデルへの入力として使用され、対応するマスクが生成されます。
+
+## ディレクトリ構造
+
+- `model/llama3_2/`: Llama3.2 Vision + SAM 統合モデルの実装
+- `model/segment_anything/`: SAM モデルの実装
+- `checkpoints/`: モデルの重みファイル
+- `utils/`: ユーティリティ関数
+
+## 謝辞
+
+このプロジェクトは以下のオープンソースプロジェクトに基づいています：
+
+- [LISA](https://github.com/xinlai3/LISA)
+- [Segment Anything](https://github.com/facebookresearch/segment-anything)
+- [Llama3.2 シリーズ](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct)
+
+Meta の研究チームに感謝します。
