@@ -3,7 +3,7 @@ from typing import List, Optional, Union, Tuple, Dict, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import BitsAndBytesConfig, CLIPVisionModel, AutoModelForVision2Seq, AutoConfig
+from transformers import BitsAndBytesConfig, CLIPVisionModel, AutoModelForVision2Seq, AutoConfig, AutoProcessor
 
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          DEFAULT_IMAGE_PATCH_TOKEN)
@@ -227,16 +227,97 @@ class Llama32LISAForCausalLM(nn.Module):
         self.dice_loss_weight = kwargs.get("dice_loss_weight", 0.5)
         self.seg_token_idx = kwargs.get("seg_token_idx", None)
         
-        # ベースとなるビジョン言語モデル (実際はchat.pyで後で設定される)
-        self.base_model = None
+        # ベースとなるビジョン言語モデル
+        self.model = None
         
         # SAMの視覚エンコーダを初期化
         if self.vision_ckpt:
             self.initialize_sam_encoder()
+    
+    @classmethod
+    def from_vision_model(cls, vision_model_id, seg_token_idx=None, vision_pretrained=None, train_mask_decoder=False, 
+                         out_dim=256, tokenizer=None, torch_dtype=None, device_map=None, 
+                         quantization_config=None, ignore_mismatched_sizes=False, **kwargs):
+        """
+        Llama3.2 Vision modelとSAMを統合したモデルを生成します。
+        
+        Args:
+            vision_model_id: Llama3.2 VisionモデルのIDまたはパス
+            seg_token_idx: <SEG>トークンのインデックス
+            vision_pretrained: SAMモデルの事前学習済み重みへのパス
+            train_mask_decoder: SAMのマスクデコーダーを訓練するかどうか
+            out_dim: 出力次元数
+            tokenizer: 使用するトークナイザー
+            torch_dtype: モデルのデータ型
+            device_map: デバイスマッピング
+            quantization_config: 量子化設定
+            ignore_mismatched_sizes: サイズの不一致を無視するかどうか
+            **kwargs: その他の引数
+        """
+        print("Step 1: Loading base vision-language model...")
+        # 最初にトークナイザーをロードし拡張する
+        if tokenizer is None:
+            tokenizer = AutoProcessor.from_pretrained(vision_model_id)
+        
+        # <SEG>トークンをトークナイザーに追加
+        if "<SEG>" not in tokenizer.tokenizer.get_vocab():
+            print("Adding <SEG> token to tokenizer vocabulary")
+            if hasattr(tokenizer, 'tokenizer'):
+                tokenizer.tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
+            else:
+                tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
+        
+        # トークナイザーを拡張した後にモデルをロード
+        vision_model = AutoModelForVision2Seq.from_pretrained(
+            vision_model_id,
+            torch_dtype=torch_dtype,
+            device_map=device_map,
+            quantization_config=quantization_config,
+            ignore_mismatched_sizes=ignore_mismatched_sizes,
+            **kwargs
+        )
+        
+        # SEGトークンのインデックスを取得
+        if seg_token_idx is None:
+            if hasattr(tokenizer, 'tokenizer'):
+                seg_token_idx = tokenizer.tokenizer.get_vocab()["<SEG>"]
+            else:
+                seg_token_idx = tokenizer.get_vocab()["<SEG>"]
+        
+        # モデルの設定を取得
+        config = vision_model.config
+        
+        # LISA modelを初期化
+        print("Step 2: Customizing with SAM integration...")
+        model = cls(
+            config,
+            vision_pretrained=vision_pretrained,
+            train_mask_decoder=train_mask_decoder,
+            out_dim=out_dim,
+            seg_token_idx=seg_token_idx,
+            **kwargs
+        )
+        
+        # SAMエンコーダを初期化
+        model.initialize_sam_encoder()
+        
+        # 基本モデルの重みを転送
+        print("Step 3: Transferring model weights...")
+        model.model = vision_model
+        
+        return model, tokenizer
+    
+    def resize_token_embeddings(self, new_num_tokens):
+        """トークン埋め込みのサイズを変更する"""
+        if hasattr(self, 'model') and self.model is not None:
+            self.model.resize_token_embeddings(new_num_tokens)
+            return self
+        return None
         
     def initialize_sam_encoder(self):
         """SAMの視覚エンコーダを初期化"""
         # SAMの視覚エンコーダ（ViT-H）を初期化
+        print(f"Initializing SAM encoder from {self.vision_ckpt}...")
         self.visual_model = build_sam_vit_h(self.vision_ckpt)
         
         # すべてのSAMパラメータを凍結（マスクデコーダを除く）
@@ -248,16 +329,18 @@ class Llama32LISAForCausalLM(nn.Module):
             self.visual_model.mask_decoder.train()
             for param in self.visual_model.mask_decoder.parameters():
                 param.requires_grad = True
-        
+
         # プロジェクションレイヤー：LLM隠れ状態をマスク埋め込み次元にプロジェクション
         # モデル設定からhidden_sizeを取得
-        # MllamaConfigは複合的な構造を持ち、hidden_sizeはconfig直下ではなくtext_config内に存在する
-        if hasattr(self.config, 'text_config'):
-            hidden_size = self.config.text_config.hidden_size  # Llama隠れサイズ
+        if hasattr(self.config, 'text_config') and hasattr(self.config.text_config, 'hidden_size'):
+            hidden_size = self.config.text_config.hidden_size
+        elif hasattr(self.config, 'hidden_size'):
+            hidden_size = self.config.hidden_size
         else:
-            # 'text_config'がない場合は直接hidden_sizeを取得
-            hidden_size = self.config.hidden_size if hasattr(self.config, 'hidden_size') else 4096
+            # デフォルト値として4096を使用（一般的なLlamaモデルの隠れ層サイズ）
+            hidden_size = 4096
             
+        print(f"Using hidden size: {hidden_size} for projection layers")
         self.text_hidden_fcs = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(hidden_size, hidden_size),
@@ -266,41 +349,16 @@ class Llama32LISAForCausalLM(nn.Module):
                 nn.Dropout(0.0)
             )
         ])
-        
-        for param in self.text_hidden_fcs.parameters():
-            param.requires_grad = True
-    
-    def load_state_dict(self, state_dict, strict=True):
-        """
-        ベースモデルの状態辞書を読み込み、それをこのモデルに統合します
-        
-        Args:
-            state_dict: ベースモデルの状態辞書
-            strict: 厳密な読み込みを行うかどうか
-        """
-        # ベースモデルを作成
-        self.base_model = AutoModelForVision2Seq.from_pretrained(
-            "meta-llama/Llama-3.2-11B-Vision-Instruct",
-            config=self.config,
-            torch_dtype=next(iter(state_dict.values())).dtype
-        )
-        
-        # ベースモデルに状態辞書を読み込む
-        self.base_model.load_state_dict(state_dict, strict=strict)
-        
-        # SAMエンコーダがまだ初期化されていない場合は初期化
-        if not hasattr(self, 'visual_model') and self.vision_ckpt:
-            self.initialize_sam_encoder()
-            
-        return self
     
     @property
     def device(self):
         """モデルのデバイスを取得"""
+        if hasattr(self, 'model') and self.model is not None:
+            return next(self.model.parameters()).device
         return next(self.parameters()).device
         
     def forward(
-        self, 
+        self,
         input_ids=None, 
         attention_mask=None, 
         pixel_values=None, 
@@ -339,16 +397,17 @@ class Llama32LISAForCausalLM(nn.Module):
         
         # ベースモデルでフォワードパスを実行
         # カスタムビジョン埋め込みがある場合は使用
-        if hasattr(self, 'base_model') and self.base_model is not None:
-            # ベースモデルの前方伝播を呼び出す
-            kwargs_to_pass = {**kwargs}
+        if hasattr(self, 'model') and self.model is not None:
+            # モデル.generateの出力のhidden_statesを使用するため、return_dictを設定
+            kwargs_to_pass = {**kwargs, "return_dict": True}
             if vision_hidden_states is not None:
                 kwargs_to_pass['vision_hidden_states'] = vision_hidden_states
                 
-            outputs = self.base_model(
+            # ベースモデルの前方伝播を呼び出す
+            outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                pixel_values=None,  # 自前の埋め込みを使うためNoneを渡す
+                pixel_values=None,  # 自前のSAM埋め込みを使うためNoneを渡す
                 labels=labels,
                 **kwargs_to_pass
             )
@@ -357,11 +416,23 @@ class Llama32LISAForCausalLM(nn.Module):
             raise ValueError("Base model has not been initialized yet!")
         
         # 訓練中かつマスクリストがあれば、セグメンテーション損失を計算
-        if not inference and masks_list is not None and len(masks_list) > 0 and self.seg_token_idx is not None:
+        if not inference and masks_list is not None and len(masks_list) > 0 and self.seg_token_idx is not None and hasattr(self, 'visual_model'):
             # マスク生成のためのセグメントトークン埋め込みを取得
             batch_size = outputs.logits.shape[0]
-            # モデル出力からhidden statesを取得
-            hidden_states = outputs.hidden_states[-1]  # 最後の層の隠れ状態
+            # モデル出力からhidden statesを取得（出力形式によって異なる）
+            if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
+                # transformersの標準出力形式
+                if isinstance(outputs.hidden_states, tuple):
+                    hidden_states = outputs.hidden_states[-1]  # 最後の層の隠れ状態
+                else:
+                    hidden_states = outputs.hidden_states
+            else:
+                # 隠れ状態が直接利用できない場合
+                hidden_states = None
+                
+            if hidden_states is None:
+                # 損失計算をスキップ
+                return outputs
             
             # セグメントトークンの位置を検索
             seg_token_pos = (input_ids == self.seg_token_idx).nonzero()
@@ -420,8 +491,8 @@ class Llama32LISAForCausalLM(nn.Module):
                     decoder_out = self.visual_model.mask_decoder(
                         image_embeddings=img_embeddings,
                         image_pe=self.visual_model.prompt_encoder.get_dense_pe(),
-                        sparse_prompt_embeddings=sparse_embeddings,
-                        dense_prompt_embeddings=dense_embeddings,
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
                         multimask_output=False,
                     )
                     
@@ -466,8 +537,12 @@ class Llama32LISAForCausalLM(nn.Module):
         テキスト生成を行う
         ベースモデルのgenerateメソッドを呼び出す
         """
-        if hasattr(self, 'base_model') and self.base_model is not None:
-            return self.base_model.generate(**kwargs)
+        if hasattr(self, 'model') and self.model is not None:
+            # output_hidden_statesを指定して、隠れ状態を取得
+            if 'output_hidden_states' not in kwargs:
+                kwargs['output_hidden_states'] = True
+                
+            return self.model.generate(**kwargs)
         else:
             raise ValueError("Base model has not been initialized yet!")
         
@@ -491,23 +566,33 @@ class Llama32LISAForCausalLM(nn.Module):
         Returns:
             生成されたマスクのリスト
         """
+        if not hasattr(self, 'visual_model') or self.visual_model is None:
+            raise ValueError("SAM visual model has not been initialized yet!")
+            
         # モデルのフォワードパスを実行して埋め込みを取得
         with torch.no_grad():
             # 画像をSAMのViTでエンコード
             img_embeds = self.visual_model.image_encoder(images)
             
-            # モデルに入力を渡す
-            outputs = self(input_ids=input_ids, **kwargs)
+            # 生成出力の隠れ状態を取得
+            # 多くの場合、生成出力は既に渡されており、隠れ状態も含まれているため、改めてforward()を呼ぶ必要はない
+            # ただし、明示的にここでモデルに入力を渡すことも可能（以下のコメントアウト部分）
+            # outputs = self(input_ids=input_ids, **kwargs)
+            # # 隠れ状態を抽出
+            # if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
+            #     hidden_states = outputs.hidden_states[-1]
+            # else:
+            #     # 適切な構造で隠れ状態を取得できない場合
+            #     raise ValueError("Cannot access hidden states from model outputs")
             
-            # ベースモデルの隠れ状態へのアクセス方法を調整
-            if hasattr(outputs, 'hidden_states'):
-                # モデルがHuggingFaceのReturnTypesを返す場合
-                hidden_states = outputs.hidden_states[-1]
-            elif hasattr(self.base_model, 'get_input_embeddings'):
-                # モデルの入力埋め込みから推定
-                hidden_states = self.base_model.get_input_embeddings()(input_ids)
+            # モデル自体から埋め込みレイヤーを使用して埋め込みを取得
+            if hasattr(self.model, 'get_input_embeddings'):
+                # 入力埋め込みを取得
+                embed_layer = self.model.get_input_embeddings()
+                hidden_states = embed_layer(input_ids)
             else:
-                raise ValueError("Cannot access hidden states of the model")
+                # 埋め込みレイヤーが直接アクセスできない場合
+                raise ValueError("Cannot access embedding layer of the model")
             
             # <SEG>トークンの埋め込みを取得
             seg_hidden_states = []
@@ -566,3 +651,28 @@ class Llama32LISAForCausalLM(nn.Module):
                 masks.append(mask)
                 
         return masks
+
+    def load_state_dict(self, state_dict, strict=False):
+        """
+        モデルの状態辞書をロードするメソッド
+        
+        Args:
+            state_dict: ロードする状態辞書
+            strict: 厳密なロードを行うかどうか
+        """
+        # プロパティとしてbase_modelが定義されていない場合は、通常のロード処理を行う
+        if not hasattr(self, 'base_model'):
+            return super().load_state_dict(state_dict, strict=strict)
+        
+        # 既に基本モデルが存在する場合は、そのままの状態を維持
+        return self
+
+    @property 
+    def base_model(self):
+        """基本モデルのプロパティ"""
+        return self.model
+
+    @base_model.setter
+    def base_model(self, model):
+        """基本モデルの設定"""
+        self.model = model

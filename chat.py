@@ -8,6 +8,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, BitsAndBytesConfig, AutoProcessor, AutoModelForVision2Seq
+from PIL import Image
+import re
 
 from model.LISA import Llama32LISAForCausalLM
 from model.llama3_2 import conversation as llama3_2_conversation
@@ -84,6 +86,12 @@ def parse_args(args):
         default=False,
         help="Whether to train SAM's mask decoder",
     )
+    parser.add_argument(
+        "--ignore_mismatched_sizes",
+        action="store_true",
+        default=True,
+        help="Whether to ignore mismatched sizes when loading weights",
+    )
     return parser.parse_args(args)
 
 
@@ -106,6 +114,164 @@ def preprocess(
     return x
 
 
+def get_prompt_template():
+    """Llama 3.2のプロンプトテンプレートを取得"""
+    return """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+あなたは役立つAIアシスタントです。画像セグメンテーションもできます。画像から特定のオブジェクトをセグメンテーションするように頼まれたら、次のような形式で回答してください：「<SEG> [セグメントする物体の説明]」
+
+<|start_header_id|>user<|end_header_id|>
+{input}
+
+<|start_header_id|>assistant<|end_header_id|>
+{response}
+"""
+
+
+def chatting(args, model, tokenizer, device, prompt_template, model_max_length, max_new_tokens, sep, stop_str):
+    """チャットモードの実行関数"""
+    print("チャットモードを開始します。'exit'と入力すると終了します。")
+    
+    # 会話履歴を初期化
+    conversation = []
+    
+    while True:
+        try:
+            # ユーザー入力を取得
+            user_input = input("\nユーザー: ")
+            if user_input.lower() == "exit":
+                break
+            
+            # 画像パスをチェック
+            image_path = None
+            for word in user_input.split():
+                if os.path.exists(word) and word.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    image_path = word
+                    user_input = user_input.replace(image_path, "").strip()
+                    break
+            
+            # 会話履歴に追加
+            conversation.append({"role": "user", "content": user_input})
+            
+            # 画像処理
+            image_tensor = None
+            if image_path:
+                # 画像を読み込み
+                image = Image.open(image_path).convert('RGB')
+                
+                # プロセッサで画像を処理
+                inputs = tokenizer(
+                    text=user_input,
+                    images=image,
+                    return_tensors="pt"
+                )
+                input_ids = inputs["input_ids"].to(device)
+                
+                # 画像テンソルも取得
+                image_tensor = inputs["pixel_values"].to(device)
+            else:
+                # テキストのみの処理
+                inputs = tokenizer.tokenizer(
+                    user_input,
+                    return_tensors="pt"
+                )
+                input_ids = inputs["input_ids"].to(device)
+            
+            # 生成パラメータを設定
+            generate_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "do_sample": True,
+                "temperature": 0.7,
+                "top_p": 0.9,
+            }
+            
+            # 画像があるかどうかで異なる生成処理
+            if image_tensor is not None:
+                # 画像と入力IDsを使って生成
+                generate_kwargs["pixel_values"] = image_tensor
+            
+            # 生成を実行
+            with torch.no_grad():
+                outputs = model.generate(
+                    input_ids=input_ids,
+                    return_dict_in_generate=True,
+                    output_hidden_states=True,
+                    **generate_kwargs
+                )
+            
+            # 生成されたテキストをデコード
+            generated_text = tokenizer.tokenizer.decode(outputs.sequences[0], skip_special_tokens=False)
+            
+            # レスポンス部分を抽出
+            generated_response = generated_text.split(sep)[-1].strip()
+            if stop_str in generated_response:
+                generated_response = generated_response.split(stop_str)[0].strip()
+            
+            # SEGトークンがあるかチェック
+            if "<SEG>" in generated_response:
+                # SEGトークンのインデックスを検出
+                seg_indices = []
+                for i, token_id in enumerate(outputs.sequences[0]):
+                    if token_id == tokenizer.tokenizer.convert_tokens_to_ids("<SEG>"):
+                        seg_indices.append(i)
+                
+                if seg_indices and image_tensor is not None:
+                    # 画像の元のサイズを取得
+                    original_image = Image.open(image_path).convert('RGB')
+                    original_size = original_image.size[::-1]  # (h, w)
+                    
+                    # SAM用に画像を前処理
+                    processed_image = preprocess(image_tensor).to(device)
+                    
+                    # マスクを生成
+                    masks = model.generate_masks(
+                        images=processed_image,
+                        input_ids=outputs.sequences,
+                        seg_token_indices=seg_indices,
+                        original_sizes=[original_size],
+                    )
+                    
+                    # マスクを可視化
+                    # 元の画像をOpenCV形式に変換
+                    image_cv = cv2.cvtColor(np.array(original_image), cv2.COLOR_RGB2BGR)
+                    
+                    for i, mask in enumerate(masks):
+                        # マスクをCPUに移動してNumPy配列に変換
+                        mask_np = mask.cpu().numpy()
+                        
+                        # マスクを0-255の範囲にスケーリング
+                        mask_np = (mask_np * 255).astype(np.uint8)
+                        
+                        # マスクを元の画像サイズにリサイズ
+                        mask_np = cv2.resize(mask_np, (original_size[1], original_size[0]))
+                        
+                        # 画像とマスクのオーバーレイ
+                        overlay = image_cv.copy()
+                        colored_mask = np.zeros_like(image_cv)
+                        colored_mask[mask_np > 127] = [0, 0, 255]  # 赤色でマスク領域を表示
+                        
+                        # マスクをブレンド
+                        cv2.addWeighted(image_cv, 0.7, colored_mask, 0.3, 0, overlay)
+                        
+                        # 結果を保存
+                        filename = f"mask_{i}_{Path(image_path).stem}.png"
+                        save_path = os.path.join(args.vis_save_path, filename)
+                        cv2.imwrite(save_path, overlay)
+                        print(f"マスク画像を保存しました: {save_path}")
+            
+            # 応答を表示
+            print(f"\nアシスタント: {generated_response}")
+            
+            # 会話履歴に追加
+            conversation.append({"role": "assistant", "content": generated_response})
+            
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print(f"エラーが発生しました: {e}")
+            import traceback
+            traceback.print_exc()
+
+
 def main(args):
     # Hugging Face認証
     authenticate_huggingface()
@@ -114,238 +280,39 @@ def main(args):
     if not os.path.exists(args.vis_save_path):
         os.makedirs(args.vis_save_path)
 
-    # デバイスの設定
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # モデル精度の設定
-    if args.precision == "fp32":
-        dtype = torch.float32
-    elif args.precision == "bf16":
-        dtype = torch.bfloat16
-    elif args.precision == "fp16":
-        dtype = torch.float16
-    else:
-        raise ValueError(f"Unsupported precision: {args.precision}")
-    
-    # 量子化の設定
-    if args.load_in_8bit or args.load_in_4bit:
-        quantization_config = BitsAndBytesConfig(
-            load_in_8bit=args.load_in_8bit,
-            load_in_4bit=args.load_in_4bit,
-        )
-    else:
-        quantization_config = None
-
-    # SAMチェックポイントの設定
-    sam_checkpoint = args.sam_version or args.vision_tower
-    if not sam_checkpoint:
-        print("警告: SAMチェックポイントが指定されていません。")
-        print("SAMのViT-Hチェックポイントを指定してください: --sam_version path/to/sam_vit_h_4b8939.pth")
-        sam_checkpoint = None
-    
-    # Llama3.2 Vision + SAMモデル
+    # モデルの読み込み
     print(f"Loading Llama3.2 Vision + SAM model: {args.version}")
     
-    # Llama3.2 Visionモデル用のプロセッサ
-    processor = AutoProcessor.from_pretrained(args.version)
-    tokenizer = processor.tokenizer
+    # トークナイザーをロード
+    tokenizer = AutoProcessor.from_pretrained(args.version)
     
-    # <SEG>トークンがボキャブラリにない場合は追加
-    if SEG_TOKEN not in tokenizer.get_vocab():
-        print(f"Adding {SEG_TOKEN} token to tokenizer vocabulary")
-        tokenizer.add_special_tokens({"additional_special_tokens": [SEG_TOKEN]})
+    # <SEG>トークンをトークナイザーに追加
+    if "<SEG>" not in tokenizer.tokenizer.get_vocab():
+        print("Adding <SEG> token to tokenizer vocabulary")
+        tokenizer.tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
     
-    # SEGトークンのインデックスを取得
-    seg_token_idx = tokenizer.convert_tokens_to_ids(SEG_TOKEN)
-    
-    # モデルをロード - 標準的なTransformerパラメータのみを使用
-    print("Step 1: Loading base vision-language model...")
-    base_model = AutoModelForVision2Seq.from_pretrained(
-        args.version,
-        torch_dtype=dtype,
-        device_map="auto" if torch.cuda.is_available() else None,
-        quantization_config=quantization_config,
-    )
-    
-    # トークナイザの語彙サイズをリサイズ（新しい特殊トークンを追加した場合）
-    base_model.resize_token_embeddings(len(tokenizer))
-    
-    # Step 2: LISAモデルをカスタマイズ
-    print("Step 2: Customizing with SAM integration...")
-    model = Llama32LISAForCausalLM(
-        base_model.config,
-        vision_pretrained=sam_checkpoint,
+    # from_vision_modelメソッドを使用してモデルとトークナイザーを同時に取得
+    model, tokenizer = Llama32LISAForCausalLM.from_vision_model(
+        vision_model_id=args.version,
+        vision_pretrained=args.sam_version,
         train_mask_decoder=args.train_mask_decoder,
-        out_dim=args.out_dim,
-        seg_token_idx=seg_token_idx,
+        tokenizer=tokenizer,
+        ignore_mismatched_sizes=args.ignore_mismatched_sizes
     )
     
-    # ベースモデルの状態を転送
-    print("Step 3: Transferring model weights...")
-    model.load_state_dict(base_model.state_dict(), strict=False)
+    # デバイスの設定
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
     
-    # 会話テンプレート
-    conv = llama3_2_conversation.conv_templates["llama3_2"].copy()
-
-    # モデルを評価モードに設定
-    model.eval()
+    # チャットループの設定
+    prompt_template = get_prompt_template()
+    model_max_length = tokenizer.tokenizer.model_max_length
+    max_new_tokens = args.max_new_tokens
+    sep = "[/INST]"
+    stop_str = "</s>"
     
-    # リサイズ変換の初期化
-    resize_transform = ResizeLongestSide(args.image_size)
-    print("LISA chat system is ready. Type 'exit' to exit.")
-    
-    while True:
-        try:
-            # ユーザー入力を取得
-            user_input = input("User: ")
-            if user_input.lower() == "exit":
-                break
-                
-            # 画像パスが含まれているか確認
-            image_path = None
-            for word in user_input.split():
-                if os.path.exists(word) and (word.endswith(".jpg") or word.endswith(".png") or word.endswith(".jpeg")):
-                    image_path = word
-                    user_input = user_input.replace(image_path, "")
-                    break
-            
-            # 画像が指定されている場合、処理を実行
-            if image_path:
-                # 画像を読み込み、前処理を行う
-                image = cv2.imread(image_path)
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                
-                # 画像の前処理（1024x1024サイズにリサイズ）
-                image_resized = resize_transform.apply_image(image)
-                original_size = image.shape[:2]  # (height, width)
-                
-                # 画像をPIL形式に変換（プロセッサ用）
-                from PIL import Image as PILImage
-                pil_image = PILImage.fromarray(image_resized)
-                
-                # メッセージを会話に追加（<|image|>トークンを使用）
-                user_input = IMAGE_TOKEN + " " + user_input
-                conv.append_message(conv.roles[0], user_input)
-                conv.append_message(conv.roles[1], None)
-                
-                # プロンプトの作成
-                prompt = conv.get_prompt()
-                
-                # プロセッサで画像とテキストを前処理
-                inputs = processor(
-                    images=pil_image,
-                    text=prompt,
-                    return_tensors="pt"
-                )
-                
-                # すべての入力をデバイスに移動
-                inputs = {k: v.to(model.device) for k, v in inputs.items()}
-                
-                # 推論の実行
-                with torch.no_grad():
-                    # 生成
-                    outputs = model.generate(
-                        **inputs,
-                        max_new_tokens=512,
-                        do_sample=True,
-                        temperature=0.7,
-                        top_p=0.9,
-                        output_hidden_states=True,
-                        return_dict_in_generate=True,
-                    )
-                    
-                    # 出力テキストをデコード
-                    output_text = tokenizer.decode(outputs.sequences[0], skip_special_tokens=False)
-                    
-                    # 応答テキストを整形（モデルの出力をユーザーフレンドリーにする）
-                    response = output_text.split("[/INST]")[-1].strip()
-                    response = response.replace(SEG_TOKEN, "*マスクを生成しました*")  # SEGトークンをユーザーフレンドリーなテキストに置換
-                    
-                    # 応答を会話に追加
-                    conv.messages[-1][-1] = response
-                    
-                    # <SEG>トークンを含む場合、マスクを生成
-                    if SEG_TOKEN in output_text:
-                        # <SEG>トークンの位置を特定
-                        seg_indices = []
-                        for i, token_id in enumerate(outputs.sequences[0]):
-                            if token_id == seg_token_idx:
-                                seg_indices.append(i)
-                        
-                        if seg_indices:
-                            # SAM用の画像をテンソルに変換
-                            sam_image = torch.from_numpy(np.array(pil_image)).permute(2, 0, 1).unsqueeze(0).float()
-                            sam_image = sam_image.to(model.device, dtype=dtype)
-                            
-                            # マスクを生成
-                            masks = model.generate_masks(
-                                images=sam_image,
-                                input_ids=outputs.sequences,
-                                seg_token_indices=seg_indices,
-                                original_sizes=[original_size],
-                            )
-                            
-                            # マスクの可視化と保存
-                            for i, mask in enumerate(masks):
-                                # マスクをCPUに移動してNumPy配列に変換
-                                mask_np = mask.cpu().numpy()
-                                # マスクを0-255の範囲にスケーリング
-                                mask_np = (mask_np * 255).astype(np.uint8)
-                                # マスクを元の画像サイズにリサイズ
-                                mask_np = cv2.resize(mask_np, (original_size[1], original_size[0]))
-                                
-                                # 画像とマスクのオーバーレイ
-                                overlay = image.copy()
-                                overlay[mask_np > 127] = [255, 0, 0]  # 赤色でマスク領域を表示
-                                overlay = cv2.addWeighted(image, 0.7, overlay, 0.3, 0)
-                                
-                                # 結果を保存
-                                save_path = os.path.join(args.vis_save_path, f"mask_{i}_{Path(image_path).stem}.png")
-                                cv2.imwrite(save_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-                                print(f"マスク画像を保存しました: {save_path}")
-                
-                # 応答を表示
-                print(f"Assistant: {response}")
-                
-            else:
-                # 画像なしの通常の会話
-                conv.append_message(conv.roles[0], user_input)
-                conv.append_message(conv.roles[1], None)
-                
-                # プロンプトの作成
-                prompt = conv.get_prompt()
-                
-                # 入力をトークン化
-                inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-                
-                # 推論の実行
-                with torch.no_grad():
-                    outputs = model.generate(
-                        **inputs,
-                        max_new_tokens=512,
-                        do_sample=True,
-                        temperature=0.7,
-                        top_p=0.9,
-                    )
-                
-                # 応答をデコード
-                output_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                
-                # 応答テキストを整形
-                response = output_text.split("[/INST]")[-1].strip()
-                
-                # 応答を会話に追加
-                conv.messages[-1][-1] = response
-                
-                # 応答を表示
-                print(f"Assistant: {response}")
-                
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            print(f"エラーが発生しました: {e}")
-            import traceback
-            traceback.print_exc()
+    # チャットモードの起動
+    chatting(args, model, tokenizer, device, prompt_template, model_max_length, max_new_tokens, sep, stop_str)
 
 
 if __name__ == "__main__":
