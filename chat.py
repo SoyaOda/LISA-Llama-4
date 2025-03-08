@@ -46,6 +46,8 @@ def parse_args(args):
     parser.add_argument("--use_mm_start_end", action="store_true", default=True)
     parser.add_argument("--hf_token", default=None, type=str, 
                         help="Hugging Face token for downloading models")
+    parser.add_argument("--prompt", type=str, help="Prompt text to use")
+    parser.add_argument("--image_path", type=str, help="Path to the image")
     return parser.parse_args(args)
 
 
@@ -163,107 +165,123 @@ def main(args):
     model.eval()
     
     print(f"Model loaded: {args.model_type} - {args.version}")
-    print("Ready for conversation. Type 'exit' to quit.")
-
-    while True:
-        prompt = input("Please input your prompt: ")
-        if prompt.lower() == "exit":
-            break
-
-        image_path = input("Please input the image path: ")
+    
+    # コマンドライン引数からプロンプトと画像パスが指定されている場合
+    if args.prompt and args.image_path:
+        prompt = args.prompt
+        image_path = args.image_path
+        
         if not os.path.exists(image_path):
-            print("File not found in {}".format(image_path))
+            print(f"画像ファイルが見つかりません: {image_path}")
+            return
+            
+        process_image_and_prompt(model, tokenizer, prompt, image_path, args, transform)
+    else:
+        # インタラクティブモード
+        print("Ready for conversation. Type 'exit' to quit.")
+        while True:
+            prompt = input("Please input your prompt: ")
+            if prompt.lower() == "exit":
+                break
+
+            image_path = input("Please input the image path: ")
+            if not os.path.exists(image_path):
+                print("File not found in {}".format(image_path))
+                continue
+                
+            process_image_and_prompt(model, tokenizer, prompt, image_path, args, transform)
+
+# 画像処理とプロンプト処理を行う関数を追加
+def process_image_and_prompt(model, tokenizer, prompt, image_path, args, transform):
+    # 画像を読み込み
+    image_np = cv2.imread(image_path)
+    image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+    original_size_list = [image_np.shape[:2]]
+
+    # SAM用の画像前処理
+    sam_tensor, resize_size, original_size = preprocess_image_for_sam(image_np, transform)
+    sam_tensor = sam_tensor.cuda()
+    
+    # 精度に合わせて変換
+    if args.precision == "bf16":
+        sam_tensor = sam_tensor.bfloat16()
+    elif args.precision == "fp16":
+        sam_tensor = sam_tensor.half()
+    else:
+        sam_tensor = sam_tensor.float()
+
+    # Llama3.2 Vision用の処理
+    # 画像をプロセッサで処理
+    image_inputs = model.processor(
+        images=image_np, 
+        return_tensors="pt"
+    ).to("cuda")
+    
+    # 精度変換
+    if args.precision == "bf16":
+        image_inputs = {k: v.bfloat16() if isinstance(v, torch.Tensor) else v for k, v in image_inputs.items()}
+    elif args.precision == "fp16":
+        image_inputs = {k: v.half() if isinstance(v, torch.Tensor) else v for k, v in image_inputs.items()}
+
+    # プロンプトをトークン化
+    input_text = f"{BEGIN_OF_TEXT_TOKEN}{IMAGE_TOKEN}{prompt}"
+    text_inputs = model.processor(
+        text=input_text,
+        return_tensors="pt"
+    ).to("cuda")
+    
+    # 入力を結合
+    combined_inputs = {
+        **image_inputs,
+        "input_ids": text_inputs["input_ids"],
+        "attention_mask": text_inputs["attention_mask"] if "attention_mask" in text_inputs else None
+    }
+    
+    # 推論
+    print("Generating response...")
+    output_ids, pred_masks = model.evaluate(
+        image_inputs,
+        sam_tensor,
+        combined_inputs["input_ids"],
+        [resize_size],
+        original_size_list,
+        max_new_tokens=512,
+        tokenizer=tokenizer,
+    )
+
+    # テキスト出力の処理
+    if hasattr(output_ids, 'sequences'):
+        output_ids = output_ids.sequences[0]
+    
+    text_output = tokenizer.decode(output_ids, skip_special_tokens=False)
+    text_output = text_output.replace("\n", "").replace("  ", " ")
+    print("text_output: ", text_output)
+
+    # マスク出力の処理
+    for i, pred_mask in enumerate(pred_masks):
+        if pred_mask.shape[0] == 0:
             continue
 
-        # 画像を読み込み
-        image_np = cv2.imread(image_path)
-        image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
-        original_size_list = [image_np.shape[:2]]
+        pred_mask = pred_mask.detach().cpu().numpy()[0]
+        pred_mask = pred_mask > 0
 
-        # SAM用の画像前処理
-        sam_tensor, resize_size, original_size = preprocess_image_for_sam(image_np, transform)
-        sam_tensor = sam_tensor.cuda()
-        
-        # 精度に合わせて変換
-        if args.precision == "bf16":
-            sam_tensor = sam_tensor.bfloat16()
-        elif args.precision == "fp16":
-            sam_tensor = sam_tensor.half()
-        else:
-            sam_tensor = sam_tensor.float()
-
-        # Llama3.2 Vision用の処理
-        # 画像をプロセッサで処理
-        image_inputs = model.processor(
-            images=image_np, 
-            return_tensors="pt"
-        ).to("cuda")
-        
-        # 精度変換
-        if args.precision == "bf16":
-            image_inputs = {k: v.bfloat16() if isinstance(v, torch.Tensor) else v for k, v in image_inputs.items()}
-        elif args.precision == "fp16":
-            image_inputs = {k: v.half() if isinstance(v, torch.Tensor) else v for k, v in image_inputs.items()}
-
-        # プロンプトをトークン化
-        input_text = f"{BEGIN_OF_TEXT_TOKEN}{IMAGE_TOKEN}{prompt}"
-        text_inputs = model.processor(
-            text=input_text,
-            return_tensors="pt"
-        ).to("cuda")
-        
-        # 入力を結合
-        combined_inputs = {
-            **image_inputs,
-            "input_ids": text_inputs["input_ids"],
-            "attention_mask": text_inputs["attention_mask"] if "attention_mask" in text_inputs else None
-        }
-        
-        # 推論
-        print("Generating response...")
-        output_ids, pred_masks = model.evaluate(
-            image_inputs,
-            sam_tensor,
-            combined_inputs["input_ids"],
-            [resize_size],
-            original_size_list,
-            max_new_tokens=512,
-            tokenizer=tokenizer,
+        save_path = "{}/{}_mask_{}.jpg".format(
+            args.vis_save_path, image_path.split("/")[-1].split(".")[0], i
         )
+        cv2.imwrite(save_path, pred_mask * 100)
+        print("{} has been saved.".format(save_path))
 
-        # テキスト出力の処理
-        if hasattr(output_ids, 'sequences'):
-            output_ids = output_ids.sequences[0]
-        
-        text_output = tokenizer.decode(output_ids, skip_special_tokens=False)
-        text_output = text_output.replace("\n", "").replace("  ", " ")
-        print("text_output: ", text_output)
-
-        # マスク出力の処理
-        for i, pred_mask in enumerate(pred_masks):
-            if pred_mask.shape[0] == 0:
-                continue
-
-            pred_mask = pred_mask.detach().cpu().numpy()[0]
-            pred_mask = pred_mask > 0
-
-            save_path = "{}/{}_mask_{}.jpg".format(
-                args.vis_save_path, image_path.split("/")[-1].split(".")[0], i
-            )
-            cv2.imwrite(save_path, pred_mask * 100)
-            print("{} has been saved.".format(save_path))
-
-            save_path = "{}/{}_masked_img_{}.jpg".format(
-                args.vis_save_path, image_path.split("/")[-1].split(".")[0], i
-            )
-            save_img = image_np.copy()
-            save_img[pred_mask] = (
-                image_np * 0.5
-                + pred_mask[:, :, None].astype(np.uint8) * np.array([255, 0, 0]) * 0.5
-            )[pred_mask]
-            save_img = cv2.cvtColor(save_img, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(save_path, save_img)
-            print("{} has been saved.".format(save_path))
+        save_path = "{}/{}_masked_img_{}.jpg".format(
+            args.vis_save_path, image_path.split("/")[-1].split(".")[0], i
+        )
+        save_img = image_np.copy()
+        save_img[pred_mask] = (
+            image_np * 0.5
+            + pred_mask[:, :, None].astype(np.uint8) * np.array([255, 0, 0]) * 0.5
+        )[pred_mask]
+        save_img = cv2.cvtColor(save_img, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(save_path, save_img)
+        print("{} has been saved.".format(save_path))
 
 
 if __name__ == "__main__":
