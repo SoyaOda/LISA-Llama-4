@@ -14,7 +14,7 @@ from transformers import (
     MllamaForCausalLM,
     MllamaModel,
     MllamaPreTrainedModel,
-    MllamaProcessor
+    AutoProcessor
 )
 
 """
@@ -36,20 +36,21 @@ from transformers import (
    - 自己回帰言語モデルタスク用
    - テキストのみの入力に対応（視覚機能なし）
 
-5. MllamaProcessor
+5. AutoProcessor
    - 画像とテキスト入力の両方を前処理
    - トークナイザと画像プロセッサを組み合わせたもの
+   - 以前のMllamaProcessorに代わって使用する新しい汎用プロセッサ
 
 使用方法:
 ```python
-from transformers import MllamaProcessor, MllamaForConditionalGeneration
+from transformers import AutoProcessor, MllamaForConditionalGeneration
 import torch
 from PIL import Image
 
 # プロセッサとモデルのロード
-model_name = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-processor = MllamaProcessor.from_pretrained(model_name)
-model = MllamaForConditionalGeneration.from_pretrained(model_name)
+model_id = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+processor = AutoProcessor.from_pretrained(model_id)
+model = MllamaForConditionalGeneration.from_pretrained(model_id)
 
 # 画像の読み込み
 image = Image.open("path/to/image.jpg")

@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, BitsAndBytesConfig, CLIPImageProcessor, MllamaProcessor
+from transformers import AutoTokenizer, BitsAndBytesConfig, CLIPImageProcessor, AutoProcessor
 from huggingface_hub import login
 
 from model.LISA import LISAForCausalLM, Llama32LISAForCausalLM
@@ -157,7 +157,7 @@ def main(args):
         print(f"Loading Llama3.2 Vision + SAM model: {args.version}")
         
         # Llama3.2 Visionモデル用のプロセッサ
-        processor = MllamaProcessor.from_pretrained(args.version)
+        processor = AutoProcessor.from_pretrained(args.version)
         tokenizer = processor.tokenizer
         
         # <SEG>トークンがボキャブラリにない場合は追加
