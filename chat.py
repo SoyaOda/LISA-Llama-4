@@ -663,16 +663,54 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                             **generation_config
                         )
                     
-                    # 生成されたテキストのデコード
-                    output = tokenizer.decode(generation[0][input_ids.shape[0]:], skip_special_tokens=True)
-                    
-                    # 生成テキストが停止ワードで終わっている場合、その前までを使用
-                    if stop_str and stop_str in output:
-                        output = output.split(stop_str)[0]
-                    
-                    # 結果を会話に追加して表示
-                    conversation[-1]["content"] = output
-                    print(f"Assistant: {output}")
+                    # 生成結果のデコード
+                    try:
+                        # generationが定義されているか確認
+                        if 'generation' not in locals() or generation is None:
+                            print("警告: 生成結果が見つかりません。エラーが発生した可能性があります。")
+                            if 'inputs' in locals() and 'input_ids' in locals():
+                                output = "エラーが発生しました。もう一度試してください。"
+                                conversation[-1]["content"] = output
+                                print(f"Assistant: {output}")
+                                continue
+                            else:
+                                error_msg = "入力と生成結果の両方が見つかりません。深刻なエラーが発生しています。"
+                                conversation[-1]["content"] = error_msg
+                                print(f"Assistant: {error_msg}")
+                                continue
+                        
+                        # デコードを実行
+                        if hasattr(tokenizer, 'tokenizer'):
+                            # MllamaProcessorの場合
+                            output = tokenizer.tokenizer.decode(generation[0][input_ids.shape[0]:], skip_special_tokens=True)
+                            print(f"MllamaProcessor.tokenizerを使用してデコード")
+                        else:
+                            # 通常のトークナイザーの場合
+                            output = tokenizer.decode(generation[0][input_ids.shape[0]:], skip_special_tokens=True)
+                            print(f"Tokenizerを使用してデコード")
+                        
+                        conversation[-1]["content"] = output
+                        print(f"Assistant: {output}")
+                    except Exception as decode_error:
+                        print(f"デコード中にエラーが発生: {decode_error}")
+                        import traceback
+                        traceback.print_exc()
+                        
+                        # エラー時のフォールバック
+                        try:
+                            # トークナイザーがMllamaProcessorの場合、プリミティブなデコードを試みる
+                            if hasattr(tokenizer, 'tokenizer'):
+                                tokens = generation[0][input_ids.shape[0]:].tolist()
+                                output = tokenizer.tokenizer.convert_ids_to_tokens(tokens)
+                                output = "".join(output).replace("▁", " ")
+                                print(f"プリミティブなデコードで取得: {output}")
+                            else:
+                                output = "デコードできませんでした。もう一度試してください。"
+                        except:
+                            output = "エラーが発生しました。もう一度試してください。"
+                        
+                        conversation[-1]["content"] = output
+                        print(f"Assistant: {output}")
                 
                 except Exception as gen_error:
                     print(f"生成中にエラーが発生しました: {gen_error}")
