@@ -35,20 +35,22 @@ def create_mllama_message(
     # 画像の処理（文字列/パス、BytesIO、PIL.Imageに対応）
     processed_image = process_images(image)
     
+    # セグメンテーション要求の場合は特別な処理
+    is_seg_request = "<SEG>" in text or "[SEG]" in text or "segment" in text.lower()
+    
     # 明示的に画像トークンを追加（必要な場合）
-    # MllamaProcessorでの一般的なエラー解決のため
-    if "<|image|>" not in text and "segment" in text.lower():
-        text = "<|image|> " + text
+    if "<|image|>" not in text:
+        if is_seg_request:
+            # セグメンテーション要求の場合、先頭に画像トークンを追加
+            text = "<|image|> " + text
+        else:
+            # 一般的な場合
+            text = "<|image|> " + text
     
-    # MetaのMllamaProcessorが期待する形式
-    # Processorのエラー回避のため、単純に画像とテキストをそのまま返す
-    # これにより、tokenizer(**message)の呼び出しで適切に処理される
     if verbose:
-        print(f"作成されたメッセージ: 画像とテキスト「{text[:30]}...」")
+        print(f"作成されたMllamaメッセージ: {text[:50]}...")
     
-    # MllamaProcessorの期待する最もシンプルなフォーマット
-    # 技術的には、画像はimagesキーに、テキストはtextキーに
-    # このシンプルな形式はtokenizer(images=image, text=text)と同等
+    # MllamaProcessorの期待する形式
     return {
         "images": processed_image,
         "text": text

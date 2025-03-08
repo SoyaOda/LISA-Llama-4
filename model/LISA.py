@@ -715,132 +715,66 @@ class Llama32LISAForCausalLM(nn.Module):
                     print(f"SAMモデルの移動中にエラー: {move_error}")
                     print("CPUで処理を続行します")
             
-            # パラメータの整理とデバイスの統一
-            kwargs = self._prepare_inputs_for_generation(input_ids, attention_mask=attention_mask, **kwargs)
+            # オリジナルのLISAコードに基づいて実装
+            # 基本的な生成を実行（SEGトークンの位置を取得するため）
+            outputs = self.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=kwargs.get("max_new_tokens", 512),
+                num_beams=1,
+                output_hidden_states=True,
+                return_dict_in_generate=True,
+            )
             
-            # generate関数を呼び出して応答を生成
-            outputs = super().generate(**kwargs)
+            output_hidden_states = outputs.hidden_states[-1]
+            output_ids = outputs.sequences
             
-            # セグメンテーションが必要かどうかを判断
-            if "<SEG>" not in self.tokenizer.decode(input_ids[0]) and "<SEG>" not in self.tokenizer.decode(outputs[0]):
-                print("セグメンテーショントークンがないため、通常の生成結果を返します")
-                return outputs
+            # セグメンテーショントークンのマスクを作成
+            seg_token_mask = output_ids[:, 1:] == self.seg_token_idx
             
-            # 画像が提供されたかどうかチェック
-            if image is None and "pixel_values" in kwargs:
-                # pixel_valuesから画像情報を使用
-                pixel_values = kwargs["pixel_values"]
-                print(f"pixel_values形状: {pixel_values.shape if pixel_values is not None else None}")
-            elif "images" in kwargs:
-                # imagesキーがある場合はそれを使用
-                print("imagesキーから画像を使用します")
-                from PIL import Image
-                import torch
-                
-                # PILイメージをテンソルに変換
-                if isinstance(kwargs["images"], Image.Image):
-                    # 画像の前処理
-                    from torchvision import transforms
-                    transform = transforms.Compose([
-                        transforms.ToTensor(),
-                        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                            std=[0.229, 0.224, 0.225])
-                    ])
-                    pixel_values = transform(kwargs["images"]).unsqueeze(0).to(device)
-                    print(f"PILイメージからpixel_values形状: {pixel_values.shape}")
-            elif image is not None:
-                # 直接画像パラメータが渡された場合
-                print("image引数から画像を使用します")
-                from PIL import Image
-                import torch
-                
-                # PILイメージをテンソルに変換
-                if isinstance(image, Image.Image):
-                    # 画像の前処理
-                    from torchvision import transforms
-                    transform = transforms.Compose([
-                        transforms.ToTensor(),
-                        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                            std=[0.229, 0.224, 0.225])
-                    ])
-                    pixel_values = transform(image).unsqueeze(0).to(device)
-                    print(f"image引数からpixel_values形状: {pixel_values.shape}")
+            # 先頭部分の処理（IMAGE_TOKEN_INDEXとの共存のため）
+            seg_token_mask = torch.cat(
+                [
+                    torch.zeros((seg_token_mask.shape[0], 1)).bool().to(seg_token_mask.device),
+                    seg_token_mask,
+                ],
+                dim=1,
+            )
             
-            # 画像がないなら早期リターン
-            if pixel_values is None:
-                print("画像が提供されていないため、通常の生成結果を返します")
-                return outputs
-            
-            # 出力の中から<SEG>トークンのインデックスを検索
-            tokenizer = self.tokenizer
-            seg_token_id = tokenizer.convert_tokens_to_ids("<SEG>")
+            # セグメンテーショントークンの位置を特定
             seg_token_indices = []
+            for i in range(seg_token_mask.shape[0]):
+                indices = torch.where(seg_token_mask[i])[0].tolist()
+                seg_token_indices.append(indices)
             
-            for i, sequence in enumerate(outputs):
-                for j, token_id in enumerate(sequence):
-                    if token_id == seg_token_id:
-                        seg_token_indices.append(j)
+            # オリジナルサイズの画像情報を取得または推定
+            original_size = image.size[::-1] if hasattr(image, "size") else (1024, 1024)
             
-            if not seg_token_indices:
-                print("<SEG>トークンが出力に見つかりませんでした。通常の生成結果を返します")
-                return outputs
+            # 画像埋め込みとセグメンテーションマスクの取得
+            image_embeddings = self.get_image_embeddings(image=image, pixel_values=pixel_values)
             
-            print(f"<SEG>トークンインデックス: {seg_token_indices}")
+            # マスクの生成
+            pred_masks = self.get_masks(
+                image_embeddings=image_embeddings,
+                output_tokens=output_ids,
+                seg_token_indices=seg_token_indices[0] if seg_token_indices else [],
+                original_sizes=[original_size]
+            )
             
-            # SAMモデルを使用した処理
-            with torch.no_grad():
-                # 画像エンコーディング
-                try:
-                    image_embeddings = self.visual_model.image_encoder(pixel_values)
-                    print(f"SAM画像エンベディング形状: {image_embeddings.shape}")
-                except Exception as encode_error:
-                    print(f"画像エンコード中にエラー: {encode_error}")
-                    import traceback
-                    traceback.print_exc()
-                    # エラーが発生した場合は元の出力を返す
-                    return outputs
-                
-                # SAMデコードで生成されたテキストを使用してマスクを生成
-                try:
-                    # 元の画像サイズを取得
-                    orig_size = kwargs.get("orig_size", None)
-                    if orig_size is None and isinstance(image, Image.Image):
-                        print("画像サイズを自動検出します")
-                        width, height = image.size
-                        orig_size = (height, width)
-                    
-                    if orig_size:
-                        print(f"元の画像サイズ: {orig_size}")
-                    
-                    # マスクデコーディング
-                    masks = self.get_masks(
-                        image_embeddings=image_embeddings,
-                        output_tokens=outputs,
-                        seg_token_indices=seg_token_indices,
-                        original_sizes=[orig_size] if orig_size else None,
-                    )
-                    
-                    # マスク情報を表示
-                    if masks is not None:
-                        print(f"生成されたマスク: {len(masks)}個")
-                    else:
-                        print("マスク生成に失敗しました")
-                        
-                    # 生成結果を返す（マスクは別途保存/処理される）
-                    return outputs
-                
-                except Exception as mask_error:
-                    print(f"マスク生成中にエラー: {mask_error}")
-                    import traceback
-                    traceback.print_exc()
-                    return outputs
-                
+            # 生成結果を返す
+            return output_ids
+            
         except Exception as e:
-            print(f"generate_masks関数内でエラーが発生: {e}")
             import traceback
+            print(f"generate_masks内でエラーが発生: {e}")
             traceback.print_exc()
-            # エラーの場合は通常の生成結果を返す
-            return super().generate(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+            
+            # エラー時はそのまま通常の生成に戻る
+            return self.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **kwargs
+            )
 
     def load_state_dict(self, state_dict, strict=False):
         """
@@ -1087,3 +1021,39 @@ class Llama32LISAForCausalLM(nn.Module):
             
             # マスクの保存や視覚化はchat.pyで行われる
             return masks
+
+    def get_image_embeddings(self, image=None, pixel_values=None):
+        """
+        画像埋め込みを取得する関数
+        Args:
+            image: PIL画像
+            pixel_values: すでに変換済みのピクセル値テンソル
+        Returns:
+            画像埋め込みテンソル
+        """
+        device = next(self.parameters()).device
+        
+        # pixel_valuesが指定されている場合はそれを使用
+        if pixel_values is not None:
+            return self.visual_model.image_encoder(pixel_values)
+        
+        # imageが指定されている場合は変換して使用
+        if image is not None:
+            from PIL import Image
+            import torch
+            
+            # PILイメージをテンソルに変換
+            if isinstance(image, Image.Image):
+                # 画像の前処理
+                from torchvision import transforms
+                transform = transforms.Compose([
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                        std=[0.229, 0.224, 0.225])
+                ])
+                pixel_values = transform(image).unsqueeze(0).to(device)
+                print(f"画像をテンソルに変換: 形状{pixel_values.shape}")
+                return self.visual_model.image_encoder(pixel_values)
+        
+        # どちらも指定されていない場合はエラー
+        raise ValueError("画像またはピクセル値が必要です")

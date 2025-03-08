@@ -430,8 +430,10 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                                     inputs = {k: v.to(device) for k, v in inputs.items()}
                         
                         # LISAモデルのgenerate_masks関数用にパラメータを整理
-                        # 重複を避けるため、inputsからinput_idsを削除
-                        mask_inputs = {k: v for k, v in inputs.items() if k != "input_ids"}
+                        # 重複を避けるため、inputsから冗長なキーを削除
+                        # input_ids と attention_mask は明示的に渡すので除外
+                        mask_inputs = {k: v for k, v in inputs.items() 
+                                      if k not in ["input_ids", "attention_mask"]}
                         
                         # 画像が正しく処理されているか確認
                         if image is not None:
@@ -678,12 +680,16 @@ def main(args):
                         
                         # セグメンテーション実行
                         with torch.no_grad():
+                            # test_inputsから冗長なキーを削除
+                            test_mask_inputs = {k: v for k, v in test_inputs.items() 
+                                              if k not in ["input_ids", "attention_mask"]}
+                            
                             generation = model.generate_masks(
                                 image=test_image,
                                 input_ids=test_inputs.input_ids,
                                 attention_mask=test_inputs.attention_mask,
-                                **test_inputs,
                                 max_new_tokens=256,
+                                **test_mask_inputs
                             )
                             
                             # 生成されたテキストをデコード
