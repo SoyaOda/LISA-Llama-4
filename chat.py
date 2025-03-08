@@ -12,7 +12,8 @@ from PIL import Image
 import re
 
 from model.LISA import Llama32LISAForCausalLM
-from model.llama3_2 import conversation as llama3_2_conversation
+# 会話ライブラリは必要に応じて動的にインポート
+# from model.llava import conversation as conversation_lib
 from model.llama3_2.constants import IMAGE_TOKEN, SEG_TOKEN
 from model.segment_anything.utils.transforms import ResizeLongestSide
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
@@ -174,6 +175,13 @@ def parse_args(args):
         action="store_true",
         help="Whether to use sampling for generation",
     )
+    parser.add_argument(
+        "--conv_type",
+        default="llava_v1",
+        type=str,
+        choices=["llava_v1", "llava_llama_2"],
+        help="Conversation template type",
+    )
     return parser.parse_args(args)
 
 
@@ -248,13 +256,20 @@ def create_segment_prompt(text):
 
 def chatting(args, model, tokenizer, device, prompt_template, model_max_length, max_new_tokens, sep, stop_str):
     # チャットモードのパラメータ設定
-    conv_mode = args.conv_type
+    if hasattr(args, 'conv_type'):
+        conv_mode = args.conv_type
+    else:
+        conv_mode = "llava_v1"  # デフォルト値を設定
 
     # Llama 3.2 Visionモデルの場合はLlama3.2会話形式を使用
     if args.version.startswith("meta-llama/Llama-3.2"):
-        conv = llama3_2_conversation.get_conversation_template()
-        print(f"Llama 3.2 Vision (Mllama)モデルを検出しました。画像トークン: {IMAGE_TOKEN}")
+        from model.llama3_2.conversation import conv_templates
+        conv = conv_templates["llama3_2"].copy()
+        print(f"Llama 3.2 Vision (Mllama)モデルを検出しました")
+        print(f"画像トークン: {IMAGE_TOKEN}")
     else:
+        # 通常のモデルではconversation_libを動的にインポート
+        from model.llava import conversation as conversation_lib
         conv = conversation_lib.conv_templates[conv_mode].copy()
     
     # 会話履歴をリセット
