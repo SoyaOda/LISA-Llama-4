@@ -119,6 +119,12 @@ def parse_args(args):
         default=0.9,
         help="Top-p sampling probability",
     )
+    parser.add_argument(
+        "--repetition_penalty",
+        type=float,
+        default=1.0,
+        help="Repetition penalty for text generation",
+    )
     
     # メモリ最適化オプション
     parser.add_argument(
