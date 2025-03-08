@@ -3,7 +3,7 @@ from typing import List, Optional, Union, Tuple, Dict, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import BitsAndBytesConfig, CLIPVisionModel, MllamaForConditionalGeneration, MllamaConfig
+from transformers import BitsAndBytesConfig, CLIPVisionModel, AutoModelForVision2Seq, AutoConfig
 
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          DEFAULT_IMAGE_PATCH_TOKEN)
@@ -201,12 +201,12 @@ def sigmoid_ce_loss(
 
 
 # Llama3.2 Vision + SAM統合版（このクラスのみ残す）
-class Llama32LISAForCausalLM(MllamaForConditionalGeneration):
+class Llama32LISAForCausalLM(AutoModelForVision2Seq):
     """
     Llama3.2 Vision 11B InstructモデルとSAMを統合したLISAモデル。
-    MllamaForConditionalGenerationを継承し、SAMの視覚エンコーダをビジョンタワーとして使用します。
+    AutoModelForVision2Seqを継承し、SAMの視覚エンコーダをビジョンタワーとして使用します。
     """
-    def __init__(self, config: MllamaConfig, **kwargs):
+    def __init__(self, config: AutoConfig, **kwargs):
         # ベースのマルチモーダルLlamaモデルを初期化
         super().__init__(config)
         
@@ -237,7 +237,10 @@ class Llama32LISAForCausalLM(MllamaForConditionalGeneration):
                 param.requires_grad = True
                 
         # プロジェクションレイヤー：LLM隠れ状態をマスク埋め込み次元にプロジェクション
-        hidden_size = config.hidden_size  # Llama隠れサイズ
+        # MllamaConfigはtext_configとvision_configに分かれているため、text_config.hidden_sizeを参照
+        # Hugging Faceのドキュメントによると、MLlamaConfigは複合的な構造を持ち、
+        # hidden_sizeはconfig直下ではなくtext_config内に存在する
+        hidden_size = config.text_config.hidden_size  # Llama隠れサイズ
         proj_out = self.config.out_dim     # SAMマスク埋め込みの例：256
         self.text_hidden_fcs = nn.ModuleList([
             nn.Sequential(
