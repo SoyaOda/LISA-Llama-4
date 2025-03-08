@@ -443,17 +443,21 @@ def is_valid_sam_input(tensor):
     return True
 
 
-def safe_mllama_to_sam(pixel_values):
+def safe_mllama_to_sam(pixel_values, target_size=1024):
     """
     MllamaのPIXEL_VALUESをSAM用に安全に変換する便利関数
     Args:
         pixel_values: MllamaProcessorからのpixel_values
+        target_size: 変換後の目標サイズ (SAMは通常1024x1024を想定)
     Returns:
         SAM用に適切に変換されたテンソル
     """
     # すでに適切な形状ならそのまま返す
     if is_valid_sam_input(pixel_values):
-        return pixel_values
+        # サイズをチェック - SAMは大きなサイズを想定
+        h, w = pixel_values.shape[2], pixel_values.shape[3]
+        if h >= target_size and w >= target_size:
+            return pixel_values
     
     # 変換を試みる
     converted = process_mllama_pixel_values(pixel_values, target_format="sam")
@@ -461,5 +465,11 @@ def safe_mllama_to_sam(pixel_values):
     # 変換後も無効なら例外
     if not is_valid_sam_input(converted):
         raise ValueError(f"有効なSAM入力に変換できません。形状: {converted.shape}")
+    
+    # サイズをチェック
+    h, w = converted.shape[2], converted.shape[3]
+    if h < target_size or w < target_size:
+        print(f"警告: 変換後の画像サイズ ({h}x{w}) がSAMの想定より小さいです。")
+        print(f"SAMはより大きなサイズ (約{target_size}x{target_size}) を想定しています。")
     
     return converted 

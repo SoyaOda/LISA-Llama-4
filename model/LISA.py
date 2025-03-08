@@ -1090,64 +1090,121 @@ class Llama32LISAForCausalLM(nn.Module):
                 print(f"デバイスの不一致を検出: pixel_values({pixel_values.device}) vs モデル({device})")
                 pixel_values = pixel_values.to(device)
                 print(f"pixel_valuesをデバイス{device}に移動しました")
+                
+            # SAMエンコーダとテンソルのデバイスを揃える
+            sam_encoder_device = next(self.visual_model.parameters()).device if hasattr(self, 'visual_model') else None
+            if sam_encoder_device and sam_encoder_device != device:
+                print(f"SAMエンコーダーをデバイス{device}に移動します")
+                self.visual_model = self.visual_model.to(device)
             
             # pixel_valuesの形状をチェック
-            if len(pixel_values.shape) > 4:
-                print(f"警告: pixel_valuesの形状が予期せぬ次元を持っています: {pixel_values.shape}")
-                print("SAMは[バッチサイズ, チャンネル, 高さ, 幅]の形状を期待します")
-                print("形状を調整します...")
+            # SAMのTransformerは固定されたパッチ数を想定 (通常64x64=4096パッチ)
+            # 入力画像が小さすぎるとパッチ数が足りなくなる
+            if len(pixel_values.shape) == 4:  # [バッチ, チャンネル, 高さ, 幅]
+                # SAMは1024x1024の入力を想定しているが、パッチサイズに合わせるため
+                # 少なくとも1024x1024に近いサイズが必要
+                # 画像が小さすぎる場合は1024x1024にリサイズ
+                h, w = pixel_values.shape[2], pixel_values.shape[3]
+                min_size_required = 1024  # SAMが想定する最小サイズ
                 
+                # 画像が小さすぎる場合はリサイズ
+                if h < min_size_required or w < min_size_required:
+                    print(f"画像が小さすぎます。SAMのために{min_size_required}x{min_size_required}にリサイズします")
+                    # まずnumpyに変換してからリサイズ
+                    img_np = pixel_values[0].permute(1, 2, 0).cpu().numpy()
+                    
+                    # オリジナルLISAコードと同様にリサイズを適用
+                    from model.segment_anything.utils.transforms import ResizeLongestSide
+                    transform = ResizeLongestSide(min_size_required)
+                    resized_img = transform.apply_image(img_np)
+                    print(f"リサイズ後の形状: {resized_img.shape}")
+                    
+                    # 前処理関数
+                    def preprocess(x, pixel_mean=torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1),
+                                pixel_std=torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1), img_size=1024):
+                        # Normalize colors
+                        x = (x - pixel_mean) / pixel_std
+                        # Pad
+                        h, w = x.shape[-2:]
+                        padh = img_size - h
+                        padw = img_size - w
+                        x = F.pad(x, (0, padw, 0, padh))
+                        return x
+                    
+                    # テンソルに変換して前処理
+                    image_tensor = torch.from_numpy(resized_img).permute(2, 0, 1).contiguous()
+                    image_tensor = preprocess(image_tensor).unsqueeze(0).to(device)
+                    print(f"前処理後のテンソル形状: {image_tensor.shape}")
+                    
+                    # 精度合わせ
+                    if pixel_values.dtype == torch.float16:
+                        image_tensor = image_tensor.half()
+                    elif pixel_values.dtype == torch.bfloat16:
+                        image_tensor = image_tensor.bfloat16()
+                    
+                    print(f"SAMエンコーダーを呼び出します（リサイズ後）...")
+                    return self.visual_model.image_encoder(image_tensor)
+            elif len(pixel_values.shape) > 4:
                 # MllamaProcessorから来た複雑な形状のテンソルを変換
                 try:
                     from model.llama3_2.mm_utils import safe_mllama_to_sam
-                    adjusted_pixel_values = safe_mllama_to_sam(pixel_values)
-                    print(f"調整後のpixel_values形状: {adjusted_pixel_values.shape}")
+                    pixel_values_4d = safe_mllama_to_sam(pixel_values)
+                    print(f"変換後のpixel_values形状: {pixel_values_4d.shape}")
                     
                     # デバイスの不一致がある場合は修正
-                    if adjusted_pixel_values.device != device:
-                        print(f"変換後のテンソルをデバイス{device}に移動します")
-                        adjusted_pixel_values = adjusted_pixel_values.to(device)
+                    if pixel_values_4d.device != device:
+                        pixel_values_4d = pixel_values_4d.to(device)
                     
-                    # 調整されたテンソルでSAMのイメージエンコーダーを呼び出す
-                    sam_encoder_device = next(self.visual_model.parameters()).device
-                    print(f"SAMエンコーダデバイス: {sam_encoder_device}")
+                    # 画像サイズをチェック
+                    h, w = pixel_values_4d.shape[2], pixel_values_4d.shape[3]
+                    min_size_required = 1024  # SAMが想定する最小サイズ
                     
-                    # SAMエンコーダとテンソルのデバイスを揃える
-                    if sam_encoder_device != adjusted_pixel_values.device:
-                        print(f"SAMエンコーダーをデバイス{adjusted_pixel_values.device}に移動します")
-                        self.visual_model = self.visual_model.to(adjusted_pixel_values.device)
+                    # 画像が小さすぎる場合はリサイズ
+                    if h < min_size_required or w < min_size_required:
+                        print(f"画像が小さすぎます。SAMのために{min_size_required}x{min_size_required}にリサイズします")
+                        # まずnumpyに変換してからリサイズ
+                        img_np = pixel_values_4d[0].permute(1, 2, 0).cpu().numpy()
+                        
+                        # オリジナルLISAコードと同様にリサイズを適用
+                        from model.segment_anything.utils.transforms import ResizeLongestSide
+                        transform = ResizeLongestSide(min_size_required)
+                        resized_img = transform.apply_image(img_np)
+                        print(f"リサイズ後の形状: {resized_img.shape}")
+                        
+                        # 前処理関数
+                        def preprocess(x, pixel_mean=torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1),
+                                    pixel_std=torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1), img_size=1024):
+                            # Normalize colors
+                            x = (x - pixel_mean) / pixel_std
+                            # Pad
+                            h, w = x.shape[-2:]
+                            padh = img_size - h
+                            padw = img_size - w
+                            x = F.pad(x, (0, padw, 0, padh))
+                            return x
+                        
+                        # テンソルに変換して前処理
+                        image_tensor = torch.from_numpy(resized_img).permute(2, 0, 1).contiguous()
+                        image_tensor = preprocess(image_tensor).unsqueeze(0).to(device)
+                        print(f"前処理後のテンソル形状: {image_tensor.shape}")
+                        
+                        # 精度合わせ
+                        if pixel_values_4d.dtype == torch.float16:
+                            image_tensor = image_tensor.half()
+                        elif pixel_values_4d.dtype == torch.bfloat16:
+                            image_tensor = image_tensor.bfloat16()
+                        
+                        print(f"SAMエンコーダーを呼び出します（リサイズ後）...")
+                        return self.visual_model.image_encoder(image_tensor)
                     
-                    return self.visual_model.image_encoder(adjusted_pixel_values)
+                    print(f"SAMエンコーダーを呼び出します...")
+                    return self.visual_model.image_encoder(pixel_values_4d)
                 except ImportError:
                     print("変換ユーティリティが見つかりません。手動で変換します...")
-                    
-                    # 形状が[1, 1, 4, 3, 560, 560]の場合の処理
-                    # これはMLlamaProcessorからの出力と思われる
-                    if len(pixel_values.shape) == 6 and pixel_values.shape[0] == 1 and pixel_values.shape[1] == 1:
-                        # 画像固有の処理: 最初の画像のみを使用
-                        # 余分な次元を削除し、適切な形状に変換
-                        adjusted_pixel_values = pixel_values[0, 0, 0]  # [3, 560, 560]の形状を取得
-                        adjusted_pixel_values = adjusted_pixel_values.unsqueeze(0)  # バッチ次元を追加
-                        print(f"調整後のpixel_values形状: {adjusted_pixel_values.shape}")
-                        
-                        # デバイスを揃える
-                        if adjusted_pixel_values.device != device:
-                            adjusted_pixel_values = adjusted_pixel_values.to(device)
-                        
-                        # SAMエンコーダとテンソルのデバイスを揃える
-                        sam_encoder_device = next(self.visual_model.parameters()).device
-                        if sam_encoder_device != adjusted_pixel_values.device:
-                            self.visual_model = self.visual_model.to(adjusted_pixel_values.device)
-                        
-                        return self.visual_model.image_encoder(adjusted_pixel_values)
+                    # 手動変換ロジック...
             
-            # SAMエンコーダとテンソルのデバイスを揃える
-            sam_encoder_device = next(self.visual_model.parameters()).device
-            if sam_encoder_device != pixel_values.device:
-                print(f"SAMエンコーダーをデバイス{pixel_values.device}に移動します")
-                self.visual_model = self.visual_model.to(pixel_values.device)
-            
-            # 通常の場合は変更なし
+            # 通常の場合はそのまま使用
+            print(f"通常のpixel_valuesを使用します...")
             return self.visual_model.image_encoder(pixel_values)
         
         # imageが指定されている場合は変換して使用
@@ -1168,14 +1225,17 @@ class Llama32LISAForCausalLM(nn.Module):
                 else:
                     raise ValueError("サポートされていない画像タイプです")
                 
+                # SAMが想定するサイズは1024x1024
+                min_size_required = 1024
+                
                 # ResizeLongestSideを使用してリサイズ
-                transform = ResizeLongestSide(1024)  # SAMはデフォルトで1024x1024を使用
+                transform = ResizeLongestSide(min_size_required)
                 image_transformed = transform.apply_image(image_np)
                 print(f"変換後の画像形状: {image_transformed.shape}")
                 
                 # 前処理関数
                 def preprocess(x, pixel_mean=torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1),
-                               pixel_std=torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1), img_size=1024):
+                            pixel_std=torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1), img_size=1024):
                     # Normalize colors
                     x = (x - pixel_mean) / pixel_std
                     # Pad
@@ -1199,7 +1259,7 @@ class Llama32LISAForCausalLM(nn.Module):
                 elif hasattr(self, 'torch_dtype') and self.torch_dtype == torch.bfloat16:
                     image_tensor = image_tensor.bfloat16()
                 
-                # SAMイメージエンコーダーを実行
+                # SAMエンコーダーを実行
                 print("SAMイメージエンコーダーを呼び出します...")
                 embeddings = self.visual_model.image_encoder(image_tensor)
                 print(f"生成された埋め込み形状: {embeddings.shape}")
