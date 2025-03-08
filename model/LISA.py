@@ -1113,6 +1113,17 @@ class Llama32LISAForCausalLM(nn.Module):
                     # まずnumpyに変換してからリサイズ
                     img_np = pixel_values[0].permute(1, 2, 0).cpu().numpy()
                     
+                    # *** 重要な修正 ***
+                    # NumPy配列をuint8形式に変換する
+                    # to_pil_imageはfloat32型を直接処理できないため
+                    if img_np.dtype == np.float32:
+                        # [0,1]の範囲にある場合は255を掛ける
+                        if img_np.max() <= 1.0:
+                            img_np = (img_np * 255.0).astype(np.uint8)
+                        else:
+                            # すでに[0,255]の範囲にある場合はそのままuint8に変換
+                            img_np = img_np.astype(np.uint8)
+                    
                     # オリジナルLISAコードと同様にリサイズを適用
                     from model.segment_anything.utils.transforms import ResizeLongestSide
                     transform = ResizeLongestSide(min_size_required)
@@ -1164,6 +1175,18 @@ class Llama32LISAForCausalLM(nn.Module):
                         print(f"画像が小さすぎます。SAMのために{min_size_required}x{min_size_required}にリサイズします")
                         # まずnumpyに変換してからリサイズ
                         img_np = pixel_values_4d[0].permute(1, 2, 0).cpu().numpy()
+                        
+                        # *** 重要な修正 ***
+                        # NumPy配列をuint8形式に変換
+                        if img_np.dtype == np.float32:
+                            # [0,1]の範囲にある場合は255を掛ける
+                            if img_np.max() <= 1.0:
+                                img_np = (img_np * 255.0).astype(np.uint8)
+                            else:
+                                # すでに[0,255]の範囲にある場合はそのままuint8に変換
+                                img_np = img_np.astype(np.uint8)
+                        
+                        print(f"変換後のNumPy配列型: {img_np.dtype}, 範囲: [{img_np.min()}, {img_np.max()}]")
                         
                         # オリジナルLISAコードと同様にリサイズを適用
                         from model.segment_anything.utils.transforms import ResizeLongestSide
@@ -1224,6 +1247,18 @@ class Llama32LISAForCausalLM(nn.Module):
                     print(f"NumPy画像形状: {image_np.shape}")
                 else:
                     raise ValueError("サポートされていない画像タイプです")
+                
+                # *** 重要な修正 ***
+                # NumPy配列をuint8形式に変換
+                if image_np.dtype == np.float32:
+                    # [0,1]の範囲にある場合は255を掛ける
+                    if image_np.max() <= 1.0:
+                        image_np = (image_np * 255.0).astype(np.uint8)
+                    else:
+                        # すでに[0,255]の範囲にある場合はそのままuint8に変換
+                        image_np = image_np.astype(np.uint8)
+                        
+                print(f"変換後のNumPy配列型: {image_np.dtype}, 範囲: [{image_np.min()}, {image_np.max()}]")
                 
                 # SAMが想定するサイズは1024x1024
                 min_size_required = 1024
