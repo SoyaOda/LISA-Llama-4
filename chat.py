@@ -261,13 +261,34 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
             if user_input.lower() == "exit":
                 break
             
-            # 画像パスをチェック
+            # 画像パスを明示的に要求
             image_path = None
-            for word in user_input.split():
-                if os.path.exists(word) and word.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    image_path = word
-                    user_input = user_input.replace(image_path, "").strip()
-                    break
+            is_seg_request = "<SEG>" in user_input or "segment" in user_input.lower()
+            
+            # セグメンテーション要求があれば画像パスも要求
+            if is_seg_request:
+                image_path = input("画像のパスを入力してください: ")
+                
+                # 画像が存在するか確認
+                if not os.path.exists(image_path) or not image_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    print(f"警告: 指定されたパス '{image_path}' が存在しないか、サポートされていない形式です。")
+                    image_path = None
+                    
+                    # 再試行するか確認
+                    retry = input("有効な画像パスを入力しますか？ (y/n): ")
+                    if retry.lower() == 'y':
+                        image_path = input("画像のパスを再入力してください: ")
+                        if not os.path.exists(image_path) or not image_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+                            print(f"警告: 指定されたパス '{image_path}' が存在しないか、サポートされていない形式です。テキストのみで処理します。")
+                            image_path = None
+            
+            # 古いコード（バックアップとして残すが、上記の明示的な要求が優先）
+            if image_path is None:
+                for word in user_input.split():
+                    if os.path.exists(word) and word.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        image_path = word
+                        user_input = user_input.replace(image_path, "").strip()
+                        break
             
             # 会話履歴に追加
             conversation.append({"role": "user", "content": user_input})
@@ -411,7 +432,7 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
             with torch.no_grad():
                 try:
                     # 画像によるセグメンテーションの場合、generate_masksを使用
-                    if (image_path and "<SEG>" in user_input) or ("<SEG>" in user_input and "segment" in user_input.lower()):
+                    if image_path and (is_seg_request or "<SEG>" in user_input or "[SEG]" in user_input):
                         print("セグメンテーションモードで実行中...")
                         # LISA専用の関数を使用
                         generation = model.generate_masks(
@@ -423,14 +444,29 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                         )
                     else:
                         # 通常の生成
+                        print("通常の生成モードで実行中...")
+                        generation_config = {
+                            "max_new_tokens": max_new_tokens,
+                            "do_sample": args.do_sample,
+                        }
+                        
+                        # サンプリング有効時のみパラメータを追加
+                        if args.do_sample:
+                            generation_config.update({
+                                "temperature": args.temperature,
+                                "top_p": args.top_p,
+                                "top_k": args.top_k,
+                            })
+                        
+                        # 常に適用するパラメータ
+                        generation_config.update({
+                            "repetition_penalty": args.repetition_penalty,
+                        })
+                        
+                        # 生成実行
                         generation = model.generate(
                             **inputs,
-                            max_new_tokens=max_new_tokens,
-                            do_sample=args.do_sample,
-                            temperature=args.temperature,
-                            top_p=args.top_p,
-                            top_k=args.top_k,
-                            repetition_penalty=args.repetition_penalty,
+                            **generation_config
                         )
                     
                     # 生成されたテキストのデコード
