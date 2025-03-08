@@ -209,294 +209,202 @@ def get_prompt_template():
 """
 
 
+def process_images(images, processor):
+    """
+    画像をモデル用に処理する関数
+    """
+    try:
+        return processor(images, return_tensors="pt")
+    except Exception as e:
+        print(f"画像処理エラー: {e}")
+        import traceback
+        traceback.print_exc()
+        # 代わりにnumpy処理を試す
+        try:
+            import numpy as np
+            img_array = np.array(images[0])
+            return {"pixel_values": torch.tensor(img_array).permute(2, 0, 1).unsqueeze(0).float() / 255.0}
+        except Exception as e2:
+            print(f"バックアップ処理でもエラー: {e2}")
+            return None
+
+def create_segment_prompt(text):
+    """
+    セグメンテーション用のプロンプトを作成します
+    Args:
+        text: 入力テキスト
+    Returns:
+        SEGトークンを含むプロンプト
+    """
+    # SEGトークンが含まれているか確認し、なければ追加
+    if SEG_TOKEN not in text:
+        # 最後に追加
+        if text.endswith('.') or text.endswith('?') or text.endswith('!'):
+            text = f"{text} {SEG_TOKEN}"
+        else:
+            text = f"{text}. {SEG_TOKEN}"
+        print(f"ユーザー入力にSEGトークンを追加しました")
+    return text
+
 def chatting(args, model, tokenizer, device, prompt_template, model_max_length, max_new_tokens, sep, stop_str):
-    """チャットモードの実行関数"""
-    print("チャットモードを開始します。'exit'と入力すると終了します。")
-    
-    # 会話履歴を初期化
-    conversation = []
-    
-    # デバイスマップの確認 - モデルがautoマッピングを使用しているかどうか
-    device_map = getattr(model, "hf_device_map", None)
-    is_auto_device_map = device_map == "auto" or isinstance(device_map, dict)
-    
-    # 最大画像サイズの設定（メモリ使用量削減のため）
-    if args.very_low_memory:
-        max_img_size = 384  # 超低メモリモードでは384x384に制限
-    elif args.low_memory:
-        max_img_size = 512  # 低メモリモードでは512x512に制限
+    # チャットモードのパラメータ設定
+    conv_mode = args.conv_type
+
+    # Llama 3.2 Visionモデルの場合はLlama3.2会話形式を使用
+    if args.version.startswith("meta-llama/Llama-3.2"):
+        conv = llama3_2_conversation.get_conversation_template()
+        print(f"Llama 3.2 Vision (Mllama)モデルを検出しました。画像トークン: {IMAGE_TOKEN}")
     else:
-        max_img_size = 768  # 通常モードでも768x768に制限
+        conv = conversation_lib.conv_templates[conv_mode].copy()
     
-    print(f"画像処理の最大サイズ: {max_img_size}x{max_img_size}")
+    # 会話履歴をリセット
+    conv.messages = []
     
-    # 常にGCを有効化してメモリリークを防止
-    import gc
-    gc.enable()
-    
-    # トークナイザーのアクセス方法を決定
-    tokenizer_func = tokenizer.tokenizer if hasattr(tokenizer, 'tokenizer') else tokenizer
-    
-    # 画像トークンを取得（MllamaProcessorのための特別処理）
-    image_token = None
-    if hasattr(tokenizer, 'image_token'):
-        image_token = tokenizer.image_token
-    elif hasattr(tokenizer_func, 'special_tokens_map') and 'image' in tokenizer_func.special_tokens_map:
-        image_token = tokenizer_func.special_tokens_map['image']
+    # メモリ使用量に基づいた画像サイズの選択
+    if args.low_memory:
+        max_img_size = 256
+        print(f"低メモリモード: 画像処理の最大サイズ: {max_img_size}x{max_img_size}")
+    elif args.very_low_memory:
+        max_img_size = 384
+        print(f"超低メモリモード: 画像処理の最大サイズ: {max_img_size}x{max_img_size}")
     else:
-        # デフォルトの画像トークン
-        image_token = "<image>"
+        max_img_size = 768
+        print(f"通常モード: 画像処理の最大サイズ: {max_img_size}x{max_img_size}")
     
-    # モデルタイプの判定
-    is_mllama = hasattr(tokenizer, 'processor') or hasattr(tokenizer, 'image_processor')
-    if is_mllama:
-        print(f"Llama 3.2 Vision (Mllama)モデルを検出しました。画像トークン: {image_token}")
-    else:
-        print(f"使用する画像トークン: {image_token}")
-    
+    # メッセージ履歴の作成とチャットループ
     while True:
         try:
-            # ユーザー入力を取得
-            user_input = input("\nユーザー: ")
-            if user_input.lower() == "exit":
+            # ユーザー入力の取得
+            prompt = input("\nユーザー: ")
+            if prompt.strip() == "exit":
                 break
             
-            # 画像パスを明示的に要求
-            image_path = None
-            is_seg_request = "<SEG>" in user_input or "segment" in user_input.lower()
+            # セグメンテーションのためのフラグ
+            segment_mode = False
             
-            # セグメンテーション要求があれば画像パスも要求
-            if is_seg_request:
-                image_path = input("画像のパスを入力してください: ")
+            # セグメンテーションが要求されているか確認
+            if SEG_TOKEN in prompt or "segment" in prompt.lower() or "分割" in prompt or "抽出" in prompt:
+                segment_mode = True
+                # セグメンテーション用にプロンプトを準備
+                prompt = create_segment_prompt(prompt)
+                print(f"セグメンテーションモードで実行中...")
+            
+            # 画像の処理（画像パスが含まれている場合）
+            if "http://" in prompt or "https://" in prompt or ".jpg" in prompt or ".png" in prompt or ".jpeg" in prompt:
+                image_path = None
                 
-                # 画像が存在するか確認
-                if not os.path.exists(image_path) or not image_path.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    print(f"警告: 指定されたパス '{image_path}' が存在しないか、サポートされていない形式です。")
-                    image_path = None
+                if "http://" in prompt or "https://" in prompt:
+                    image_regex = r'(https?://[^\s]+\.(?:jpg|jpeg|png|gif))'
+                    image_paths = re.findall(image_regex, prompt)
                     
-                    # 再試行するか確認
-                    retry = input("有効な画像パスを入力しますか？ (y/n): ")
-                    if retry.lower() == 'y':
-                        image_path = input("画像のパスを再入力してください: ")
-                        if not os.path.exists(image_path) or not image_path.lower().endswith(('.png', '.jpg', '.jpeg')):
-                            print(f"警告: 指定されたパス '{image_path}' が存在しないか、サポートされていない形式です。テキストのみで処理します。")
-                            image_path = None
+                    if image_paths:
+                        image_path = image_paths[0]
+                        # URLを画像トークンに置き換え
+                        prompt = prompt.replace(image_path, IMAGE_TOKEN)
+                    else:
+                        print("有効な画像URLが見つかりませんでした")
+                else:
+                    # ローカルファイルパスを検索
+                    image_regex = r'([^\s]+\.(?:jpg|jpeg|png|gif))'
+                    image_paths = re.findall(image_regex, prompt)
+                    
+                    if image_paths:
+                        image_path = image_paths[0]
+                        # ファイルパスを画像トークンに置き換え
+                        prompt = prompt.replace(image_path, IMAGE_TOKEN)
+                    else:
+                        print("有効な画像パスが見つかりませんでした")
+            else:
+                # 画像パスを明示的に尋ねる
+                if IMAGE_TOKEN in prompt:
+                    image_path = input("画像のパスを入力してください: ")
+                else:
+                    image_path = None
             
-            # 古いコード（バックアップとして残すが、上記の明示的な要求が優先）
-            if image_path is None:
-                for word in user_input.split():
-                    if os.path.exists(word) and word.lower().endswith(('.png', '.jpg', '.jpeg')):
-                        image_path = word
-                        user_input = user_input.replace(image_path, "").strip()
-                        break
-            
-            # 会話履歴に追加
-            conversation.append({"role": "user", "content": user_input})
-            
-            # 処理開始前にメモリクリーンアップ
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-            
-            # 画像処理
-            image_tensor = None
+            # 画像の処理（画像パスがある場合）
             if image_path:
                 try:
-                    # 画像を読み込み - メモリ効率のため小さめのサイズで読み込む
-                    image = Image.open(image_path).convert('RGB')
+                    # 画像の読み込みと処理
+                    image = Image.open(image_path)
                     
-                    # 画像サイズを制限（元のアスペクト比を維持）
-                    w, h = image.size
-                    if max(w, h) > max_img_size:
-                        ratio = max_img_size / max(w, h)
-                        new_size = (int(w * ratio), int(h * ratio))
-                        print(f"画像リサイズ: {w}x{h} -> {new_size[0]}x{new_size[1]}")
-                        image = image.resize(new_size, Image.LANCZOS)
+                    # 画像のリサイズ（メモリ使用量削減のため）
+                    original_size = image.size
+                    if original_size[0] > max_img_size or original_size[1] > max_img_size:
+                        # アスペクト比を維持しながらリサイズ
+                        image.thumbnail((max_img_size, max_img_size))
+                        print(f"画像リサイズ: {original_size[0]}x{original_size[1]} -> {image.size[0]}x{image.size[1]}")
                     
-                    # SEGトークンをプロンプトに追加（必要な場合）
-                    if is_seg_request and "<SEG>" not in user_input and "[SEG]" not in user_input:
-                        user_input += " [SEG]"
-                        print("ユーザー入力にSEGトークンを追加しました")
-                    
-                    # テキストにセグメンテーション指示がある場合は必ず画像トークンを追加
-                    is_segment_request = "segment" in user_input.lower() or "<SEG>" in user_input or "[SEG]" in user_input
-                    
-                    # 推論中に不要なメモリを解放するためno_gradを使用
-                    with torch.no_grad():
-                        # Llama 3.2 Vision (Mllama)モデルの場合
-                        if is_mllama:
-                            # 最もシンプルな方法: 単純な文字列とPIL画像
-                            # 画像を先に指定し、テキストを後に指定する
-                            try:
-                                print("Mllamaプロセッサを使用")
-                                # セグメンテーション要求の場合は画像トークンを追加
-                                if is_segment_request and "<|image|>" not in user_input:
-                                    # SEGトークンを[SEG]から<SEG>に変換
-                                    processed_input = "<|image|> " + user_input.replace("[SEG]", "<SEG>")
-                                else:
-                                    # SEGトークンを[SEG]から<SEG>に変換
-                                    processed_input = user_input.replace("[SEG]", "<SEG>")
-                                
-                                # メッセージの表示
-                                print(f"入力テキスト: {processed_input}")
-                                
-                                # 明示的な引数順序でプロセッサを呼び出す
-                                print("Mllamaプロセッサでtokenizer呼び出し前...")
-                                print(f"画像タイプ: {type(image)}, テキスト: {processed_input[:50]}...")
-                                
-                                # Mllama tokenizer/processorを確認
-                                if hasattr(tokenizer, 'processor'):
-                                    print(f"processorタイプ: {type(tokenizer.processor)}")
-                                
-                                inputs = tokenizer(
-                                    images=image,  # 画像を第1引数またはキーワード引数で
-                                    text=processed_input,  # テキストを第2引数またはキーワード引数で
-                                    return_tensors="pt"
-                                )
-                                
-                                # テンソル形状のデバッグ
-                                for k, v in inputs.items():
-                                    if isinstance(v, torch.Tensor):
-                                        print(f"inputs['{k}']の形状: {v.shape}, dtype: {v.dtype}")
-                                
-                                # pixel_valuesの特別処理
-                                if 'pixel_values' in inputs:
-                                    pixel_values = inputs['pixel_values']
-                                    print(f"pixel_values形状: {pixel_values.shape}, dtype: {pixel_values.dtype}")
-                                    
-                                    # 形状が複雑すぎる場合、調整を検討
-                                    if len(pixel_values.shape) > 4:
-                                        print(f"警告: pixel_valuesの形状が複雑すぎます: {pixel_values.shape}")
-                                        print("SAMはシンプルな[バッチ, チャンネル, 高さ, 幅]形式を期待します")
-                                        
-                                        # バックアップとして画像を直接PIL→テンソルに変換
-                                        if is_segment_request:
-                                            print("セグメンテーション用に画像を直接変換します...")
-                                            # SAM用の専用画像処理を実行
-                                            from model.segment_anything.utils.transforms import ResizeLongestSide
-                                            transform = ResizeLongestSide(1024)
-                                            
-                                            # PIL画像からNumPy配列を取得
-                                            import numpy as np
-                                            image_np = np.array(image)
-                                            
-                                            # SAMの変換を適用
-                                            image_transformed = transform.apply_image(image_np)
-                                            print(f"変換後の画像形状: {image_transformed.shape}")
-                                    
-                            except Exception as e1:
-                                print(f"標準の処理中にエラー: {e1}")
-                                try:
-                                    # フォーマットされたメッセージを作成
-                                    print("代替方法: フォーマットされたメッセージを使用")
-                                    message = create_mllama_message(image, user_input, verbose=True)
-                                    print(f"作成されたメッセージ: {message.keys()}")
-                                    inputs = tokenizer(**message, return_tensors="pt")
-                                    
-                                    # テンソル形状のデバッグ
-                                    for k, v in inputs.items():
-                                        if isinstance(v, torch.Tensor):
-                                            print(f"代替inputs['{k}']の形状: {v.shape}, dtype: {v.dtype}")
-                                except Exception as e2:
-                                    print(f"代替処理中にエラー: {e2}")
-                                    raise ValueError("画像処理に失敗しました")
-                                
-                                # デバイスに移動
-                                if not is_auto_device_map:
-                                    inputs = {k: v.to(device) for k, v in inputs.items()}
-                                
-                                # 入力IDsを取得
-                                input_ids = inputs["input_ids"]
-                            else:
-                                # 通常のVLM処理（LLaVA等）
-                                # 画像トークンをテキストに追加
-                                if image_token not in user_input:
-                                    modified_input = f"{image_token} {user_input}"
-                                else:
-                                    modified_input = user_input
-                                
-                                # 通常の処理 - VLMと画像を同時に処理
-                                inputs = tokenizer(
-                                    text=modified_input,
-                                    images=image,
-                                    return_tensors="pt"
-                                )
-                                
-                                # デバイスに移動
-                                if not is_auto_device_map:
-                                    inputs = {k: v.to(device) for k, v in inputs.items()}
-                                
-                                # 入力IDsと画像テンソルを取得
-                                input_ids = inputs["input_ids"]
-                                if "pixel_values" in inputs:
-                                    image_tensor = inputs["pixel_values"]
-                except Exception as main_error:
-                    print(f"画像処理に完全に失敗しました: {main_error}")
-                    # テキストのみで処理を継続
-                    inputs = tokenizer_func(user_input, return_tensors="pt")
-                    if not is_auto_device_map:
-                        inputs = {k: v.to(device) for k, v in inputs.items()}
-                    input_ids = inputs["input_ids"]
-            else:
-                # テキストのみの処理
-                with torch.no_grad():
-                    inputs = tokenizer_func(user_input, return_tensors="pt")
-                    if not is_auto_device_map:
-                        inputs = {k: v.to(device) for k, v in inputs.items()}
-                    input_ids = inputs["input_ids"]
-            
-            # 入力サイズの確認
-            input_length = input_ids.shape[0]
-            print(f"入力トークン数: {input_length}")
-            
-            # 出力に十分な長さを確保
-            if input_length + max_new_tokens > model_max_length:
-                max_possible_tokens = model_max_length - input_length
-                print(f"警告: 入力が長すぎるため、max_new_tokensを{max_new_tokens}から{max_possible_tokens}に削減します")
-                max_new_tokens = max(1, max_possible_tokens)
-            
-            # メモリ効率のため推論時にはgrad計算を無効化
-            with torch.no_grad():
-                try:
-                    # 画像によるセグメンテーションの場合、generate_masksを使用
-                    if image_path and (is_seg_request or "<SEG>" in user_input or "[SEG]" in user_input):
-                        print("セグメンテーションモードで実行中...")
-                        
-                        # SEGトークンをプロンプトに追加（まだない場合）
-                        if "<SEG>" not in user_input and "[SEG]" not in user_input:
-                            if "segment" in user_input.lower():
-                                # テキストの末尾に[SEG]を追加
-                                user_input += " [SEG]"
-                                # 入力を再構築
-                                inputs = tokenizer_func(
-                                    user_input,
-                                    return_tensors="pt"
-                                )
-                                input_ids = inputs["input_ids"]
-                                if not is_auto_device_map:
-                                    inputs = {k: v.to(device) for k, v in inputs.items()}
-                        
-                        # LISAモデルのgenerate_masks関数用にパラメータを整理
-                        # 重複を避けるため、inputsから冗長なキーを削除
-                        # input_ids と attention_mask は明示的に渡すので除外
-                        mask_inputs = {k: v for k, v in inputs.items() 
-                                      if k not in ["input_ids", "attention_mask"]}
-                        
-                        # SAM用に画像を適切に準備
-                        # オリジナルのLISAに合わせた方法で画像を処理
-                        from model.segment_anything.utils.transforms import ResizeLongestSide
-                        transform = ResizeLongestSide(1024)  # SAMは1024x1024を使用
-                        
-                        # 画像が正しく処理されているか確認
-                        if image is not None:
-                            print(f"画像情報: {type(image)}, サイズ: {image.size if hasattr(image, 'size') else 'N/A'}")
+                    # 会話にメッセージを追加
+                    if args.version.startswith("meta-llama/Llama-3.2"):
+                        # Llama 3.2 Visionモデルでは特別なフォーマットが必要
+                        message = create_mllama_message(prompt, [image])
+                        conv.append_message(conv.roles[0], message)
+                    else:
+                        # 通常のモデルではIMAGE_TOKENを置き換える
+                        if IMAGE_TOKEN not in prompt:
+                            prompt = IMAGE_TOKEN + "\n" + prompt
                             
-                            try:
-                                # SAM用の画像処理
-                                import numpy as np
-                                image_np = np.array(image)
+                        if args.use_mm_start_end:
+                            # 開始/終了トークンで画像トークンを囲む
+                            replace_token = (
+                                DEFAULT_IM_START_TOKEN + IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
+                            )
+                            prompt = prompt.replace(IMAGE_TOKEN, replace_token)
+                            
+                        conv.append_message(conv.roles[0], prompt)
+                    
+                    # モデルの応答を追加するためのプレースホルダー
+                    conv.append_message(conv.roles[1], "")
+                    
+                    # 最終的なプロンプトを生成
+                    prompt = conv.get_prompt()
+                    
+                    # Llama 3.2 Visionモデルとその他のモデルで処理を分ける
+                    if args.version.startswith("meta-llama/Llama-3.2"):
+                        # MllamaProcessorのケース
+                        # 画像処理をより詳細にデバッグ
+                        print("Mllamaプロセッサを使用")
+                        print(f"入力テキスト: {prompt[:50]}...")
+                        try:
+                            print("Mllamaプロセッサでtokenizer呼び出し前...")
+                            print(f"画像タイプ: {type(image)}, テキスト: {prompt[:50]}...")
+                            
+                            # ProcessorでTokenizerと画像処理を同時に行う
+                            inputs = tokenizer(
+                                text=prompt,
+                                images=[image],
+                                return_tensors="pt"
+                            )
+                            
+                            # デバッグ情報
+                            for key, tensor in inputs.items():
+                                print(f"inputs['{key}']の形状: {tensor.shape}, dtype: {tensor.dtype}")
+                            
+                            input_ids = inputs["input_ids"]
+                            attention_mask = inputs["attention_mask"]
+                            
+                            # キューに追加
+                            pixel_values = inputs["pixel_values"]
+                            print(f"pixel_values形状: {pixel_values.shape}, dtype: {pixel_values.dtype}")
+                            
+                            # セグメンテーションモードの場合、追加のチェック
+                            if segment_mode:
+                                print(f"入力トークン数: {len(torch.where(input_ids[0] == tokenizer.tokenizer.convert_tokens_to_ids('<SEG>'))[0])}")
                                 
-                                # 入力テンソルに特別な処理が必要か確認
+                                # マスク生成に必要なパラメータを追加
+                                mask_inputs = {}
+                                for key, value in inputs.items():
+                                    if key != "input_ids" and key != "attention_mask":
+                                        mask_inputs[key] = value
+                                
+                                # デバイスに移動
+                                input_ids = input_ids.to(device)
+                                attention_mask = attention_mask.to(device)
+                                
+                                # 画像情報を表示
+                                print(f"画像情報: {type(image)}, サイズ: {image.size}")
+                                
+                                # 画像ピクセル値の形状チェック
                                 if 'pixel_values' in inputs and len(inputs['pixel_values'].shape) > 4:
                                     print("複雑な形状のpixel_valuesを検出しました。適切な形状に変換します...")
                                     pixel_values = inputs['pixel_values']
@@ -507,226 +415,242 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                                         pixel_values = safe_mllama_to_sam(pixel_values)
                                         print(f"SAM用に変換成功: 形状={pixel_values.shape}")
                                         
-                                        # デバイスをモデルに合わせる
-                                        device_to_use = next(model.parameters()).device
-                                        print(f"モデルデバイス: {device_to_use}")
-                                        pixel_values = pixel_values.to(device_to_use)
-                                        print(f"テンソルをデバイス{device_to_use}に移動しました")
-                                        
-                                        # mask_inputsからpixel_valuesを削除して重複を防ぐ
-                                        clean_mask_inputs = {k: v for k, v in mask_inputs.items() 
-                                                           if k != 'pixel_values'}
+                                        # pixel_valuesキーを持つkwargsを作成
+                                        # clean_mask_inputs = {k: v for k, v in mask_inputs.items() 
+                                        #                   if k != 'pixel_values'}
                                         
                                         # トークナイザーを追加
-                                        clean_mask_inputs["tokenizer"] = tokenizer
+                                        # clean_mask_inputs["tokenizer"] = tokenizer
                                         
                                         # generate_masksを実行
                                         result = model.generate_masks(
                                             image=None,  # PILを渡さない
                                             input_ids=input_ids,
-                                            attention_mask=inputs.get("attention_mask", None),
-                                            pixel_values=pixel_values,  # 変換済みのテンソルを渡す
+                                            attention_mask=attention_mask,
+                                            pixel_values=pixel_values,  # 変換済みのテンソル
                                             max_new_tokens=max_new_tokens,
-                                            **clean_mask_inputs
+                                            do_sample=args.do_sample,
+                                            temperature=args.temperature,
+                                            top_p=args.top_p,
+                                            tokenizer=tokenizer
                                         )
                                     except Exception as conversion_error:
                                         print(f"テンソル変換中にエラー: {conversion_error}")
                                         print("代わりにPIL画像を使用します...")
                                         
-                                        # mask_inputsからpixel_valuesを削除して重複を防ぐ
-                                        clean_mask_inputs = {k: v for k, v in mask_inputs.items() 
-                                                           if k != 'pixel_values'}
-                                        
-                                        # トークナイザーを追加
-                                        clean_mask_inputs["tokenizer"] = tokenizer
-                                        
-                                        # 通常の処理 - PILイメージを使用
+                                        # generate_masksを実行（PILイメージを使用）
                                         result = model.generate_masks(
                                             image=image,  # PIL Image
                                             input_ids=input_ids,
-                                            attention_mask=inputs.get("attention_mask", None),
-                                            pixel_values=None,  # pixel_valuesは渡さない
+                                            attention_mask=attention_mask,
+                                            pixel_values=None,
                                             max_new_tokens=max_new_tokens,
-                                            **clean_mask_inputs
+                                            do_sample=args.do_sample,
+                                            temperature=args.temperature,
+                                            top_p=args.top_p,
+                                            tokenizer=tokenizer
                                         )
                                 else:
-                                    # mask_inputsからpixel_valuesを削除して重複を防ぐ
-                                    clean_mask_inputs = {k: v for k, v in mask_inputs.items() 
-                                                       if k != 'pixel_values'}
-                                    
-                                    # トークナイザーを追加
-                                    clean_mask_inputs["tokenizer"] = tokenizer
-                                    
-                                    # 通常の処理 - PILイメージを使用
+                                    # 通常の処理
                                     result = model.generate_masks(
-                                        image=image,  # PIL Image
+                                        image=image,
                                         input_ids=input_ids,
-                                        attention_mask=inputs.get("attention_mask", None),
-                                        pixel_values=None,  # pixel_valuesを明示的にNoneに設定
+                                        attention_mask=attention_mask,
                                         max_new_tokens=max_new_tokens,
-                                        **clean_mask_inputs
+                                        do_sample=args.do_sample,
+                                        temperature=args.temperature,
+                                        top_p=args.top_p,
+                                        tokenizer=tokenizer
                                     )
-                                    
+                                
                                 # 結果の処理
-                                if isinstance(result, dict) and "masks" in result:
-                                    # マスクと出力トークンを取得
-                                    masks = result["masks"]
-                                    generation = result["output_tokens"]
-                                    
-                                    # マスクの可視化と保存
-                                    if len(masks) > 0:
-                                        print(f"{len(masks)}個のマスクが生成されました")
+                                if result is not None:
+                                    # タプルの場合はトークンとマスクに分ける
+                                    if isinstance(result, tuple) and len(result) == 2:
+                                        generation = result[0]
+                                        masks = result[1]
+                                        print(f"生成されたマスク数: {len(masks) if masks else 0}")
                                         
-                                        # 原画像の取得
-                                        original_image = image
-                                        
-                                        # マスクの可視化と保存
-                                        import matplotlib.pyplot as plt
-                                        import cv2
-                                        
-                                        # 各マスクを処理
-                                        for i, mask in enumerate(masks):
-                                            # マスクをNumPy配列に変換
-                                            mask_np = mask.cpu().numpy()
+                                        # マスクの保存
+                                        if masks and len(masks) > 0:
+                                            # マスクの保存場所
+                                            os.makedirs(args.vis_save_path, exist_ok=True)
                                             
-                                            # マスクのサイズを画像サイズに合わせる
-                                            if hasattr(original_image, "size"):
-                                                img_w, img_h = original_image.size
-                                                if mask_np.shape != (img_h, img_w):
-                                                    mask_np = cv2.resize(mask_np, (img_w, img_h))
-                                            
-                                            # マスクオーバーレイ画像の作成
-                                            plt.figure(figsize=(10, 10))
-                                            plt.imshow(np.array(original_image))
-                                            
-                                            # マスクをオーバーレイ
-                                            mask_display = np.zeros((mask_np.shape[0], mask_np.shape[1], 4))
-                                            mask_display[:, :, 0] = 1  # R
-                                            mask_display[:, :, 3] = mask_np * 0.5  # アルファチャンネル
-                                            plt.imshow(mask_display)
-                                            
-                                            # 保存パス
-                                            mask_path = os.path.join(args.vis_save_path, f"{os.path.basename(image_path).split('.')[0]}_masked_img_{i}.jpg")
-                                            
-                                            # 保存して閉じる
-                                            plt.axis("off")
-                                            plt.savefig(mask_path, bbox_inches="tight", pad_inches=0)
-                                            plt.close()
-                                            
-                                            print(f"マスク{i+1}を保存しました: {mask_path}")
+                                            for i, mask in enumerate(masks):
+                                                try:
+                                                    # マスクをNumPyに変換
+                                                    mask_np = mask.detach().cpu().numpy()
+                                                    
+                                                    if mask_np.ndim > 2:
+                                                        # 適切な次元を抽出
+                                                        if mask_np.shape[0] == 1:
+                                                            mask_np = mask_np[0]
+                                                        
+                                                        # 次元が3つ以上ある場合
+                                                        if mask_np.ndim >= 3:
+                                                            mask_np = mask_np[0]
+                                                    
+                                                    # バイナリマスクに変換
+                                                    binary_mask = (mask_np > 0.5).astype(np.uint8) * 255
+                                                    
+                                                    # マスクとマスク適用画像の保存パス
+                                                    mask_path = f"{args.vis_save_path}/{Path(image_path).stem}_mask_{i}.png"
+                                                    masked_img_path = f"{args.vis_save_path}/{Path(image_path).stem}_masked_{i}.png"
+                                                    
+                                                    # マスクの保存
+                                                    cv2.imwrite(mask_path, binary_mask)
+                                                    print(f"マスクを保存しました: {mask_path}")
+                                                    
+                                                    # 元の画像にマスクを適用
+                                                    img_np = np.array(Image.open(image_path))
+                                                    
+                                                    # マスクのリサイズ
+                                                    if binary_mask.shape[:2] != img_np.shape[:2]:
+                                                        binary_mask = cv2.resize(binary_mask, (img_np.shape[1], img_np.shape[0]))
+                                                    
+                                                    # マスクを適用した画像を生成
+                                                    masked_img = img_np.copy()
+                                                    masked_img[binary_mask > 0] = (
+                                                        img_np[binary_mask > 0] * 0.5 + 
+                                                        np.array([0, 0, 255]) * 0.5
+                                                    ).astype(np.uint8)
+                                                    
+                                                    # BGR→RGB変換
+                                                    if img_np.shape[-1] == 3:
+                                                        masked_img = cv2.cvtColor(masked_img, cv2.COLOR_RGB2BGR)
+                                                    
+                                                    # マスク適用画像の保存
+                                                    cv2.imwrite(masked_img_path, masked_img)
+                                                    print(f"マスク適用画像を保存しました: {masked_img_path}")
+                                                    
+                                                except Exception as mask_save_error:
+                                                    print(f"マスク保存中にエラー: {mask_save_error}")
+                                                    import traceback
+                                                    traceback.print_exc()
                                     else:
-                                        # マスクがない場合は通常の出力を使用
+                                        # 通常の結果
                                         generation = result
-                                    
-                            except Exception as e:
-                                print(f"マスク生成中にエラー: {e}")
-                                import traceback
-                                traceback.print_exc()
-                                # テキスト生成にフォールバック
-                                generation_config = {
-                                    "max_new_tokens": max_new_tokens,
-                                    "do_sample": args.do_sample,
-                                }
-                                
-                                if args.do_sample:
-                                    generation_config.update({
-                                        "temperature": args.temperature,
-                                        "top_p": args.top_p,
-                                        "top_k": args.top_k,
-                                    })
-                                
+                                        print("警告: マスクが生成されていません")
+                                else:
+                                    print("警告: 生成結果が見つかりません。エラーが発生した可能性があります。")
+                                    generation = None
+                            else:
+                                # 通常のテキスト生成（セグメンテーションなし）
                                 generation = model.generate(
-                                    **inputs,
-                                    **generation_config
+                                    **inputs.to(device),
+                                    max_new_tokens=max_new_tokens,
+                                    do_sample=args.do_sample,
+                                    temperature=args.temperature,
+                                    top_p=args.top_p,
                                 )
+                        except Exception as process_error:
+                            print(f"入力処理中にエラー: {process_error}")
+                            import traceback
+                            traceback.print_exc()
+                            continue
                     else:
-                        # 通常の生成
-                        print("通常の生成モードで実行中...")
-                        generation_config = {
-                            "max_new_tokens": max_new_tokens,
-                            "do_sample": args.do_sample,
-                        }
+                        # 非MllamaProcessorのケース（他のモデル）
+                        input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").to(device)
                         
-                        # サンプリング有効時のみパラメータを追加
-                        if args.do_sample:
-                            generation_config.update({
-                                "temperature": args.temperature,
-                                "top_p": args.top_p,
-                                "top_k": args.top_k,
-                            })
-                        
-                        # 常に適用するパラメータ
-                        generation_config.update({
-                            "repetition_penalty": args.repetition_penalty,
-                        })
-                        
-                        # 生成実行
+                        # 通常のテキスト生成
                         generation = model.generate(
-                            **inputs,
-                            **generation_config
+                            input_ids=input_ids,
+                            max_new_tokens=max_new_tokens,
+                            do_sample=args.do_sample,
+                            temperature=args.temperature,
+                            top_p=args.top_p,
                         )
                     
-                    # 生成結果のデコード
+                    # 出力テキストのデコード
                     try:
-                        # generationが定義されているか確認
-                        if 'generation' not in locals() or generation is None:
-                            print("警告: 生成結果が見つかりません。エラーが発生した可能性があります。")
-                            if 'inputs' in locals() and 'input_ids' in locals():
-                                output = "エラーが発生しました。もう一度試してください。"
-                                conversation[-1]["content"] = output
-                                print(f"Assistant: {output}")
-                                continue
+                        if generation is not None:
+                            if args.version.startswith("meta-llama/Llama-3.2"):
+                                # MllamaProcessor用のデコード処理
+                                try:
+                                    # input_idsの長さを考慮してスライスを作成
+                                    input_length = input_ids.shape[1]
+                                    
+                                    # generationをデコード
+                                    s = tokenizer.decode(generation[0][input_length:], skip_special_tokens=True)
+                                    
+                                    # 出力を整形
+                                    s = s.strip()
+                                except Exception as decode_error:
+                                    print(f"Mllama生成結果のデコード中にエラー: {decode_error}")
+                                    s = "デコード中にエラーが発生しました。もう一度お試しください。"
                             else:
-                                error_msg = "入力と生成結果の両方が見つかりません。深刻なエラーが発生しています。"
-                                conversation[-1]["content"] = error_msg
-                                print(f"Assistant: {error_msg}")
-                                continue
-                        
-                        # デコードを実行
-                        if hasattr(tokenizer, 'tokenizer'):
-                            # MllamaProcessorの場合
-                            output = tokenizer.tokenizer.decode(generation[0][input_ids.shape[0]:], skip_special_tokens=True)
-                            print(f"MllamaProcessor.tokenizerを使用してデコード")
+                                # 通常のモデルのデコード処理
+                                s = tokenizer.decode(generation[0])
+                                
+                                # 出力の整形
+                                # 入力プロンプトの末尾を探して、それ以降のテキストを取得
+                                if s.find(prompt) != -1:
+                                    s = s[s.find(prompt) + len(prompt):]
+                                # 特殊トークンを削除
+                                s = s.replace("\n", "").replace("  ", " ")
+                                
+                            # 応答を会話に追加
+                            conv.messages[-1][-1] = s
+                            
+                            # 出力テキストを整形して表示
+                            print(f"\nAssistant: {s}")
                         else:
-                            # 通常のトークナイザーの場合
-                            output = tokenizer.decode(generation[0][input_ids.shape[0]:], skip_special_tokens=True)
-                            print(f"Tokenizerを使用してデコード")
-                        
-                        conversation[-1]["content"] = output
-                        print(f"Assistant: {output}")
+                            print("\nAssistant: エラーが発生しました。もう一度試してください。")
                     except Exception as decode_error:
-                        print(f"デコード中にエラーが発生: {decode_error}")
+                        print(f"出力デコード中にエラー: {decode_error}")
                         import traceback
                         traceback.print_exc()
-                        
-                        # エラー時のフォールバック
-                        try:
-                            # トークナイザーがMllamaProcessorの場合、プリミティブなデコードを試みる
-                            if hasattr(tokenizer, 'tokenizer'):
-                                tokens = generation[0][input_ids.shape[0]:].tolist()
-                                output = tokenizer.tokenizer.convert_ids_to_tokens(tokens)
-                                output = "".join(output).replace("▁", " ")
-                                print(f"プリミティブなデコードで取得: {output}")
-                            else:
-                                output = "デコードできませんでした。もう一度試してください。"
-                        except:
-                            output = "エラーが発生しました。もう一度試してください。"
-                        
-                        conversation[-1]["content"] = output
-                        print(f"Assistant: {output}")
-                
-                except Exception as gen_error:
-                    print(f"生成中にエラーが発生しました: {gen_error}")
+                        print("\nAssistant: 結果のデコード中にエラーが発生しました。もう一度試してください。")
+                except Exception as img_error:
+                    print(f"画像処理中にエラー: {img_error}")
                     import traceback
                     traceback.print_exc()
-                    # エラーメッセージを会話に追加
-                    error_msg = f"エラーが発生しました。もう一度試してください。"
-                    conversation[-1]["content"] = error_msg
-                    print(f"Assistant: {error_msg}")
-        
-        except KeyboardInterrupt:
-            print("ユーザーによる中断...")
-            break
+            else:
+                # 画像なしの通常のテキスト処理
+                conv.append_message(conv.roles[0], prompt)
+                conv.append_message(conv.roles[1], "")
+                
+                # 最終的なプロンプトを生成
+                prompt = conv.get_prompt()
+                
+                # 入力IDの取得
+                inputs = tokenizer(prompt, return_tensors="pt").to(device)
+                
+                # テキスト生成
+                try:
+                    generation = model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=args.do_sample,
+                        temperature=args.temperature,
+                        top_p=args.top_p
+                    )
+                    
+                    # 出力のデコード
+                    try:
+                        if args.version.startswith("meta-llama/Llama-3.2"):
+                            # MllamaProcessor用のデコード処理
+                            input_length = inputs.input_ids.shape[1]
+                            s = tokenizer.decode(generation[0][input_length:], skip_special_tokens=True)
+                        else:
+                            # 通常のデコード処理
+                            s = tokenizer.decode(generation[0])
+                            if s.find(prompt) != -1:
+                                s = s[s.find(prompt) + len(prompt):]
+                        
+                        # 応答を会話に追加して表示
+                        conv.messages[-1][-1] = s
+                        print(f"\nAssistant: {s}")
+                    except Exception as decode_error:
+                        print(f"出力デコード中にエラー: {decode_error}")
+                        print("\nAssistant: 結果のデコード中にエラーが発生しました。もう一度試してください。")
+                except Exception as gen_error:
+                    print(f"テキスト生成中にエラー: {gen_error}")
+                    print("\nAssistant: エラーが発生しました。もう一度試してください。")
+        except Exception as e:
+            print(f"チャット処理中に予期せぬエラーが発生: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 def main(args):
