@@ -205,6 +205,9 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
     import gc
     gc.enable()
     
+    # トークナイザーのアクセス方法を決定
+    tokenizer_func = tokenizer.tokenizer if hasattr(tokenizer, 'tokenizer') else tokenizer
+    
     while True:
         try:
             # ユーザー入力を取得
@@ -260,7 +263,7 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
             else:
                 # テキストのみの処理
                 with torch.no_grad():
-                    inputs = tokenizer.tokenizer(
+                    inputs = tokenizer_func(
                         user_input,
                         return_tensors="pt"
                     )
@@ -319,7 +322,7 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                                 return_tensors="pt"
                             )
                         else:
-                            inputs = tokenizer.tokenizer(
+                            inputs = tokenizer_func(
                                 user_input,
                                 return_tensors="pt"
                             )
@@ -342,7 +345,7 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                         raise
             
             # 生成されたテキストをデコード
-            generated_text = tokenizer.tokenizer.decode(outputs.sequences[0], skip_special_tokens=False)
+            generated_text = tokenizer_func.decode(outputs.sequences[0], skip_special_tokens=False)
             
             # レスポンス部分を抽出
             generated_response = generated_text.split(sep)[-1].strip()
@@ -354,7 +357,7 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                 # SEGトークンのインデックスを検出
                 seg_indices = []
                 for i, token_id in enumerate(outputs.sequences[0]):
-                    if token_id == tokenizer.tokenizer.convert_tokens_to_ids("<SEG>"):
+                    if token_id == tokenizer_func.convert_tokens_to_ids("<SEG>"):
                         seg_indices.append(i)
                 
                 if seg_indices and image_path:
@@ -502,9 +505,16 @@ def main(args):
     tokenizer = AutoProcessor.from_pretrained(args.version)
     
     # <SEG>トークンをトークナイザーに追加
-    if "<SEG>" not in tokenizer.tokenizer.get_vocab():
-        print("Adding <SEG> token to tokenizer vocabulary")
-        tokenizer.tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
+    # MllamaProcessorの場合、内部tokenizer属性を使用
+    if hasattr(tokenizer, 'tokenizer'):
+        if "<SEG>" not in tokenizer.tokenizer.get_vocab():
+            print("Adding <SEG> token to tokenizer vocabulary")
+            tokenizer.tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
+    else:
+        # 通常のトークナイザーの場合
+        if "<SEG>" not in tokenizer.get_vocab():
+            print("Adding <SEG> token to tokenizer vocabulary")
+            tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
     
     # from_vision_modelメソッドを使用してモデルとトークナイザーを同時に取得
     # メモリ管理を最適化
@@ -573,7 +583,7 @@ def main(args):
     
     # チャットループの設定
     prompt_template = get_prompt_template()
-    model_max_length = tokenizer.tokenizer.model_max_length
+    model_max_length = tokenizer.tokenizer.model_max_length if hasattr(tokenizer, 'tokenizer') else tokenizer.model_max_length
     max_new_tokens = args.max_new_tokens
     sep = "[/INST]"
     stop_str = "</s>"

@@ -295,11 +295,15 @@ class Llama32LISAForCausalLM(nn.Module):
             tokenizer = AutoProcessor.from_pretrained(vision_model_id)
         
         # <SEG>トークンをトークナイザーに追加
-        if "<SEG>" not in tokenizer.tokenizer.get_vocab():
-            print("Adding <SEG> token to tokenizer vocabulary")
-            if hasattr(tokenizer, 'tokenizer'):
+        if hasattr(tokenizer, 'tokenizer'):
+            # Processor with internal tokenizer (MllamaProcessor)
+            if "<SEG>" not in tokenizer.tokenizer.get_vocab():
+                print("Adding <SEG> token to tokenizer vocabulary")
                 tokenizer.tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
         else:
+            # Direct tokenizer
+            if "<SEG>" not in tokenizer.get_vocab():
+                print("Adding <SEG> token to tokenizer vocabulary")
                 tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
         
         # 量子化設定がない場合は作成
