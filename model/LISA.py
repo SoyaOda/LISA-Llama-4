@@ -208,31 +208,62 @@ class Llama32LISAForCausalLM(nn.Module):
     """
     def __init__(self, config, **kwargs):
         """
-        初期化メソッド
+        Llama32LISAForCausalLMを初期化
         
         Args:
-            config: モデルの設定
-            **kwargs: 追加の引数（vision_pretrained, train_mask_decoder, out_dim, seg_token_idx）
+            config: モデル設定
+            vision_pretrained: SAMビジョンモデルの事前学習済み重みへのパス
+            train_mask_decoder: マスクデコーダをトレーニングするかどうか
+            out_dim: 出力次元数
+            seg_token_idx: セグメントトークンのインデックス
         """
+        # 設定を格納
         super().__init__()
-        
-        # 基本設定
         self.config = config
         
-        # LISAのカスタム引数を取得
-        self.train_mask_decoder = kwargs.get("train_mask_decoder", False)
-        self.out_dim = kwargs.get("out_dim", 256)
-        self.vision_ckpt = kwargs.get("vision_pretrained", None)
-        self.ce_loss_weight = kwargs.get("ce_loss_weight", 1.0)
-        self.dice_loss_weight = kwargs.get("dice_loss_weight", 0.5)
-        self.seg_token_idx = kwargs.get("seg_token_idx", None)
+        # キーワード引数からパラメータを取得
+        self.vision_ckpt = kwargs.pop("vision_pretrained", None)
+        self.train_mask_decoder = kwargs.pop("train_mask_decoder", False)
+        self.out_dim = kwargs.pop("out_dim", 256)
+        self.seg_token_idx = kwargs.pop("seg_token_idx", None)
         
-        # ベースとなるビジョン言語モデル
+        # モデルが適切にロードされたかのフラグ
         self.model = None
+        self.visual_model = None
         
-        # SAMの視覚エンコーダを初期化
+        # 基本モデルは外部から設定（from_vision_modelメソッドから）
+        
+        # モデル設定をロガーに出力
+        print(f"初期化: SAM checkpoint={self.vision_ckpt}, train_mask_decoder={self.train_mask_decoder}, "
+              f"out_dim={self.out_dim}, seg_token_idx={self.seg_token_idx}")
+        
+        # MllamaConfigの構造を特定するデバッグ情報を出力
+        if hasattr(config, 'model_type'):
+            print(f"モデルタイプ: {config.model_type}")
+        
+        # 設定の構造を確認
+        if hasattr(config, 'text_config'):
+            print(f"テキスト設定: {type(config.text_config).__name__}")
+            if hasattr(config.text_config, 'hidden_size'):
+                print(f"テキスト隠れ層サイズ: {config.text_config.hidden_size}")
+        elif hasattr(config, 'hidden_size'):
+            print(f"隠れ層サイズ（直接）: {config.hidden_size}")
+        
+        # ビジョン設定も確認
+        if hasattr(config, 'vision_config'):
+            print(f"ビジョン設定: {type(config.vision_config).__name__}")
+            if hasattr(config.vision_config, 'hidden_size'):
+                print(f"ビジョン隠れ層サイズ: {config.vision_config.hidden_size}")
+        
+        # SAMエンコーダをロード（パスが指定されている場合）
         if self.vision_ckpt:
-            self.initialize_sam_encoder()
+            try:
+                self.initialize_sam_encoder()
+            except Exception as e:
+                print(f"SAMエンコーダの初期化中にエラーが発生: {e}")
+                print("SAMエンコーダの初期化はスキップされました。後で手動で initialize_sam_encoder() を呼び出してください。")
+                import traceback
+                traceback.print_exc()
     
     @classmethod
     def from_vision_model(cls, vision_model_id, seg_token_idx=None, vision_pretrained=None, train_mask_decoder=False, 
@@ -391,7 +422,16 @@ class Llama32LISAForCausalLM(nn.Module):
                     param.requires_grad = False
 
             # プロジェクションレイヤーの作成
-            hidden_size = self.config.hidden_size
+            # MllamaConfigの構造に合わせてhidden_sizeを取得する
+            if hasattr(self.config, 'text_config') and hasattr(self.config.text_config, 'hidden_size'):
+                hidden_size = self.config.text_config.hidden_size
+            elif hasattr(self.config, 'hidden_size'):
+                # 従来のモデル用の互換性
+                hidden_size = self.config.hidden_size
+            else:
+                # デフォルト値（Llama 3.2のテキストモデルの標準サイズ）
+                hidden_size = 4096
+            
             print(f"Using hidden size: {hidden_size} for projection layers")
             self.mm_projector = nn.Linear(256, hidden_size)
             
@@ -684,11 +724,39 @@ class Llama32LISAForCausalLM(nn.Module):
             sparse_embeddings = []
             dense_embeddings = []
             
+            # mm_projectorがない場合、デフォルトの次元変換関数を定義
+            if not hasattr(self, 'mm_projector') or self.mm_projector is None:
+                print("警告: mm_projectorが見つかりません。デフォルトの変換を使用します。")
+                # SAM埋め込み用の次元に変換するシンプルな線形変換
+                def default_projection(hidden_state):
+                    # 入力次元をSAMのpoint_embedのサイズ(256)に合わせる
+                    out_dim = 256
+                    # 元の次元（Llama隠れ状態）
+                    in_dim = hidden_state.shape[-1]
+                    # GPU上でランダムな線形変換を生成
+                    if not hasattr(self, '_default_projector'):
+                        # キャッシュして再利用（ランダムな初期化を維持）
+                        self._default_projector = nn.Linear(in_dim, out_dim).to(device)
+                    return self._default_projector(hidden_state)
+                
+                projector = default_projection
+            else:
+                projector = self.mm_projector
+            
             for seg_hidden_state in seg_hidden_states:
                 # 各セグメントトークンのプロジェクション実行
-                sparse_emb = self.mm_projector(seg_hidden_state).unsqueeze(0)
-                sparse_embeddings.append(sparse_emb)
-                dense_embeddings.append(None)  # SAMはプロンプトポイントのみを使用
+                try:
+                    sparse_emb = projector(seg_hidden_state).unsqueeze(0)
+                    sparse_embeddings.append(sparse_emb)
+                    dense_embeddings.append(None)  # SAMはプロンプトポイントのみを使用
+                except Exception as e:
+                    print(f"プロジェクション中にエラー: {e}")
+                    # エラー時は元の埋め込みをスキップ
+                    continue
+            
+            # セグメント埋め込みが取得できない場合はエラー
+            if len(sparse_embeddings) == 0:
+                raise ValueError("セグメント埋め込みを取得できませんでした。プロンプト処理中にエラーが発生したか、有効なセグメントトークンがありません。")
             
             # SAMデコーダを使用してマスクを生成
             masks = []
@@ -711,9 +779,15 @@ class Llama32LISAForCausalLM(nn.Module):
                 binary_mask = (mask > 0.5).float()
                 
                 # マスクを元の解像度にリサイズ
-                # binary_mask = F.interpolate(
-                #    binary_mask, size=original_size, mode="bilinear", align_corners=False
-                # )
+                # 元の画像サイズがある場合はリサイズする
+                if original_size and original_size != binary_mask.shape[-2:]:
+                    try:
+                        binary_mask = F.interpolate(
+                            binary_mask, size=original_size, mode="bilinear", align_corners=False
+                        )
+                    except Exception as resize_error:
+                        print(f"マスクのリサイズ中にエラー: {resize_error}")
+                        # エラー時は元のサイズを維持
                 
                 masks.append(binary_mask.squeeze())
                 
