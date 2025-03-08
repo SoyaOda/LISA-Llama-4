@@ -313,18 +313,46 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                         print(f"画像リサイズ: {w}x{h} -> {new_size[0]}x{new_size[1]}")
                         image = image.resize(new_size, Image.LANCZOS)
                     
+                    # SEGトークンをプロンプトに追加（必要な場合）
+                    if is_seg_request and "<SEG>" not in user_input and "[SEG]" not in user_input:
+                        user_input += " [SEG]"
+                    
+                    # テキストにセグメンテーション指示がある場合は必ず画像トークンを追加
+                    is_segment_request = "segment" in user_input.lower() or "<SEG>" in user_input or "[SEG]" in user_input
+                    
                     # 推論中に不要なメモリを解放するためno_gradを使用
                     with torch.no_grad():
                         # Llama 3.2 Vision (Mllama)モデルの場合
                         if is_mllama:
-                            print("Mllamaメッセージ形式を使用")
+                            # 最もシンプルな方法: 単純な文字列とPIL画像
+                            # 画像を先に指定し、テキストを後に指定する
                             try:
-                                # 最もシンプルな方法: 単純な文字列とPIL画像
+                                print("Mllamaプロセッサを使用")
+                                # セグメンテーション要求の場合は画像トークンを追加
+                                if is_segment_request and "<|image|>" not in user_input:
+                                    processed_input = "<|image|> " + user_input
+                                else:
+                                    processed_input = user_input
+                                
+                                # メッセージの表示
+                                print(f"入力テキスト: {processed_input}")
+                                
+                                # 明示的な引数順序でプロセッサを呼び出す
                                 inputs = tokenizer(
-                                    images=image,
-                                    text=user_input,
+                                    images=image,  # 画像を第1引数またはキーワード引数で
+                                    text=processed_input,  # テキストを第2引数またはキーワード引数で
                                     return_tensors="pt"
                                 )
+                            except Exception as e1:
+                                print(f"標準の処理中にエラー: {e1}")
+                                try:
+                                    # フォーマットされたメッセージを作成
+                                    print("代替方法: フォーマットされたメッセージを使用")
+                                    message = create_mllama_message(image, user_input, verbose=True)
+                                    inputs = tokenizer(**message, return_tensors="pt")
+                                except Exception as e2:
+                                    print(f"代替処理中にエラー: {e2}")
+                                    raise ValueError("画像処理に失敗しました")
                                 
                                 # デバイスに移動
                                 if not is_auto_device_map:
@@ -332,77 +360,29 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                                 
                                 # 入力IDsを取得
                                 input_ids = inputs["input_ids"]
-                            except Exception as e1:
-                                print(f"画像処理中にエラー: {e1}")
-                                print("代替方法1で試行...")
-                                
-                                try:
-                                    # 代替方法1: create_mllama_message関数を使用
-                                    message = create_mllama_message(image, user_input)
-                                    inputs = tokenizer(**message, return_tensors="pt")
-                                    
-                                    # デバイスに移動
-                                    if not is_auto_device_map:
-                                        inputs = {k: v.to(device) for k, v in inputs.items()}
-                                    
-                                    # 入力IDsを取得
-                                    input_ids = inputs["input_ids"]
-                                except Exception as e2:
-                                    print(f"代替方法1でもエラー: {e2}")
-                                    print("代替方法2で試行...")
-                                    
-                                    try:
-                                        # 代替方法2: 明示的なキーワード引数の使用
-                                        # ChatベースでなくVisionのみで処理
-                                        if hasattr(tokenizer, "processor"):
-                                            processor = tokenizer.processor
-                                            processed = processor(image, user_input, return_tensors="pt")
-                                            inputs = processed
-                                        else:
-                                            # 最も基本的な方法: 辞書を直接構築
-                                            inputs = {
-                                                "input_ids": tokenizer.encode(user_input, return_tensors="pt"),
-                                                "pixel_values": tokenizer.image_processor(image, return_tensors="pt").pixel_values
-                                            }
-                                            
-                                            # デバイスに移動
-                                            if not is_auto_device_map:
-                                                inputs = {k: v.to(device) for k, v in inputs.items()}
-                                            
-                                            # 入力IDsを取得
-                                            input_ids = inputs["input_ids"]
-                                    except Exception as e3:
-                                        print(f"代替方法2でもエラー: {e3}")
-                                        print("画像処理をスキップします")
-                                        
-                                        # すべての方法が失敗した場合: 画像なしで処理
-                                        inputs = tokenizer_func(user_input, return_tensors="pt")
-                                        if not is_auto_device_map:
-                                            inputs = {k: v.to(device) for k, v in inputs.items()}
-                                        input_ids = inputs["input_ids"]
-                        else:
-                            # 通常のVLM処理（LLaVA等）
-                            # 画像トークンをテキストに追加
-                            if image_token not in user_input:
-                                modified_input = f"{image_token} {user_input}"
                             else:
-                                modified_input = user_input
-                            
-                            # 通常の処理 - VLMと画像を同時に処理
-                            inputs = tokenizer(
-                                text=modified_input,
-                                images=image,
-                                return_tensors="pt"
-                            )
-                            
-                            # デバイスに移動
-                            if not is_auto_device_map:
-                                inputs = {k: v.to(device) for k, v in inputs.items()}
-                            
-                            # 入力IDsと画像テンソルを取得
-                            input_ids = inputs["input_ids"]
-                            if "pixel_values" in inputs:
-                                image_tensor = inputs["pixel_values"]
+                                # 通常のVLM処理（LLaVA等）
+                                # 画像トークンをテキストに追加
+                                if image_token not in user_input:
+                                    modified_input = f"{image_token} {user_input}"
+                                else:
+                                    modified_input = user_input
+                                
+                                # 通常の処理 - VLMと画像を同時に処理
+                                inputs = tokenizer(
+                                    text=modified_input,
+                                    images=image,
+                                    return_tensors="pt"
+                                )
+                                
+                                # デバイスに移動
+                                if not is_auto_device_map:
+                                    inputs = {k: v.to(device) for k, v in inputs.items()}
+                                
+                                # 入力IDsと画像テンソルを取得
+                                input_ids = inputs["input_ids"]
+                                if "pixel_values" in inputs:
+                                    image_tensor = inputs["pixel_values"]
                 except Exception as main_error:
                     print(f"画像処理に完全に失敗しました: {main_error}")
                     # テキストのみで処理を継続
@@ -434,14 +414,58 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                     # 画像によるセグメンテーションの場合、generate_masksを使用
                     if image_path and (is_seg_request or "<SEG>" in user_input or "[SEG]" in user_input):
                         print("セグメンテーションモードで実行中...")
-                        # LISA専用の関数を使用
-                        generation = model.generate_masks(
-                            image=image if image else None,
-                            input_ids=input_ids,
-                            attention_mask=torch.ones_like(input_ids),
-                            **inputs,
-                            max_new_tokens=max_new_tokens,
-                        )
+                        
+                        # SEGトークンをプロンプトに追加（まだない場合）
+                        if "<SEG>" not in user_input and "[SEG]" not in user_input:
+                            if "segment" in user_input.lower():
+                                # テキストの末尾に[SEG]を追加
+                                user_input += " [SEG]"
+                                # 入力を再構築
+                                inputs = tokenizer_func(
+                                    user_input,
+                                    return_tensors="pt"
+                                )
+                                input_ids = inputs["input_ids"]
+                                if not is_auto_device_map:
+                                    inputs = {k: v.to(device) for k, v in inputs.items()}
+                        
+                        # LISAモデルのgenerate_masks関数用にパラメータを整理
+                        # 重複を避けるため、inputsからinput_idsを削除
+                        mask_inputs = {k: v for k, v in inputs.items() if k != "input_ids"}
+                        
+                        # 画像が正しく処理されているか確認
+                        if image is not None:
+                            print(f"画像情報: {type(image)}, サイズ: {image.size if hasattr(image, 'size') else 'N/A'}")
+                            
+                            # generate_masksに渡すパラメータを整理
+                            generation = model.generate_masks(
+                                image=image,  # PIL Image
+                                input_ids=input_ids,
+                                attention_mask=inputs.get("attention_mask", torch.ones_like(input_ids)),
+                                max_new_tokens=max_new_tokens,
+                                **mask_inputs
+                            )
+                        else:
+                            print("画像が正しく処理されていないため、通常の生成に切り替えます")
+                            # 通常のテキスト生成にフォールバック
+                            generation_config = {
+                                "max_new_tokens": max_new_tokens,
+                                "do_sample": args.do_sample,
+                            }
+                            
+                            # サンプリング有効時のみパラメータを追加
+                            if args.do_sample:
+                                generation_config.update({
+                                    "temperature": args.temperature,
+                                    "top_p": args.top_p,
+                                    "top_k": args.top_k,
+                                })
+                            
+                            # 生成実行
+                            generation = model.generate(
+                                **inputs,
+                                **generation_config
+                            )
                     else:
                         # 通常の生成
                         print("通常の生成モードで実行中...")

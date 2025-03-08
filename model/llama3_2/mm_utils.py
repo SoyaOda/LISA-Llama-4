@@ -35,6 +35,11 @@ def create_mllama_message(
     # 画像の処理（文字列/パス、BytesIO、PIL.Imageに対応）
     processed_image = process_images(image)
     
+    # 明示的に画像トークンを追加（必要な場合）
+    # MllamaProcessorでの一般的なエラー解決のため
+    if "<|image|>" not in text and "segment" in text.lower():
+        text = "<|image|> " + text
+    
     # MetaのMllamaProcessorが期待する形式
     # Processorのエラー回避のため、単純に画像とテキストをそのまま返す
     # これにより、tokenizer(**message)の呼び出しで適切に処理される
@@ -56,33 +61,41 @@ def load_image_from_base64(image_str: str) -> Image.Image:
 
 def tokenizer_image_token(text: str, image_token: str = "<image>") -> str:
     """
-    テキスト内に画像トークンを挿入します（まだ存在しない場合）。
-    
+    テキスト中で画像トークンがない場合、適切に追加する関数
     Args:
-        text: 元のテキスト
+        text: プロンプトテキスト
         image_token: 使用する画像トークン
-    
     Returns:
-        画像トークンが適切に挿入されたテキスト
+        画像トークン付きのプロンプト
     """
-    if not text:
-        # テキストが空または None の場合、画像トークンだけを返す
-        return image_token
-    
-    # 画像トークンがすでに含まれている場合はそのまま返す
+    # すでに画像トークンがある場合はそのまま返す
     if image_token in text:
         return text
     
-    # 正規表現を使ってテキストを分解
-    pattern = r"(.*?)(?:\s*$)"
-    match = re.match(pattern, text)
+    # これはLlama 3.2 Vision (Mllama)では必須ではないが、
+    # 必要に応じて画像トークンを追加する場合のロジック
     
-    if match:
-        # プロンプトの最後に画像トークンを追加
-        return f"{match.group(1)} {image_token}"
-    else:
-        # マッチしない場合はそのまま画像トークンを追加
-        return f"{text} {image_token}"
+    # 既に<|image|>が含まれていればそのまま返す
+    if "<|image|>" in text:
+        return text
+        
+    # セグメンテーションコマンドの場合、できるだけ前に挿入
+    if "segment" in text.lower() or "<SEG>" in text or "[SEG]" in text:
+        # セグメント指示がある場合、最初の文の前に画像トークンを挿入
+        sentences = text.split(". ")
+        if len(sentences) > 1:
+            # 最初の文の後に画像トークンを挿入
+            return sentences[0] + ". " + image_token + " " + ". ".join(sentences[1:])
+        else:
+            # 一文しかない場合は文頭に挿入
+            return image_token + " " + text
+    
+    # 一般的なケース
+    # Mllama用の特別なプロンプト形式の試行
+    if not text.startswith(image_token):
+        return image_token + " " + text
+    
+    return text
 
 def process_images(images: Union[List[Union[str, Image.Image, BytesIO]], Union[str, Image.Image, BytesIO]]) -> Union[List[Image.Image], Image.Image]:
     """
