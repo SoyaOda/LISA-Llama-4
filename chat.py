@@ -500,6 +500,7 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                                     
                                     try:
                                         # ユーティリティ関数を使用してSAM用に安全に変換
+                                        from model.llama3_2.mm_utils import safe_mllama_to_sam
                                         pixel_values = safe_mllama_to_sam(pixel_values)
                                         print(f"SAM用に変換成功: 形状={pixel_values.shape}")
                                         
@@ -509,44 +510,93 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                                         pixel_values = pixel_values.to(device_to_use)
                                         print(f"テンソルをデバイス{device_to_use}に移動しました")
                                         
-                                        # generate_masksにpixel_valuesとして明示的に渡す
-                                        # mask_inputsからpixel_valuesを削除して重複を防ぐ
-                                        clean_mask_inputs = {k: v for k, v in mask_inputs.items() 
-                                                           if k != 'pixel_values'}
-                                        
-                                        generation = model.generate_masks(
+                                        # generate_masksを実行
+                                        result = model.generate_masks(
                                             image=None,  # PILを渡さない
                                             input_ids=input_ids,
-                                            attention_mask=inputs.get("attention_mask", torch.ones_like(input_ids)),
+                                            attention_mask=inputs.get("attention_mask", None),
                                             pixel_values=pixel_values,  # 変換済みのテンソルを渡す
                                             max_new_tokens=max_new_tokens,
-                                            **clean_mask_inputs
+                                            **mask_inputs
                                         )
                                     except Exception as conversion_error:
                                         print(f"テンソル変換中にエラー: {conversion_error}")
                                         print("代わりにPIL画像を使用します...")
                                         # 通常の処理 - PILイメージを使用
-                                        generation = model.generate_masks(
+                                        result = model.generate_masks(
                                             image=image,  # PIL Image
                                             input_ids=input_ids,
-                                            attention_mask=inputs.get("attention_mask", torch.ones_like(input_ids)),
+                                            attention_mask=inputs.get("attention_mask", None),
+                                            pixel_values=None,  # pixel_valuesは渡さない
                                             max_new_tokens=max_new_tokens,
                                             **mask_inputs
                                         )
                                 else:
-                                    # 通常の処理
-                                    print("マスク生成を呼び出します...")
-                                    generation = model.generate_masks(
-                                        image=image,  # PIL Image - SAM内部で適切に処理されるように修正
+                                    # 通常の処理 - PILイメージを使用
+                                    result = model.generate_masks(
+                                        image=image,  # PIL Image
                                         input_ids=input_ids,
-                                        attention_mask=inputs.get("attention_mask", torch.ones_like(input_ids)),
+                                        attention_mask=inputs.get("attention_mask", None),
                                         max_new_tokens=max_new_tokens,
                                         **mask_inputs
                                     )
+                                    
+                                # 結果の処理
+                                if isinstance(result, dict) and "masks" in result:
+                                    # マスクと出力トークンを取得
+                                    masks = result["masks"]
+                                    generation = result["output_tokens"]
+                                    
+                                    # マスクの可視化と保存
+                                    if len(masks) > 0:
+                                        print(f"{len(masks)}個のマスクが生成されました")
+                                        
+                                        # 原画像の取得
+                                        original_image = image
+                                        
+                                        # マスクの可視化と保存
+                                        import matplotlib.pyplot as plt
+                                        import cv2
+                                        
+                                        # 各マスクを処理
+                                        for i, mask in enumerate(masks):
+                                            # マスクをNumPy配列に変換
+                                            mask_np = mask.cpu().numpy()
+                                            
+                                            # マスクのサイズを画像サイズに合わせる
+                                            if hasattr(original_image, "size"):
+                                                img_w, img_h = original_image.size
+                                                if mask_np.shape != (img_h, img_w):
+                                                    mask_np = cv2.resize(mask_np, (img_w, img_h))
+                                            
+                                            # マスクオーバーレイ画像の作成
+                                            plt.figure(figsize=(10, 10))
+                                            plt.imshow(np.array(original_image))
+                                            
+                                            # マスクをオーバーレイ
+                                            mask_display = np.zeros((mask_np.shape[0], mask_np.shape[1], 4))
+                                            mask_display[:, :, 0] = 1  # R
+                                            mask_display[:, :, 3] = mask_np * 0.5  # アルファチャンネル
+                                            plt.imshow(mask_display)
+                                            
+                                            # 保存パス
+                                            mask_path = os.path.join(args.vis_save_path, f"{os.path.basename(image_path).split('.')[0]}_masked_img_{i}.jpg")
+                                            
+                                            # 保存して閉じる
+                                            plt.axis("off")
+                                            plt.savefig(mask_path, bbox_inches="tight", pad_inches=0)
+                                            plt.close()
+                                            
+                                            print(f"マスク{i+1}を保存しました: {mask_path}")
+                                    else:
+                                        # マスクがない場合は通常の出力を使用
+                                        generation = result
+                                    
                             except Exception as e:
-                                print(f"セグメンテーション処理中にエラー: {e}")
-                                print("通常のテキスト生成にフォールバックします...")
-                                # 例外が発生した場合は通常のテキスト生成にフォールバック
+                                print(f"マスク生成中にエラー: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                # テキスト生成にフォールバック
                                 generation_config = {
                                     "max_new_tokens": max_new_tokens,
                                     "do_sample": args.do_sample,
@@ -563,27 +613,6 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                                     **inputs,
                                     **generation_config
                                 )
-                        else:
-                            print("画像が正しく処理されていないため、通常の生成に切り替えます")
-                            # 通常のテキスト生成にフォールバック
-                            generation_config = {
-                                "max_new_tokens": max_new_tokens,
-                                "do_sample": args.do_sample,
-                            }
-                            
-                            # サンプリング有効時のみパラメータを追加
-                            if args.do_sample:
-                                generation_config.update({
-                                    "temperature": args.temperature,
-                                    "top_p": args.top_p,
-                                    "top_k": args.top_k,
-                                })
-                            
-                            # 生成実行
-                            generation = model.generate(
-                                **inputs,
-                                **generation_config
-                            )
                     else:
                         # 通常の生成
                         print("通常の生成モードで実行中...")

@@ -688,139 +688,153 @@ class Llama32LISAForCausalLM(nn.Module):
         pixel_values=None,
         **kwargs
     ):
-        try:
-            print("LISA.generate_masksが呼び出されました")
-            
-            # 実行時のデバイス情報を表示
-            device = next(self.parameters()).device
-            print(f"モデルデバイス: {device}")
-            
-            # 入力パラメータのデバッグ情報を表示
-            if "inputs" in kwargs:
-                print("inputs引数が存在します")
-                # 重複を防ぐためにpixel_valuesが含まれる場合は削除
-                if "pixel_values" in kwargs["inputs"] and pixel_values is not None:
-                    print("重複するpixel_valuesを検出しました。kwargs['inputs']から削除します。")
-                    kwargs["inputs"].pop("pixel_values")
-                
-                for k, v in kwargs["inputs"].items():
-                    if isinstance(v, torch.Tensor):
-                        print(f"inputs[{k}]の形状: {v.shape}, 型: {v.dtype}, デバイス: {v.device}")
-            
-            if pixel_values is not None:
-                print(f"pixel_values形状: {pixel_values.shape}, 型: {pixel_values.dtype}, デバイス: {pixel_values.device}")
-                
-                # デバイスの不一致を修正
-                if pixel_values.device != device:
-                    print(f"デバイスの不一致を検出: pixel_values({pixel_values.device}) vs モデル({device})")
-                    pixel_values = pixel_values.to(device)
-                    print(f"pixel_valuesをデバイス{device}に移動しました")
-            
-            # 他のパラメータを確認
-            for k, v in kwargs.items():
-                if isinstance(v, torch.Tensor):
-                    print(f"kwargs[{k}]の形状: {v.shape}, 型: {v.dtype}")
-                elif k == "pixel_values" and v is not None and pixel_values is not None:
-                    print(f"重複するpixel_values検出: kwargs内にも存在します。削除します。")
-                    # 重複するpixel_valuesを削除
-                    kwargs.pop("pixel_values")
-                    break
-            
-            # SAMエンコーダがメモリにあるか確認
-            if not hasattr(self, "visual_model") or self.visual_model is None:
-                print("警告: SAM視覚モデルが初期化されていません。初期化を試みます。")
-                self._init_sam_model()
-            
-            # SAMエンコーダが正しいデバイスにあるか確認
-            sam_device = next(self.visual_model.parameters()).device if hasattr(self, "visual_model") else None
-            print(f"SAMモデルデバイス: {sam_device}")
-            
-            # 必要に応じてSAMモデルをGPUに移動（メモリ効率のため）
-            if sam_device != device and device.type == "cuda":
-                print(f"SAMモデルを{sam_device}から{device}に移動します")
-                try:
-                    # GPUに移動を試みる
-                    self.visual_model.to(device)
-                    print("SAMモデルを正常にGPUに移動しました")
-                except Exception as move_error:
-                    print(f"SAMモデルの移動中にエラー: {move_error}")
-                    print("CPUで処理を続行します")
-                    
-            # オリジナルのLISAコードに基づいて実装
-            # 基本的な生成を実行（SEGトークンの位置を取得するため）
-            print("テキスト生成処理を開始...")
-            outputs = self.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=kwargs.get("max_new_tokens", 512),
-                num_beams=1,
-                output_hidden_states=True,
-                return_dict_in_generate=True,
-            )
-            print("テキスト生成完了")
-            
-            output_hidden_states = outputs.hidden_states[-1]
-            output_ids = outputs.sequences
-            
-            # セグメンテーショントークンのマスクを作成
-            seg_token_mask = output_ids[:, 1:] == self.seg_token_idx
-            
-            # 先頭部分の処理（IMAGE_TOKEN_INDEXとの共存のため）
-            seg_token_mask = torch.cat(
-                [
-                    torch.zeros((seg_token_mask.shape[0], 1)).bool().to(seg_token_mask.device),
-                    seg_token_mask,
-                ],
-                dim=1,
-            )
-            
-            # セグメンテーショントークンの位置を特定
-            seg_token_indices = []
-            for i in range(seg_token_mask.shape[0]):
-                indices = torch.where(seg_token_mask[i])[0].tolist()
-                seg_token_indices.append(indices)
-            
-            print(f"見つかったセグメンテーショントークンインデックス: {seg_token_indices}")
-            
-            # オリジナルサイズの画像情報を取得または推定
-            original_size = image.size[::-1] if hasattr(image, "size") else (1024, 1024)
-            print(f"使用する画像サイズ: {original_size}")
-            
-            # 画像埋め込みとセグメンテーションマスクの取得
-            print("画像埋め込みを取得中...")
-            image_embeddings = self.get_image_embeddings(image=image, pixel_values=pixel_values)
-            print(f"画像埋め込みの形状: {image_embeddings.shape}")
-            
-            # マスクの生成
-            print("マスクを生成中...")
-            pred_masks = self.get_masks(
-                image_embeddings=image_embeddings,
-                output_tokens=output_ids,
-                seg_token_indices=seg_token_indices[0] if seg_token_indices else [],
-                original_sizes=[original_size]
-            )
-            
-            if pred_masks:
-                print(f"生成されたマスクの数: {len(pred_masks)}")
-                for i, mask in enumerate(pred_masks):
-                    print(f"マスク{i+1}の形状: {mask.shape}")
-            else:
-                print("マスクは生成されませんでした")
-            
-            # 生成結果を返す
-            return output_ids
-            
-        except Exception as e:
-            import traceback
-            print(f"generate_masks内でエラーが発生: {e}")
-            traceback.print_exc()
-            
-            # エラー時はそのまま通常の生成に戻る
+        """
+        テキスト出力を生成し、SEGトークンに対応するマスクを生成する
+        Args:
+            image: 入力画像
+            input_ids: テキスト入力ID
+            attention_mask: 注意マスク
+            pixel_values: 画像のピクセル値
+        Returns:
+            生成されたテキストとマスク
+        """
+        # モデルが正しいデバイスにあるか確認
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+
+        # デバッグ情報
+        print("LISA.generate_masksが呼び出されました")
+        print(f"モデルデバイス: {self.device}")
+        
+        # 引数のデバッグ
+        if pixel_values is not None:
+            print(f"pixel_values形状: {pixel_values.shape}, 型: {pixel_values.dtype}, デバイス: {pixel_values.device}")
+        
+        # kwargsからトークナイザーを取得し保存
+        if 'tokenizer' in kwargs:
+            self.tokenizer = kwargs.pop('tokenizer')
+            print("トークナイザーをモデルに保存しました")
+        
+        # その他のパラメータを表示
+        for key, value in kwargs.items():
+            if isinstance(value, torch.Tensor):
+                print(f"kwargs[{key}]の形状: {value.shape}, 型: {value.dtype}")
+        
+        # SAMが初期化されているか確認
+        if not hasattr(self, 'visual_model') or self.visual_model is None:
+            print("警告: SAMモデルが初期化されていません")
+            # generate関数を使用して通常のテキスト生成に切り替え
             return self.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+                input_ids=input_ids, 
+                attention_mask=attention_mask, 
                 **kwargs
             )
+        
+        print(f"SAMモデルデバイス: {next(self.visual_model.parameters()).device}")
+        
+        # テキスト生成のパラメーター
+        max_new_tokens = kwargs.pop('max_new_tokens', 100)
+        
+        # 通常の生成関数を呼び出し
+        print("テキスト生成処理を開始...")
+        
+        # 生成パラメータをforward関数に渡さないようにする
+        generation_kwargs = {}
+        forward_kwargs = {}
+        
+        # 生成関数で使用される一般的なパラメータ
+        generation_params = [
+            'do_sample', 'temperature', 'top_p', 'top_k', 'repetition_penalty',
+            'max_length', 'min_length', 'length_penalty', 'no_repeat_ngram_size'
+        ]
+        
+        # kwargs内のパラメータを適切に振り分ける
+        for key, value in kwargs.items():
+            if key in generation_params:
+                generation_kwargs[key] = value
+            else:
+                forward_kwargs[key] = value
+        
+        # 生成の実行
+        output_tokens = self.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            **generation_kwargs
+        )
+        
+        print("テキスト生成完了")
+        
+        # 生成されたテキストから<SEG>トークンのインデックスを検索
+        seg_token_indices = []
+        
+        # トークナイザーからSEGトークンのIDを取得
+        if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+            try:
+                seg_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+                # 生成されたトークン列の中からSEGトークンの位置を検索
+                for i in range(output_tokens.size(0)):
+                    positions = torch.where(output_tokens[i] == seg_token_id)[0].tolist()
+                    seg_token_indices.append(positions)
+            except Exception as e:
+                print(f"SEGトークン検索中にエラー: {e}")
+                seg_token_indices = [[]]
+        else:
+            # トークナイザーがない場合は空リストを使用
+            seg_token_indices = [[]]
+        
+        print(f"見つかったセグメンテーショントークンインデックス: {seg_token_indices}")
+        
+        # SEGトークンが見つからない場合は、通常の生成結果のみを返す
+        if not any(seg_token_indices):
+            return output_tokens
+        
+        # 画像埋め込みの取得
+        print("画像埋め込みを取得中...")
+        image_embeddings = self.get_image_embeddings(image=image, pixel_values=pixel_values)
+        if image_embeddings is not None:
+            print(f"画像埋め込みの形状: {image_embeddings.shape}")
+        else:
+            print("警告: 画像埋め込みを取得できませんでした")
+            return output_tokens
+        
+        # マスクの生成
+        print("マスクを生成中...")
+        masks = []
+        
+        # 入力画像のサイズの取得（デフォルトはSAMの期待サイズ）
+        original_sizes = None
+        if 'original_sizes' in kwargs:
+            original_sizes = kwargs['original_sizes']
+        
+        # 各バッチサンプルに対してマスクを生成
+        for i, indices in enumerate(seg_token_indices):
+            if not indices:  # インデックスが空の場合はスキップ
+                continue
+                
+            # 現在のサンプルのマスクを生成
+            sample_masks = self.get_masks(
+                image_embeddings=image_embeddings,
+                output_tokens=output_tokens[i:i+1],  # バッチ次元を保持
+                seg_token_indices=indices,
+                original_sizes=original_sizes
+            )
+            
+            # マスクをリストに追加
+            masks.extend(sample_masks)
+        
+        # マスクが生成されたかどうかを確認
+        if not masks:
+            print("マスクは生成されませんでした")
+            return output_tokens
+        
+        # 結果を返す（生成されたテキストとマスク）
+        return {
+            "output_tokens": output_tokens,
+            "masks": masks
+        }
 
     def load_state_dict(self, state_dict, strict=False):
         """
@@ -922,6 +936,51 @@ class Llama32LISAForCausalLM(nn.Module):
             print("警告: SAMモデルが初期化されていません")
             return []
         
+        # セグメントトークンインデックスが空の場合は、出力トークン内のSEGトークンを検索
+        if len(seg_token_indices) == 0:
+            # トークナイザーを使ってセグメントトークンIDを取得
+            if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+                seg_token_idx = self.tokenizer.convert_tokens_to_ids("[SEG]")
+                print(f"トークナイザーからセグメントトークンインデックスを取得: {seg_token_idx}")
+            else:
+                # 直接SEGトークンインデックスを使用
+                seg_token_idx = self.seg_token_idx if hasattr(self, 'seg_token_idx') else None
+                print(f"モデル属性からセグメントトークンインデックスを取得: {seg_token_idx}")
+            
+            # SEGトークンの位置を検索
+            if seg_token_idx is not None:
+                # 出力トークン内のSEGトークン位置を検索
+                seg_token_positions = torch.where(output_tokens[0] == seg_token_idx)[0].tolist()
+                print(f"見つかったセグメントトークン位置: {seg_token_positions}")
+                seg_token_indices = seg_token_positions
+        
+        # セグメントトークンインデックスが依然として空の場合、直接SEGの文字列を含むトークンを検索
+        if len(seg_token_indices) == 0:
+            print("SEGトークンのインデックスを文字列ベースで検索中...")
+            
+            # 全トークンIDをデコードしてSEGを含むインデックスを検索
+            if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+                try:
+                    decoded_tokens = self.tokenizer.batch_decode(output_tokens[0].unsqueeze(-1), skip_special_tokens=False)
+                    seg_indices = [i for i, token in enumerate(decoded_tokens) if "SEG" in token]
+                    print(f"文字列検索でSEGトークンを見つけました: {seg_indices}")
+                    seg_token_indices = seg_indices
+                except Exception as e:
+                    print(f"トークンデコード中にエラー: {e}")
+        
+        # さらにインデックスが空の場合、マスクを生成できない
+        if len(seg_token_indices) == 0:
+            print("警告: セグメントトークンのインデックスが見つかりませんでした。マスクは生成されません。")
+            # デバッグのために出力トークンの一部をデコード
+            if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+                try:
+                    sample_tokens = output_tokens[0, :30].tolist()  # 最初の30トークンを取得
+                    decoded = self.tokenizer.decode(sample_tokens)
+                    print(f"出力トークンの先頭部分: {decoded}")
+                except Exception as e:
+                    print(f"サンプルトークンのデコード中にエラー: {e}")
+            return []
+        
         # モデルのフォワードパスを実行して埋め込みを取得
         with torch.no_grad():
             # メモリ効率のためCPU→GPU転送を最適化
@@ -943,26 +1002,60 @@ class Llama32LISAForCausalLM(nn.Module):
                 # 隠れ状態が未取得の場合、取得を試みる
                 if hidden_states is None:
                     # 出力IDを使用して推論実行（隠れ状態を取得するため）
-                    model_outputs = self.model(
-                        input_ids=output_tokens,
-                        output_hidden_states=True,
-                        return_dict=True
-                    )
-                    hidden_states = model_outputs.hidden_states
+                    try:
+                        model_outputs = self.model(
+                            input_ids=output_tokens,
+                            output_hidden_states=True,
+                            return_dict=True
+                        )
+                        hidden_states = model_outputs.hidden_states
+                    except Exception as e:
+                        print(f"モデル推論中にエラーが発生: {e}")
+                        # モデルが異なる属性名を使用している可能性がある
+                        try:
+                            # Llama3.2モデルでは構造が異なる可能性があるため再試行
+                            if hasattr(self, 'base_model'):
+                                print("base_modelを使用して再試行中...")
+                                model_outputs = self.base_model(
+                                    input_ids=output_tokens,
+                                    output_hidden_states=True,
+                                    return_dict=True
+                                )
+                                hidden_states = model_outputs.hidden_states
+                            else:
+                                print("警告: base_modelも利用できません")
+                                continue
+                        except Exception as inner_e:
+                            print(f"base_modelでの推論中にもエラーが発生: {inner_e}")
+                            continue
                 
                 # 最後のレイヤーの隠れ状態を取得
-                if isinstance(hidden_states, tuple):
-                    last_hidden_states = hidden_states[-1]
-                else:
-                    last_hidden_states = hidden_states
-                    
-                # <SEG>トークンの埋め込みを取得
-                seg_hidden_state = last_hidden_states[0, seg_token_idx]
-                seg_hidden_states.append(seg_hidden_state)
+                if hidden_states is None:
+                    print("警告: 隠れ状態を取得できませんでした")
+                    continue
+                
+                try:
+                    if isinstance(hidden_states, tuple):
+                        last_hidden_states = hidden_states[-1]
+                    else:
+                        last_hidden_states = hidden_states
+                        
+                    # <SEG>トークンの埋め込みを取得
+                    seg_hidden_state = last_hidden_states[0, seg_token_idx]
+                    seg_hidden_states.append(seg_hidden_state)
+                    print(f"セグメントトークン {seg_token_idx} の隠れ状態を取得しました")
+                except Exception as e:
+                    print(f"隠れ状態の取得中にエラー: {e}")
+                    continue
             
             # <SEG>トークンの隠れ状態をプロジェクション
             sparse_embeddings = []
             dense_embeddings = []
+            
+            # 有効な隠れ状態があるか確認
+            if len(seg_hidden_states) == 0:
+                print("警告: 有効なセグメントトークンの隠れ状態がありません")
+                return []
             
             # mm_projectorがない場合、デフォルトの次元変換関数を定義
             if not hasattr(self, 'mm_projector') or self.mm_projector is None:
@@ -1008,7 +1101,7 @@ class Llama32LISAForCausalLM(nn.Module):
                 # 一般的なSAMデフォルトサイズは1024x1024
                 default_size = (1024, 1024)
                 original_sizes = [default_size for _ in range(len(sparse_embeddings))]
-                print(f"元の画像サイズが指定されていないため、デフォルトサイズを使用: {default_size}")
+                print(f"使用する画像サイズ: {default_size}")
             
             # 各セグメントプロンプトに対してマスクを生成
             for i, (sparse_emb, dense_emb) in enumerate(zip(sparse_embeddings, dense_embeddings)):
