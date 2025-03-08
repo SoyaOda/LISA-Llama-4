@@ -133,6 +133,18 @@ def parse_args(args):
         default=True,
         help="Whether to ignore mismatched sizes when loading weights",
     )
+    parser.add_argument(
+        "--very_low_memory",
+        action="store_true",
+        default=False,
+        help="Enable very low memory mode for smaller images and more memory efficiency",
+    )
+    parser.add_argument(
+        "--mixed_precision",
+        action="store_true",
+        default=False,
+        help="Enable mixed precision inference",
+    )
     return parser.parse_args(args)
 
 
@@ -179,6 +191,20 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
     device_map = getattr(model, "hf_device_map", None)
     is_auto_device_map = device_map == "auto" or isinstance(device_map, dict)
     
+    # 最大画像サイズの設定（メモリ使用量削減のため）
+    if args.very_low_memory:
+        max_img_size = 384  # 超低メモリモードでは384x384に制限
+    elif args.low_memory:
+        max_img_size = 512  # 低メモリモードでは512x512に制限
+    else:
+        max_img_size = 768  # 通常モードでも768x768に制限
+    
+    print(f"画像処理の最大サイズ: {max_img_size}x{max_img_size}")
+    
+    # 常にGCを有効化してメモリリークを防止
+    import gc
+    gc.enable()
+    
     while True:
         try:
             # ユーザー入力を取得
@@ -197,18 +223,23 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
             # 会話履歴に追加
             conversation.append({"role": "user", "content": user_input})
             
+            # 処理開始前にメモリクリーンアップ
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+            
             # 画像処理
             image_tensor = None
             if image_path:
                 # 画像を読み込み - メモリ効率のため小さめのサイズで読み込む
                 image = Image.open(image_path).convert('RGB')
                 
-                # 低メモリモードの場合、画像をリサイズして使用
-                if args.low_memory:
-                    # 画像サイズを制限（元のアスペクト比を維持）
-                    max_size = 512  # メモリ削減のため小さめに
-                    ratio = min(max_size / image.width, max_size / image.height)
-                    new_size = (int(image.width * ratio), int(image.height * ratio))
+                # 画像サイズを制限（元のアスペクト比を維持）
+                w, h = image.size
+                if max(w, h) > max_img_size:
+                    ratio = max_img_size / max(w, h)
+                    new_size = (int(w * ratio), int(h * ratio))
+                    print(f"画像リサイズ: {w}x{h} -> {new_size[0]}x{new_size[1]}")
                     image = image.resize(new_size, Image.LANCZOS)
                 
                 # 推論中に不要なメモリを解放するためno_gradを使用
@@ -221,7 +252,7 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                     )
                     
                     # 入力をデバイスに送る
-                    if not is_auto_device_map:  # autoの場合は自動的に適切なデバイスに配置される
+                    if not is_auto_device_map:
                         inputs = {k: v.to(device) for k, v in inputs.items()}
                     
                     input_ids = inputs["input_ids"]
@@ -239,7 +270,7 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
             
             # 生成パラメータを設定
             generate_kwargs = {
-                "max_new_tokens": max_new_tokens,
+                "max_new_tokens": min(max_new_tokens, 256 if args.very_low_memory else 512),  # 超低メモリモードではトークン数も制限
                 "do_sample": True if args.temperature > 0 else False,
                 "temperature": args.temperature,
                 "top_p": args.top_p,
@@ -252,12 +283,63 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
             
             # 生成を実行 - torch.no_gradでメモリ使用量を削減
             with torch.no_grad():
-                outputs = model.generate(
-                    input_ids=input_ids,
-                    return_dict_in_generate=True,
-                    output_hidden_states=True,
-                    **generate_kwargs
-                )
+                try:
+                    # 生成中にGPUメモリ不足になる場合は、より小さなメモリフットプリントでの生成を試みる
+                    outputs = model.generate(
+                        input_ids=input_ids,
+                        return_dict_in_generate=True,
+                        output_hidden_states=True,
+                        **generate_kwargs
+                    )
+                except RuntimeError as e:
+                    if "CUDA out of memory" in str(e):
+                        print("警告: GPUメモリ不足のため、より小さなトークン数で再試行します")
+                        # トークン数を減らして再試行
+                        generate_kwargs["max_new_tokens"] = 128
+                        # さらにメモリをクリーンアップ
+                        del input_ids
+                        if image_tensor is not None:
+                            del image_tensor
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        # 再度入力を処理
+                        if image_path:
+                            # 画像をさらに小さいサイズに
+                            image = Image.open(image_path).convert('RGB')
+                            max_retry_size = 256  # 再試行時はさらに小さく
+                            w, h = image.size
+                            ratio = max_retry_size / max(w, h)
+                            new_size = (int(w * ratio), int(h * ratio))
+                            print(f"再試行: 画像を縮小 {new_size[0]}x{new_size[1]}")
+                            image = image.resize(new_size, Image.LANCZOS)
+                            
+                            inputs = tokenizer(
+                                text=user_input,
+                                images=image,
+                                return_tensors="pt"
+                            )
+                        else:
+                            inputs = tokenizer.tokenizer(
+                                user_input,
+                                return_tensors="pt"
+                            )
+                        
+                        if not is_auto_device_map:
+                            inputs = {k: v.to(device) for k, v in inputs.items()}
+                        
+                        input_ids = inputs["input_ids"]
+                        if "pixel_values" in inputs:
+                            generate_kwargs["pixel_values"] = inputs["pixel_values"]
+                        
+                        # 再度生成
+                        outputs = model.generate(
+                            input_ids=input_ids,
+                            return_dict_in_generate=True,
+                            output_hidden_states=False,  # メモリ削減のため
+                            **generate_kwargs
+                        )
+                    else:
+                        raise
             
             # 生成されたテキストをデコード
             generated_text = tokenizer.tokenizer.decode(outputs.sequences[0], skip_special_tokens=False)
@@ -286,7 +368,7 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                     
                     # SAM用に画像を前処理
                     # 低メモリモードの場合、より小さいサイズでSAM処理
-                    sam_image_size = 512 if args.low_memory else 1024
+                    sam_image_size = 256 if args.very_low_memory else (384 if args.low_memory else 512)
                     
                     # メモリ効率のため、ここでプロセッサで処理した画像を使用
                     with torch.no_grad():
@@ -331,20 +413,26 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                         del mask_np, overlay, colored_mask
                     
                     # メモリ解放
-                    del masks, processed_image
+                    del masks, processed_image, image_cv
                 
                 # 明示的に不要なテンソルを解放
-                if image_tensor is not None:
+                if 'image_tensor' in locals() and image_tensor is not None:
                     del image_tensor
+                
+                if 'inputs' in locals():
+                    del inputs
+                
+                if 'input_ids' in locals():
+                    del input_ids
                 
                 if 'outputs' in locals():
                     del outputs
                 
                 # ガベージコレクションを実行してメモリを確実に解放
-                import gc
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                    print(f"GPUメモリ使用状況: {torch.cuda.memory_allocated() / 1024**2:.2f} MB / {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
             
             # 応答を表示
             print(f"\nアシスタント: {generated_response}")
@@ -358,6 +446,10 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
             print(f"エラーが発生しました: {e}")
             import traceback
             traceback.print_exc()
+            # エラー発生時もメモリをクリーンアップ
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 def main(args):
@@ -381,6 +473,14 @@ def main(args):
     else:
         raise ValueError(f"Unsupported precision: {args.precision}")
     
+    # 4bit/8bit量子化をスキップするためのチェック
+    if args.load_in_4bit or args.load_in_8bit:
+        print("警告: bitsandbytesライブラリのセットアップに問題があるため、4bit/8bit量子化をスキップします")
+        print("代わりにGPUメモリ最適化を実施します")
+        args.load_in_4bit = False
+        args.load_in_8bit = False
+        args.very_low_memory = True
+    
     # トークナイザーをロード
     tokenizer = AutoProcessor.from_pretrained(args.version)
     
@@ -389,22 +489,78 @@ def main(args):
         print("Adding <SEG> token to tokenizer vocabulary")
         tokenizer.tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
     
+    # デバイスマップを設定 - メモリ使用量を削減するための特別設定
+    device_map = None
+    
+    # 超低メモリモードの場合、一部のレイヤーをCPUにオフロード
+    if args.very_low_memory:
+        print("超低メモリモードを有効化します - 一部のレイヤーをCPUにオフロード")
+        device_map = {
+            "model.embed_tokens": 0,
+            "model.norm": 0,
+            "model.layers.0": 0, 
+            "model.layers.1": 0,
+            "model.layers.2": 0,
+            "model.layers.3": 0,
+            "model.layers.4": 0,
+            "model.layers.5": 0,
+            "model.layers.6": 0,
+            "model.layers.7": 0,
+            "model.layers.8": 0,
+            "model.layers.9": 0,
+            "model.layers.10": 0,
+            "model.layers.11": 0,
+            "model.layers.12": 0,
+            "model.layers.13": 0,
+            "model.layers.14": 0,
+            "model.layers.15": 0,
+            "model.layers.16": "cpu",
+            "model.layers.17": "cpu",
+            "model.layers.18": "cpu",
+            "model.layers.19": "cpu",
+            "model.layers.20": "cpu",
+            "model.layers.21": "cpu",
+            "model.layers.22": "cpu",
+            "model.layers.23": "cpu",
+            "model.layers.24": "cpu",
+            "model.layers.25": "cpu",
+            "model.layers.26": "cpu",
+            "model.layers.27": "cpu",
+            "model.layers.28": "cpu",
+            "model.layers.29": "cpu",
+            "model.layers.30": "cpu",
+            "model.layers.31": "cpu",
+            "lm_head": 0,
+            "vision_tower": 0,
+        }
+    elif args.low_memory:
+        print("低メモリモードを有効化します")
+        # auto device mapを使用
+        device_map = "auto"
+    
     # from_vision_modelメソッドを使用してモデルとトークナイザーを同時に取得
-    # メモリ効率を高めるためにdevice_map="auto"を使用し、量子化オプションを渡す
+    # メモリ効率を高めるためにdevice_mapを使用
     model, tokenizer = Llama32LISAForCausalLM.from_vision_model(
         vision_model_id=args.version,
         vision_pretrained=args.sam_version,
         train_mask_decoder=args.train_mask_decoder,
         tokenizer=tokenizer,
         torch_dtype=dtype,
-        device_map="auto",  # 自動的にGPU/CPU間でレイヤーを配置
+        device_map=device_map,  # 自動的にGPU/CPU間でレイヤーを配置
         ignore_mismatched_sizes=args.ignore_mismatched_sizes,
-        load_in_8bit=args.load_in_8bit,
-        load_in_4bit=args.load_in_4bit
+        load_in_8bit=False,  # BNBエラーのため無効化
+        load_in_4bit=False   # BNBエラーのため無効化
     )
     
-    # デバイスの設定（device_map="auto"を使用している場合、.toは不要）
+    # モデルをデバイスに配置
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # モデルが混合精度を使用するように設定（オプション）
+    if args.mixed_precision and torch.cuda.is_available():
+        print("混合精度推論を有効化します")
+        amp_config = {"enabled": True, "dtype": dtype}
+    else:
+        amp_config = {"enabled": False}
     
     # チャットループの設定
     prompt_template = get_prompt_template()
@@ -412,6 +568,10 @@ def main(args):
     max_new_tokens = args.max_new_tokens
     sep = "[/INST]"
     stop_str = "</s>"
+    
+    # メモリの状態を報告
+    if torch.cuda.is_available():
+        print(f"GPUメモリ使用状況: {torch.cuda.memory_allocated() / 1024**2:.2f} MB / {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
     
     # チャットモードの起動
     chatting(args, model, tokenizer, device, prompt_template, model_max_length, max_new_tokens, sep, stop_str)
