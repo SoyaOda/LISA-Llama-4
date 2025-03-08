@@ -36,49 +36,90 @@ def authenticate_huggingface():
 
 
 def parse_args(args):
-    parser = argparse.ArgumentParser(description="LISA chat")
-    parser.add_argument("--version", default="meta-llama/Llama-3.2-11B-Vision-Instruct")
-    parser.add_argument("--vis_save_path", default="./vis_output", type=str)
+    parser = argparse.ArgumentParser(description='LISA Chat')
+    
+    # モデルと設定
     parser.add_argument(
-        "--precision",
-        default="bf16",
-        type=str,
-        choices=["fp32", "bf16", "fp16"],
-        help="precision for inference",
-    )
-    parser.add_argument("--image_size", default=1024, type=int, help="image size")
-    parser.add_argument("--model_max_length", default=512, type=int)
-    parser.add_argument("--lora_r", default=8, type=int)
-    parser.add_argument(
-        "--vision-tower", default=None, type=str, help="Path to SAM ViT-H checkpoint"
-    )
-    parser.add_argument("--local-rank", default=0, type=int, help="node rank")
-    parser.add_argument("--load_in_8bit", action="store_true", default=False)
-    parser.add_argument("--load_in_4bit", action="store_true", default=False)
-    parser.add_argument(
-        "--conv_type",
-        default="llama3_2",
-        type=str,
-        choices=["llama3_2"],
+        "--version",
+        default="meta-llama/Llama-3.2-11B-Vision-Instruct",
+        help="LISA model version",
     )
     parser.add_argument(
         "--sam_version",
+        type=str,
+        default="./checkpoints/sam_vit_h_4b8939.pth",
+        help="SAM model version",
+    )
+    parser.add_argument(
+        "--vision_tower",
+        type=str,
         default=None,
-        type=str,
-        help="SAM model version, e.g., sam_vit_h_4b8939.pth"
+        help="Vision tower model name or path",
     )
     parser.add_argument(
-        "--model_type",
-        default="llama32_lisa",
-        type=str,
-        choices=["llama32_lisa"],
-        help="Model type: Llama3.2 Vision + SAM",
-    )
-    parser.add_argument(
-        "--out_dim",
+        "--out_dim", 
+        type=int, 
         default=256,
+        help="Output dimension"
+    )
+    parser.add_argument(
+        '--precision',
+        type=str,
+        default='bf16',
+        choices=['fp32', 'bf16', 'fp16'],
+        help='Precision for model weights'
+    )
+    parser.add_argument(
+        "--vis_save_path",
+        type=str,
+        default="./vis_output/",
+        help="Path to save visualization results",
+    )
+    parser.add_argument(
+        "--image_size",
         type=int,
-        help="Output dimension for mask embedding",
+        default=1024,
+        help="image size for SAM model input",
+    )
+    
+    # 生成設定
+    parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=512,
+        help="Maximum number of new tokens to generate",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Temperature for sampling, 0 means greedy decoding",
+    )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=0.9,
+        help="Top-p sampling probability",
+    )
+    
+    # メモリ最適化オプション
+    parser.add_argument(
+        "--load_in_8bit",
+        action="store_true",
+        default=False,
+        help="Load model in 8-bit precision",
+    )
+    parser.add_argument(
+        "--load_in_4bit",
+        action="store_true",
+        default=False,
+        help="Load model in 4-bit precision",
+    )
+    parser.add_argument(
+        "--low_memory",
+        action="store_true",
+        default=False,
+        help="Enable low memory mode for smaller images and more memory efficiency",
     )
     parser.add_argument(
         "--train_mask_decoder",
@@ -134,6 +175,10 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
     # 会話履歴を初期化
     conversation = []
     
+    # デバイスマップの確認 - モデルがautoマッピングを使用しているかどうか
+    device_map = getattr(model, "hf_device_map", None)
+    is_auto_device_map = device_map == "auto" or isinstance(device_map, dict)
+    
     while True:
         try:
             # ユーザー入力を取得
@@ -155,33 +200,49 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
             # 画像処理
             image_tensor = None
             if image_path:
-                # 画像を読み込み
+                # 画像を読み込み - メモリ効率のため小さめのサイズで読み込む
                 image = Image.open(image_path).convert('RGB')
                 
-                # プロセッサで画像を処理
-                inputs = tokenizer(
-                    text=user_input,
-                    images=image,
-                    return_tensors="pt"
-                )
-                input_ids = inputs["input_ids"].to(device)
+                # 低メモリモードの場合、画像をリサイズして使用
+                if args.low_memory:
+                    # 画像サイズを制限（元のアスペクト比を維持）
+                    max_size = 512  # メモリ削減のため小さめに
+                    ratio = min(max_size / image.width, max_size / image.height)
+                    new_size = (int(image.width * ratio), int(image.height * ratio))
+                    image = image.resize(new_size, Image.LANCZOS)
                 
-                # 画像テンソルも取得
-                image_tensor = inputs["pixel_values"].to(device)
+                # 推論中に不要なメモリを解放するためno_gradを使用
+                with torch.no_grad():
+                    # プロセッサで画像を処理
+                    inputs = tokenizer(
+                        text=user_input,
+                        images=image,
+                        return_tensors="pt"
+                    )
+                    
+                    # 入力をデバイスに送る
+                    if not is_auto_device_map:  # autoの場合は自動的に適切なデバイスに配置される
+                        inputs = {k: v.to(device) for k, v in inputs.items()}
+                    
+                    input_ids = inputs["input_ids"]
+                    image_tensor = inputs["pixel_values"]
             else:
                 # テキストのみの処理
-                inputs = tokenizer.tokenizer(
-                    user_input,
-                    return_tensors="pt"
-                )
-                input_ids = inputs["input_ids"].to(device)
+                with torch.no_grad():
+                    inputs = tokenizer.tokenizer(
+                        user_input,
+                        return_tensors="pt"
+                    )
+                    if not is_auto_device_map:
+                        inputs = {k: v.to(device) for k, v in inputs.items()}
+                    input_ids = inputs["input_ids"]
             
             # 生成パラメータを設定
             generate_kwargs = {
                 "max_new_tokens": max_new_tokens,
-                "do_sample": True,
-                "temperature": 0.7,
-                "top_p": 0.9,
+                "do_sample": True if args.temperature > 0 else False,
+                "temperature": args.temperature,
+                "top_p": args.top_p,
             }
             
             # 画像があるかどうかで異なる生成処理
@@ -189,7 +250,7 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                 # 画像と入力IDsを使って生成
                 generate_kwargs["pixel_values"] = image_tensor
             
-            # 生成を実行
+            # 生成を実行 - torch.no_gradでメモリ使用量を削減
             with torch.no_grad():
                 outputs = model.generate(
                     input_ids=input_ids,
@@ -214,25 +275,33 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                     if token_id == tokenizer.tokenizer.convert_tokens_to_ids("<SEG>"):
                         seg_indices.append(i)
                 
-                if seg_indices and image_tensor is not None:
+                if seg_indices and image_path:
                     # 画像の元のサイズを取得
                     original_image = Image.open(image_path).convert('RGB')
                     original_size = original_image.size[::-1]  # (h, w)
                     
-                    # SAM用に画像を前処理
-                    processed_image = preprocess(image_tensor).to(device)
-                    
-                    # マスクを生成
-                    masks = model.generate_masks(
-                        images=processed_image,
-                        input_ids=outputs.sequences,
-                        seg_token_indices=seg_indices,
-                        original_sizes=[original_size],
-                    )
-                    
-                    # マスクを可視化
-                    # 元の画像をOpenCV形式に変換
+                    # マスク生成に必要なイメージデータを準備
+                    # 元の画像をOpenCV形式に変換（マスク可視化用）
                     image_cv = cv2.cvtColor(np.array(original_image), cv2.COLOR_RGB2BGR)
+                    
+                    # SAM用に画像を前処理
+                    # 低メモリモードの場合、より小さいサイズでSAM処理
+                    sam_image_size = 512 if args.low_memory else 1024
+                    
+                    # メモリ効率のため、ここでプロセッサで処理した画像を使用
+                    with torch.no_grad():
+                        # SAM用の画像を前処理
+                        processed_image = preprocess(image_tensor, img_size=sam_image_size)
+                        if not is_auto_device_map:
+                            processed_image = processed_image.to(device)
+                        
+                        # マスクを生成
+                        masks = model.generate_masks(
+                            images=processed_image,
+                            input_ids=outputs.sequences,
+                            seg_token_indices=seg_indices,
+                            original_sizes=[original_size],
+                        )
                     
                     for i, mask in enumerate(masks):
                         # マスクをCPUに移動してNumPy配列に変換
@@ -253,10 +322,29 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                         cv2.addWeighted(image_cv, 0.7, colored_mask, 0.3, 0, overlay)
                         
                         # 結果を保存
-                        filename = f"mask_{i}_{Path(image_path).stem}.png"
+                        filename = f"{Path(image_path).stem}_masked_img_{i}.jpg"
                         save_path = os.path.join(args.vis_save_path, filename)
                         cv2.imwrite(save_path, overlay)
                         print(f"マスク画像を保存しました: {save_path}")
+                        
+                        # メモリ解放（大きなNumPy配列）
+                        del mask_np, overlay, colored_mask
+                    
+                    # メモリ解放
+                    del masks, processed_image
+                
+                # 明示的に不要なテンソルを解放
+                if image_tensor is not None:
+                    del image_tensor
+                
+                if 'outputs' in locals():
+                    del outputs
+                
+                # ガベージコレクションを実行してメモリを確実に解放
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
             # 応答を表示
             print(f"\nアシスタント: {generated_response}")
@@ -283,6 +371,16 @@ def main(args):
     # モデルの読み込み
     print(f"Loading Llama3.2 Vision + SAM model: {args.version}")
     
+    # モデル精度の設定
+    if args.precision == "fp32":
+        dtype = torch.float32
+    elif args.precision == "bf16":
+        dtype = torch.bfloat16
+    elif args.precision == "fp16":
+        dtype = torch.float16
+    else:
+        raise ValueError(f"Unsupported precision: {args.precision}")
+    
     # トークナイザーをロード
     tokenizer = AutoProcessor.from_pretrained(args.version)
     
@@ -292,17 +390,21 @@ def main(args):
         tokenizer.tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
     
     # from_vision_modelメソッドを使用してモデルとトークナイザーを同時に取得
+    # メモリ効率を高めるためにdevice_map="auto"を使用し、量子化オプションを渡す
     model, tokenizer = Llama32LISAForCausalLM.from_vision_model(
         vision_model_id=args.version,
         vision_pretrained=args.sam_version,
         train_mask_decoder=args.train_mask_decoder,
         tokenizer=tokenizer,
-        ignore_mismatched_sizes=args.ignore_mismatched_sizes
+        torch_dtype=dtype,
+        device_map="auto",  # 自動的にGPU/CPU間でレイヤーを配置
+        ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+        load_in_8bit=args.load_in_8bit,
+        load_in_4bit=args.load_in_4bit
     )
     
-    # デバイスの設定
+    # デバイスの設定（device_map="auto"を使用している場合、.toは不要）
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
     
     # チャットループの設定
     prompt_template = get_prompt_template()

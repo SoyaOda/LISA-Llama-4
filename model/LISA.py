@@ -237,7 +237,7 @@ class Llama32LISAForCausalLM(nn.Module):
     @classmethod
     def from_vision_model(cls, vision_model_id, seg_token_idx=None, vision_pretrained=None, train_mask_decoder=False, 
                          out_dim=256, tokenizer=None, torch_dtype=None, device_map=None, 
-                         quantization_config=None, ignore_mismatched_sizes=False, **kwargs):
+                         quantization_config=None, ignore_mismatched_sizes=False, load_in_8bit=False, load_in_4bit=False, **kwargs):
         """
         Llama3.2 Vision modelとSAMを統合したモデルを生成します。
         
@@ -252,6 +252,8 @@ class Llama32LISAForCausalLM(nn.Module):
             device_map: デバイスマッピング
             quantization_config: 量子化設定
             ignore_mismatched_sizes: サイズの不一致を無視するかどうか
+            load_in_8bit: 8ビット量子化を使用するかどうか
+            load_in_4bit: 4ビット量子化を使用するかどうか
             **kwargs: その他の引数
         """
         print("Step 1: Loading base vision-language model...")
@@ -266,6 +268,21 @@ class Llama32LISAForCausalLM(nn.Module):
                 tokenizer.tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
             else:
                 tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
+        
+        # 量子化設定がない場合は作成
+        if quantization_config is None and (load_in_8bit or load_in_4bit):
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=load_in_8bit,
+                load_in_4bit=load_in_4bit,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+            )
+        
+        # デバイスマップがない場合は設定（メモリ効率のため）
+        if device_map is None:
+            # 自動的にGPUとCPU間でレイヤーを配置
+            device_map = "auto"
         
         # トークナイザーを拡張した後にモデルをロード
         vision_model = AutoModelForVision2Seq.from_pretrained(
@@ -298,8 +315,9 @@ class Llama32LISAForCausalLM(nn.Module):
             **kwargs
         )
         
-        # SAMエンコーダを初期化
-        model.initialize_sam_encoder()
+        # SAMエンコーダを初期化（GPUメモリの効率化のためtorch.no_gradを使用）
+        with torch.no_grad():
+            model.initialize_sam_encoder()
         
         # 基本モデルの重みを転送
         print("Step 3: Transferring model weights...")
