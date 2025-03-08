@@ -17,7 +17,7 @@ from model.llama3_2.constants import IMAGE_TOKEN, SEG_TOKEN
 from model.segment_anything.utils.transforms import ResizeLongestSide
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX)
-from model.llama3_2.mm_utils import create_mllama_message
+from model.llama3_2.mm_utils import create_mllama_message, process_images
 
 # Hugging Face認証を行う関数
 def authenticate_huggingface():
@@ -50,6 +50,17 @@ def parse_args(args):
         type=str,
         default="./checkpoints/sam_vit_h_4b8939.pth",
         help="SAM model version",
+    )
+    parser.add_argument(
+        "--test_image",
+        type=str,
+        default=None,
+        help="Path to a test image for validating processor functionality",
+    )
+    parser.add_argument(
+        "--run_segment_test",
+        action="store_true",
+        help="Run a segmentation test with the test image if provided",
     )
     parser.add_argument(
         "--vision_tower",
@@ -220,7 +231,7 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
         image_token = "<image>"
     
     # モデルタイプの判定
-    is_mllama = hasattr(tokenizer, 'apply_chat_template')
+    is_mllama = hasattr(tokenizer, 'processor') or hasattr(tokenizer, 'image_processor')
     if is_mllama:
         print(f"Llama 3.2 Vision (Mllama)モデルを検出しました。画像トークン: {image_token}")
     else:
@@ -252,276 +263,182 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
             # 画像処理
             image_tensor = None
             if image_path:
-                # 画像を読み込み - メモリ効率のため小さめのサイズで読み込む
-                image = Image.open(image_path).convert('RGB')
-                
-                # 画像サイズを制限（元のアスペクト比を維持）
-                w, h = image.size
-                if max(w, h) > max_img_size:
-                    ratio = max_img_size / max(w, h)
-                    new_size = (int(w * ratio), int(h * ratio))
-                    print(f"画像リサイズ: {w}x{h} -> {new_size[0]}x{new_size[1]}")
-                    image = image.resize(new_size, Image.LANCZOS)
-                
-                # 推論中に不要なメモリを解放するためno_gradを使用
-                with torch.no_grad():
-                    try:
-                        # Mllama (Llama 3.2 Vision)モデルの場合
+                try:
+                    # 画像を読み込み - メモリ効率のため小さめのサイズで読み込む
+                    image = Image.open(image_path).convert('RGB')
+                    
+                    # 画像サイズを制限（元のアスペクト比を維持）
+                    w, h = image.size
+                    if max(w, h) > max_img_size:
+                        ratio = max_img_size / max(w, h)
+                        new_size = (int(w * ratio), int(h * ratio))
+                        print(f"画像リサイズ: {w}x{h} -> {new_size[0]}x{new_size[1]}")
+                        image = image.resize(new_size, Image.LANCZOS)
+                    
+                    # 推論中に不要なメモリを解放するためno_gradを使用
+                    with torch.no_grad():
+                        # Llama 3.2 Vision (Mllama)モデルの場合
                         if is_mllama:
-                            # チャットテンプレートを使用するスタイル
-                            messages = [
-                                {
-                                    "role": "user", 
-                                    "content": [
-                                        {"type": "image"},
-                                        {"type": "text", "text": user_input}
-                                    ]
-                                }
-                            ]
-                            # ロギング
                             print("Mllamaメッセージ形式を使用")
-                            
-                            # 入力を処理（画像とテキスト）
-                            inputs = tokenizer(
-                                text=messages,
-                                images=image,
-                                return_tensors="pt"
-                            )
+                            try:
+                                # 最もシンプルな方法: 単純な文字列とPIL画像
+                                inputs = tokenizer(
+                                    images=image,
+                                    text=user_input,
+                                    return_tensors="pt"
+                                )
+                                
+                                # デバイスに移動
+                                if not is_auto_device_map:
+                                    inputs = {k: v.to(device) for k, v in inputs.items()}
+                                
+                                # 入力IDsを取得
+                                input_ids = inputs["input_ids"]
+                            except Exception as e1:
+                                print(f"画像処理中にエラー: {e1}")
+                                print("代替方法1で試行...")
+                                
+                                try:
+                                    # 代替方法1: create_mllama_message関数を使用
+                                    message = create_mllama_message(image, user_input)
+                                    inputs = tokenizer(**message, return_tensors="pt")
+                                    
+                                    # デバイスに移動
+                                    if not is_auto_device_map:
+                                        inputs = {k: v.to(device) for k, v in inputs.items()}
+                                    
+                                    # 入力IDsを取得
+                                    input_ids = inputs["input_ids"]
+                                except Exception as e2:
+                                    print(f"代替方法1でもエラー: {e2}")
+                                    print("代替方法2で試行...")
+                                    
+                                    try:
+                                        # 代替方法2: 明示的なキーワード引数の使用
+                                        # ChatベースでなくVisionのみで処理
+                                        if hasattr(tokenizer, "processor"):
+                                            processor = tokenizer.processor
+                                            processed = processor(image, user_input, return_tensors="pt")
+                                            inputs = processed
+                                        else:
+                                            # 最も基本的な方法: 辞書を直接構築
+                                            inputs = {
+                                                "input_ids": tokenizer.encode(user_input, return_tensors="pt"),
+                                                "pixel_values": tokenizer.image_processor(image, return_tensors="pt").pixel_values
+                                            }
+                                            
+                                            # デバイスに移動
+                                            if not is_auto_device_map:
+                                                inputs = {k: v.to(device) for k, v in inputs.items()}
+                                            
+                                            # 入力IDsを取得
+                                            input_ids = inputs["input_ids"]
+                                    except Exception as e3:
+                                        print(f"代替方法2でもエラー: {e3}")
+                                        print("画像処理をスキップします")
+                                        
+                                        # すべての方法が失敗した場合: 画像なしで処理
+                                        inputs = tokenizer_func(user_input, return_tensors="pt")
+                                        if not is_auto_device_map:
+                                            inputs = {k: v.to(device) for k, v in inputs.items()}
+                                        input_ids = inputs["input_ids"]
                         else:
-                            # 直接テキスト+画像のスタイル
+                            # 通常のVLM処理（LLaVA等）
+                            # 画像トークンをテキストに追加
                             if image_token not in user_input:
-                                # 画像トークンを追加
                                 modified_input = f"{image_token} {user_input}"
                             else:
                                 modified_input = user_input
-                                
-                            # 入力を処理
+                            
+                            # 通常の処理 - VLMと画像を同時に処理
                             inputs = tokenizer(
                                 text=modified_input,
                                 images=image,
                                 return_tensors="pt"
                             )
-                        
-                        # デバイスに移動
-                        if not is_auto_device_map:
-                            inputs = {k: v.to(device) for k, v in inputs.items()}
-                        
-                        # 入力IDsと画像テンソルを取得
-                        input_ids = inputs["input_ids"]
-                        if "pixel_values" in inputs:
-                            image_tensor = inputs["pixel_values"]
-                    except Exception as e:
-                        print(f"画像処理中にエラー: {e}")
-                        print("別の方法で試行...")
-                        
-                        # MllamaProcessorの別のインターフェースを試す
-                        messages = create_mllama_message(user_input, image_token)
-                        inputs = tokenizer(
-                            text=messages,
-                            images=image,
-                            return_tensors="pt"
-                        )
-                        
-                        # デバイスに移動
-                        if not is_auto_device_map:
-                            inputs = {k: v.to(device) for k, v in inputs.items()}
-                        
-                        input_ids = inputs["input_ids"]
-                        if "pixel_values" in inputs:
-                            image_tensor = inputs["pixel_values"]
+                            
+                            # デバイスに移動
+                            if not is_auto_device_map:
+                                inputs = {k: v.to(device) for k, v in inputs.items()}
+                            
+                            # 入力IDsと画像テンソルを取得
+                            input_ids = inputs["input_ids"]
+                            if "pixel_values" in inputs:
+                                image_tensor = inputs["pixel_values"]
+                except Exception as main_error:
+                    print(f"画像処理に完全に失敗しました: {main_error}")
+                    # テキストのみで処理を継続
+                    inputs = tokenizer_func(user_input, return_tensors="pt")
+                    if not is_auto_device_map:
+                        inputs = {k: v.to(device) for k, v in inputs.items()}
+                    input_ids = inputs["input_ids"]
             else:
                 # テキストのみの処理
                 with torch.no_grad():
-                    inputs = tokenizer_func(
-                        user_input,
-                        return_tensors="pt"
-                    )
+                    inputs = tokenizer_func(user_input, return_tensors="pt")
                     if not is_auto_device_map:
                         inputs = {k: v.to(device) for k, v in inputs.items()}
                     input_ids = inputs["input_ids"]
             
-            # 生成パラメータを設定
-            generate_kwargs = {
-                "max_new_tokens": min(max_new_tokens, 256 if args.very_low_memory else 512),  # 超低メモリモードではトークン数も制限
-                "do_sample": True if args.temperature > 0 else False,
-                "temperature": args.temperature,
-                "top_p": args.top_p,
-            }
+            # 入力サイズの確認
+            input_length = input_ids.shape[0]
+            print(f"入力トークン数: {input_length}")
             
-            # 画像があるかどうかで異なる生成処理
-            if image_tensor is not None:
-                # 画像と入力IDsを使って生成
-                generate_kwargs["pixel_values"] = image_tensor
+            # 出力に十分な長さを確保
+            if input_length + max_new_tokens > model_max_length:
+                max_possible_tokens = model_max_length - input_length
+                print(f"警告: 入力が長すぎるため、max_new_tokensを{max_new_tokens}から{max_possible_tokens}に削減します")
+                max_new_tokens = max(1, max_possible_tokens)
             
-            # 生成を実行 - torch.no_gradでメモリ使用量を削減
+            # メモリ効率のため推論時にはgrad計算を無効化
             with torch.no_grad():
                 try:
-                    # 生成中にGPUメモリ不足になる場合は、より小さなメモリフットプリントでの生成を試みる
-                    outputs = model.generate(
-                        input_ids=input_ids,
-                        return_dict_in_generate=True,
-                        output_hidden_states=True,
-                        **generate_kwargs
-                    )
-                except RuntimeError as e:
-                    if "CUDA out of memory" in str(e):
-                        print("警告: GPUメモリ不足のため、より小さなトークン数で再試行します")
-                        # トークン数を減らして再試行
-                        generate_kwargs["max_new_tokens"] = 128
-                        # さらにメモリをクリーンアップ
-                        del input_ids
-                        if image_tensor is not None:
-                            del image_tensor
-                        torch.cuda.empty_cache()
-                        gc.collect()
-                        # 再度入力を処理
-                        if image_path:
-                            # 画像をさらに小さいサイズに
-                            image = Image.open(image_path).convert('RGB')
-                            max_retry_size = 256  # 再試行時はさらに小さく
-                            w, h = image.size
-                            ratio = max_retry_size / max(w, h)
-                            new_size = (int(w * ratio), int(h * ratio))
-                            print(f"再試行: 画像を縮小 {new_size[0]}x{new_size[1]}")
-                            image = image.resize(new_size, Image.LANCZOS)
-                            
-                            inputs = tokenizer(
-                                text=user_input,
-                                images=image,
-                                return_tensors="pt"
-                            )
-                        else:
-                            inputs = tokenizer_func(
-                                user_input,
-                                return_tensors="pt"
-                            )
-                        
-                        if not is_auto_device_map:
-                            inputs = {k: v.to(device) for k, v in inputs.items()}
-                        
-                        input_ids = inputs["input_ids"]
-                        if "pixel_values" in inputs:
-                            generate_kwargs["pixel_values"] = inputs["pixel_values"]
-                        
-                        # 再度生成
-                        outputs = model.generate(
+                    # 画像によるセグメンテーションの場合、generate_masksを使用
+                    if (image_path and "<SEG>" in user_input) or ("<SEG>" in user_input and "segment" in user_input.lower()):
+                        print("セグメンテーションモードで実行中...")
+                        # LISA専用の関数を使用
+                        generation = model.generate_masks(
+                            image=image if image else None,
                             input_ids=input_ids,
-                            return_dict_in_generate=True,
-                            output_hidden_states=False,  # メモリ削減のため
-                            **generate_kwargs
+                            attention_mask=torch.ones_like(input_ids),
+                            **inputs,
+                            max_new_tokens=max_new_tokens,
                         )
                     else:
-                        raise
-            
-            # 生成されたテキストをデコード
-            generated_text = tokenizer_func.decode(outputs.sequences[0], skip_special_tokens=False)
-            
-            # レスポンス部分を抽出
-            generated_response = generated_text.split(sep)[-1].strip()
-            if stop_str in generated_response:
-                generated_response = generated_response.split(stop_str)[0].strip()
-            
-            # SEGトークンがあるかチェック
-            if "<SEG>" in generated_response:
-                # SEGトークンのインデックスを検出
-                seg_indices = []
-                for i, token_id in enumerate(outputs.sequences[0]):
-                    if token_id == tokenizer_func.convert_tokens_to_ids("<SEG>"):
-                        seg_indices.append(i)
-                
-                if seg_indices and image_path:
-                    # 画像の元のサイズを取得
-                    original_image = Image.open(image_path).convert('RGB')
-                    original_size = original_image.size[::-1]  # (h, w)
-                    
-                    # マスク生成に必要なイメージデータを準備
-                    # 元の画像をOpenCV形式に変換（マスク可視化用）
-                    image_cv = cv2.cvtColor(np.array(original_image), cv2.COLOR_RGB2BGR)
-                    
-                    # SAM用に画像を前処理
-                    # 低メモリモードの場合、より小さいサイズでSAM処理
-                    sam_image_size = 256 if args.very_low_memory else (384 if args.low_memory else 512)
-                    
-                    # メモリ効率のため、ここでプロセッサで処理した画像を使用
-                    with torch.no_grad():
-                        # SAM用の画像を前処理
-                        processed_image = preprocess(image_tensor, img_size=sam_image_size)
-                        if not is_auto_device_map:
-                            processed_image = processed_image.to(device)
-                        
-                        # マスクを生成
-                        masks = model.generate_masks(
-                            images=processed_image,
-                            input_ids=outputs.sequences,
-                            seg_token_indices=seg_indices,
-                            original_sizes=[original_size],
+                        # 通常の生成
+                        generation = model.generate(
+                            **inputs,
+                            max_new_tokens=max_new_tokens,
+                            do_sample=args.do_sample,
+                            temperature=args.temperature,
+                            top_p=args.top_p,
+                            top_k=args.top_k,
+                            repetition_penalty=args.repetition_penalty,
                         )
                     
-                    for i, mask in enumerate(masks):
-                        # マスクをCPUに移動してNumPy配列に変換
-                        mask_np = mask.cpu().numpy()
-                        
-                        # マスクを0-255の範囲にスケーリング
-                        mask_np = (mask_np * 255).astype(np.uint8)
-                        
-                        # マスクを元の画像サイズにリサイズ
-                        mask_np = cv2.resize(mask_np, (original_size[1], original_size[0]))
-                        
-                        # 画像とマスクのオーバーレイ
-                        overlay = image_cv.copy()
-                        colored_mask = np.zeros_like(image_cv)
-                        colored_mask[mask_np > 127] = [0, 0, 255]  # 赤色でマスク領域を表示
-                        
-                        # マスクをブレンド
-                        cv2.addWeighted(image_cv, 0.7, colored_mask, 0.3, 0, overlay)
-                        
-                        # 結果を保存
-                        filename = f"{Path(image_path).stem}_masked_img_{i}.jpg"
-                        save_path = os.path.join(args.vis_save_path, filename)
-                        cv2.imwrite(save_path, overlay)
-                        print(f"マスク画像を保存しました: {save_path}")
-                        
-                        # メモリ解放（大きなNumPy配列）
-                        del mask_np, overlay, colored_mask
+                    # 生成されたテキストのデコード
+                    output = tokenizer.decode(generation[0][input_ids.shape[0]:], skip_special_tokens=True)
                     
-                    # メモリ解放
-                    del masks, processed_image, image_cv
+                    # 生成テキストが停止ワードで終わっている場合、その前までを使用
+                    if stop_str and stop_str in output:
+                        output = output.split(stop_str)[0]
+                    
+                    # 結果を会話に追加して表示
+                    conversation[-1]["content"] = output
+                    print(f"Assistant: {output}")
                 
-                # 明示的に不要なテンソルを解放
-                if 'image_tensor' in locals() and image_tensor is not None:
-                    del image_tensor
-                
-                if 'inputs' in locals():
-                    del inputs
-                
-                if 'input_ids' in locals():
-                    del input_ids
-                
-                if 'outputs' in locals():
-                    del outputs
-                
-                # ガベージコレクションを実行してメモリを確実に解放
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    print(f"GPUメモリ使用状況: {torch.cuda.memory_allocated() / 1024**2:.2f} MB / {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
-            
-            # 応答を表示
-            print(f"\nアシスタント: {generated_response}")
-            
-            # 会話履歴に追加
-            conversation.append({"role": "assistant", "content": generated_response})
-            
+                except Exception as gen_error:
+                    print(f"生成中にエラーが発生しました: {gen_error}")
+                    import traceback
+                    traceback.print_exc()
+                    # エラーメッセージを会話に追加
+                    error_msg = f"エラーが発生しました。もう一度試してください。"
+                    conversation[-1]["content"] = error_msg
+                    print(f"Assistant: {error_msg}")
+        
         except KeyboardInterrupt:
+            print("ユーザーによる中断...")
             break
-        except Exception as e:
-            print(f"エラーが発生しました: {e}")
-            import traceback
-            traceback.print_exc()
-            # エラー発生時もメモリをクリーンアップ
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
 
 def main(args):
@@ -570,99 +487,159 @@ def main(args):
             torch.cuda.set_per_process_memory_fraction(0.8)  # GPUメモリの80%まで使用
             os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
     
-    # トークナイザーをロード
-    tokenizer = AutoProcessor.from_pretrained(args.version)
-    
-    # <SEG>トークンをトークナイザーに追加
-    # MllamaProcessorの場合、内部tokenizer属性を使用
-    if hasattr(tokenizer, 'tokenizer'):
-        if "<SEG>" not in tokenizer.tokenizer.get_vocab():
-            print("Adding <SEG> token to tokenizer vocabulary")
-            tokenizer.tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
-    else:
-        # 通常のトークナイザーの場合
-        if "<SEG>" not in tokenizer.get_vocab():
-            print("Adding <SEG> token to tokenizer vocabulary")
-            tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
-    
-    # from_vision_modelメソッドを使用してモデルとトークナイザーを同時に取得
-    # メモリ管理を最適化
-    print("メモリ効率の良いモデルロードを実行します...")
-    device_map = "auto"  # Hugging Faceにデバイスマッピングを任せる
-    
-    # 超低メモリモードでの追加対策
-    offload_folder = None
-    if args.very_low_memory:
-        print("CPUオフロードを有効化します")
-        # モデルを部分的にディスクにオフロードするための一時フォルダを設定
-        import tempfile
-        offload_folder = tempfile.mkdtemp()
-        print(f"一時オフロードフォルダ: {offload_folder}")
-    
     try:
-        model, tokenizer = Llama32LISAForCausalLM.from_vision_model(
-            vision_model_id=args.version,
-            vision_pretrained=args.sam_version,
-            train_mask_decoder=args.train_mask_decoder,
-            tokenizer=tokenizer,
-            torch_dtype=dtype,
-            device_map=device_map,  # 自動的にGPU/CPU間でレイヤーを配置
-            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
-            load_in_8bit=False,  # BNBエラーのため無効化
-            load_in_4bit=False,   # BNBエラーのため無効化
-            offload_folder=offload_folder if args.very_low_memory else None,
-        )
-    except Exception as e:
-        print(f"モデルロード中にエラーが発生しました: {e}")
-        print("代替方法でモデルをロードします...")
+        # トークナイザーをロード
+        tokenizer = AutoProcessor.from_pretrained(args.version)
+        print(f"トークナイザータイプ: {type(tokenizer)}")
         
-        # 代替として、より単純な方法でロード
-        model, tokenizer = Llama32LISAForCausalLM.from_vision_model(
-            vision_model_id=args.version,
-            vision_pretrained=args.sam_version,
-            train_mask_decoder=args.train_mask_decoder,
-            tokenizer=tokenizer,
-            torch_dtype=dtype,
-            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
-        )
+        # トークナイザーが持つメソッドとプロパティを表示
+        print("Tokenizer functions:", [method for method in dir(tokenizer) if not method.startswith('_') and callable(getattr(tokenizer, method))])
         
-        # モデルをCPUに一部移動して手動でメモリ管理
-        if args.very_low_memory and hasattr(model, 'model') and model.model is not None:
-            print("手動でモデルレイヤーをCPUに移動します...")
-            # モデルの一部のレイヤーを手動でCPUに移動
-            for i in range(20, 32):  # 後半のレイヤーをCPUに
-                try:
-                    layer_name = f"model.layers.{i}"
-                    if hasattr(model.model, "layers") and i < len(model.model.layers):
-                        layer = model.model.layers[i]
-                        layer.to("cpu")
-                        print(f"レイヤー {layer_name} をCPUに移動しました")
-                except Exception as layer_e:
-                    print(f"レイヤー移動中にエラー: {layer_e}")
+        # トークナイザーがチャットテンプレートメソッドを持つか確認
+        if hasattr(tokenizer, 'apply_chat_template'):
+            print("このトークナイザーはapply_chat_templateメソッドを持っています")
+        
+        # <SEG>トークンをトークナイザーに追加
+        # MllamaProcessorの場合、内部tokenizer属性を使用
+        if hasattr(tokenizer, 'tokenizer'):
+            print("トークナイザーは内部tokenizer属性を持っています")
+            if "<SEG>" not in tokenizer.tokenizer.get_vocab():
+                print("Adding <SEG> token to tokenizer vocabulary")
+                tokenizer.tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
+        else:
+            # 通常のトークナイザーの場合
+            print("トークナイザーは直接アクセス可能です")
+            if "<SEG>" not in tokenizer.get_vocab():
+                print("Adding <SEG> token to tokenizer vocabulary")
+                tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
+        
+        # from_vision_modelメソッドを使用してモデルとトークナイザーを同時に取得
+        # メモリ管理を最適化
+        print("メモリ効率の良いモデルロードを実行します...")
+        device_map = "auto"  # Hugging Faceにデバイスマッピングを任せる
+        
+        # 超低メモリモードでの追加対策
+        offload_folder = None
+        if args.very_low_memory:
+            print("CPUオフロードを有効化します")
+            # モデルを部分的にディスクにオフロードするための一時フォルダを設定
+            import tempfile
+            offload_folder = tempfile.mkdtemp()
+            print(f"一時オフロードフォルダ: {offload_folder}")
+        
+        try:
+            model, tokenizer = Llama32LISAForCausalLM.from_vision_model(
+                vision_model_id=args.version,
+                vision_pretrained=args.sam_version,
+                train_mask_decoder=args.train_mask_decoder,
+                tokenizer=tokenizer,
+                torch_dtype=dtype,
+                device_map=device_map,  # 自動的にGPU/CPU間でレイヤーを配置
+                ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+                load_in_8bit=False,  # BNBエラーのため無効化
+                load_in_4bit=False,   # BNBエラーのため無効化
+                offload_folder=offload_folder if args.very_low_memory else None,
+            )
+        except Exception as e:
+            print(f"モデルロード中にエラーが発生しました: {e}")
+            print("代替方法でモデルをロードします...")
+            
+            # 代替として、より単純な方法でロード
+            model, tokenizer = Llama32LISAForCausalLM.from_vision_model(
+                vision_model_id=args.version,
+                vision_pretrained=args.sam_version,
+                train_mask_decoder=args.train_mask_decoder,
+                tokenizer=tokenizer,
+                torch_dtype=dtype,
+                ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+            )
+            
+            # モデルをCPUに一部移動して手動でメモリ管理
+            if args.very_low_memory and hasattr(model, 'model') and model.model is not None:
+                print("手動でモデルレイヤーをCPUに移動します...")
+                # モデルの一部のレイヤーを手動でCPUに移動
+                for i in range(20, 32):  # 後半のレイヤーをCPUに
+                    try:
+                        layer_name = f"model.layers.{i}"
+                        if hasattr(model.model, "layers") and i < len(model.model.layers):
+                            layer = model.model.layers[i]
+                            layer.to("cpu")
+                            print(f"レイヤー {layer_name} をCPUに移動しました")
+                    except Exception as layer_e:
+                        print(f"レイヤー移動中にエラー: {layer_e}")
+        
+        # モデルをデバイスに配置
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # テスト用のシンプルな例で動作確認
+        try:
+            # Mllama処理テスト
+            from model.llama3_2.mm_utils import run_test_mllama_processor, print_debug_info_for_mllama
+            
+            # プロセッサとモデルの詳細情報を出力
+            print_debug_info_for_mllama(tokenizer, model)
+            
+            # テスト画像パスがあれば読み込む
+            test_image_path = args.test_image if hasattr(args, 'test_image') and args.test_image else None
+            
+            if test_image_path and os.path.exists(test_image_path):
+                print(f"テスト画像 {test_image_path} を使って処理テスト")
+                from PIL import Image
+                test_image = Image.open(test_image_path).convert('RGB')
+                
+                # プロセッサの動作テスト
+                run_test_mllama_processor(tokenizer, model_name=args.version)
+                
+                # セグメンテーションテスト
+                if args.run_segment_test and hasattr(model, 'generate_masks'):
+                    print("\n===== セグメンテーションテスト =====")
+                    try:
+                        # 最もシンプルな形式でテスト
+                        test_prompt = "Please segment all the persons in this image. <SEG>"
+                        # 画像第一引数、テキスト第二引数
+                        test_inputs = tokenizer(test_image, test_prompt, return_tensors="pt").to(device)
+                        
+                        # セグメンテーション実行
+                        with torch.no_grad():
+                            generation = model.generate_masks(
+                                image=test_image,
+                                input_ids=test_inputs.input_ids,
+                                attention_mask=test_inputs.attention_mask,
+                                **test_inputs,
+                                max_new_tokens=256,
+                            )
+                            
+                            # 生成されたテキストをデコード
+                            output = tokenizer.decode(generation[0][test_inputs.input_ids.shape[1]:], skip_special_tokens=True)
+                            print(f"セグメンテーション出力: {output[:100]}...")
+                            print("セグメンテーションテスト成功!")
+                    except Exception as segment_e:
+                        print(f"セグメンテーションテスト中にエラー: {segment_e}")
+                        import traceback
+                        traceback.print_exc()
+            
+        except Exception as test_exc:
+            print(f"テスト中にエラー発生: {test_exc}")
+        
+        # チャットループの設定
+        prompt_template = get_prompt_template()
+        # model_max_lengthを適切に取得
+        model_max_length = tokenizer.tokenizer.model_max_length if hasattr(tokenizer, 'tokenizer') else tokenizer.model_max_length
+        max_new_tokens = args.max_new_tokens
+        sep = "[/INST]"
+        stop_str = "</s>"
+        
+        # メモリの状態を報告
+        if torch.cuda.is_available():
+            print(f"GPUメモリ使用状況: {torch.cuda.memory_allocated() / 1024**2:.2f} MB / {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
+        
+        # チャットモードの起動
+        chatting(args, model, tokenizer, device, prompt_template, model_max_length, max_new_tokens, sep, stop_str)
     
-    # モデルをデバイスに配置
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # モデルが混合精度を使用するように設定（オプション）
-    if args.mixed_precision and torch.cuda.is_available():
-        print("混合精度推論を有効化します")
-        amp_config = {"enabled": True, "dtype": dtype}
-    else:
-        amp_config = {"enabled": False}
-    
-    # チャットループの設定
-    prompt_template = get_prompt_template()
-    model_max_length = tokenizer.tokenizer.model_max_length if hasattr(tokenizer, 'tokenizer') else tokenizer.model_max_length
-    max_new_tokens = args.max_new_tokens
-    sep = "[/INST]"
-    stop_str = "</s>"
-    
-    # メモリの状態を報告
-    if torch.cuda.is_available():
-        print(f"GPUメモリ使用状況: {torch.cuda.memory_allocated() / 1024**2:.2f} MB / {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
-    
-    # チャットモードの起動
-    chatting(args, model, tokenizer, device, prompt_template, model_max_length, max_new_tokens, sep, stop_str)
+    except Exception as main_error:
+        print(f"メイン処理中の致命的エラー: {main_error}")
+        import traceback
+        traceback.print_exc()
 
     # 一時フォルダを削除
     if offload_folder and os.path.exists(offload_folder):

@@ -682,49 +682,272 @@ class Llama32LISAForCausalLM(nn.Module):
         
     def generate_masks(
         self,
-        images: torch.FloatTensor,
-        input_ids: torch.LongTensor,
-        seg_token_indices: List[int],
-        original_sizes: List[Tuple[int, int]],
+        image=None,
+        input_ids=None,
+        attention_mask=None,
+        pixel_values=None,
         **kwargs
+    ):
+        try:
+            print("LISA.generate_masksが呼び出されました")
+            
+            # 実行時のデバイス情報を表示
+            device = next(self.parameters()).device
+            print(f"モデルデバイス: {device}")
+            
+            # SAMエンコーダがメモリにあるか確認
+            if not hasattr(self, "visual_model") or self.visual_model is None:
+                print("警告: SAM視覚モデルが初期化されていません。初期化を試みます。")
+                self._init_sam_model()
+            
+            # SAMエンコーダが正しいデバイスにあるか確認
+            sam_device = next(self.visual_model.parameters()).device if hasattr(self, "visual_model") else None
+            print(f"SAMモデルデバイス: {sam_device}")
+            
+            # 必要に応じてSAMモデルをGPUに移動（メモリ効率のため）
+            if sam_device != device and device.type == "cuda":
+                print(f"SAMモデルを{sam_device}から{device}に移動します")
+                try:
+                    # GPUに移動を試みる
+                    self.visual_model.to(device)
+                    print("SAMモデルを正常にGPUに移動しました")
+                except Exception as move_error:
+                    print(f"SAMモデルの移動中にエラー: {move_error}")
+                    print("CPUで処理を続行します")
+            
+            # パラメータの整理とデバイスの統一
+            kwargs = self._prepare_inputs_for_generation(input_ids, attention_mask=attention_mask, **kwargs)
+            
+            # generate関数を呼び出して応答を生成
+            outputs = super().generate(**kwargs)
+            
+            # セグメンテーションが必要かどうかを判断
+            if "<SEG>" not in self.tokenizer.decode(input_ids[0]) and "<SEG>" not in self.tokenizer.decode(outputs[0]):
+                print("セグメンテーショントークンがないため、通常の生成結果を返します")
+                return outputs
+            
+            # 画像が提供されたかどうかチェック
+            if image is None and "pixel_values" in kwargs:
+                # pixel_valuesから画像情報を使用
+                pixel_values = kwargs["pixel_values"]
+                print(f"pixel_values形状: {pixel_values.shape if pixel_values is not None else None}")
+            elif "images" in kwargs:
+                # imagesキーがある場合はそれを使用
+                print("imagesキーから画像を使用します")
+                from PIL import Image
+                import torch
+                
+                # PILイメージをテンソルに変換
+                if isinstance(kwargs["images"], Image.Image):
+                    # 画像の前処理
+                    from torchvision import transforms
+                    transform = transforms.Compose([
+                        transforms.ToTensor(),
+                        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                            std=[0.229, 0.224, 0.225])
+                    ])
+                    pixel_values = transform(kwargs["images"]).unsqueeze(0).to(device)
+                    print(f"PILイメージからpixel_values形状: {pixel_values.shape}")
+            elif image is not None:
+                # 直接画像パラメータが渡された場合
+                print("image引数から画像を使用します")
+                from PIL import Image
+                import torch
+                
+                # PILイメージをテンソルに変換
+                if isinstance(image, Image.Image):
+                    # 画像の前処理
+                    from torchvision import transforms
+                    transform = transforms.Compose([
+                        transforms.ToTensor(),
+                        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                            std=[0.229, 0.224, 0.225])
+                    ])
+                    pixel_values = transform(image).unsqueeze(0).to(device)
+                    print(f"image引数からpixel_values形状: {pixel_values.shape}")
+            
+            # 画像がないなら早期リターン
+            if pixel_values is None:
+                print("画像が提供されていないため、通常の生成結果を返します")
+                return outputs
+            
+            # 出力の中から<SEG>トークンのインデックスを検索
+            tokenizer = self.tokenizer
+            seg_token_id = tokenizer.convert_tokens_to_ids("<SEG>")
+            seg_token_indices = []
+            
+            for i, sequence in enumerate(outputs):
+                for j, token_id in enumerate(sequence):
+                    if token_id == seg_token_id:
+                        seg_token_indices.append(j)
+            
+            if not seg_token_indices:
+                print("<SEG>トークンが出力に見つかりませんでした。通常の生成結果を返します")
+                return outputs
+            
+            print(f"<SEG>トークンインデックス: {seg_token_indices}")
+            
+            # SAMモデルを使用した処理
+            with torch.no_grad():
+                # 画像エンコーディング
+                try:
+                    image_embeddings = self.visual_model.image_encoder(pixel_values)
+                    print(f"SAM画像エンベディング形状: {image_embeddings.shape}")
+                except Exception as encode_error:
+                    print(f"画像エンコード中にエラー: {encode_error}")
+                    import traceback
+                    traceback.print_exc()
+                    # エラーが発生した場合は元の出力を返す
+                    return outputs
+                
+                # SAMデコードで生成されたテキストを使用してマスクを生成
+                try:
+                    # 元の画像サイズを取得
+                    orig_size = kwargs.get("orig_size", None)
+                    if orig_size is None and isinstance(image, Image.Image):
+                        print("画像サイズを自動検出します")
+                        width, height = image.size
+                        orig_size = (height, width)
+                    
+                    if orig_size:
+                        print(f"元の画像サイズ: {orig_size}")
+                    
+                    # マスクデコーディング
+                    masks = self.get_masks(
+                        image_embeddings=image_embeddings,
+                        output_tokens=outputs,
+                        seg_token_indices=seg_token_indices,
+                        original_sizes=[orig_size] if orig_size else None,
+                    )
+                    
+                    # マスク情報を表示
+                    if masks is not None:
+                        print(f"生成されたマスク: {len(masks)}個")
+                    else:
+                        print("マスク生成に失敗しました")
+                        
+                    # 生成結果を返す（マスクは別途保存/処理される）
+                    return outputs
+                
+                except Exception as mask_error:
+                    print(f"マスク生成中にエラー: {mask_error}")
+                    import traceback
+                    traceback.print_exc()
+                    return outputs
+                
+        except Exception as e:
+            print(f"generate_masks関数内でエラーが発生: {e}")
+            import traceback
+            traceback.print_exc()
+            # エラーの場合は通常の生成結果を返す
+            return super().generate(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+
+    def load_state_dict(self, state_dict, strict=False):
+        """
+        モデルの状態辞書をロードするメソッド
+        
+        Args:
+            state_dict: ロードする状態辞書
+            strict: 厳密なロードを行うかどうか
+        """
+        # プロパティとしてbase_modelが定義されていない場合は、通常のロード処理を行う
+        if not hasattr(self, 'base_model'):
+            return super().load_state_dict(state_dict, strict=strict)
+        
+        # 既に基本モデルが存在する場合は、そのままの状態を維持
+        return self
+
+    @property 
+    def base_model(self):
+        """基本モデルのプロパティ"""
+        return self.model
+
+    @base_model.setter
+    def base_model(self, model):
+        """基本モデルの設定"""
+        self.model = model
+
+    def _init_sam_model(self, sam_checkpoint=None, model_type="vit_h"):
+        print("SAM視覚モデルを初期化中...")
+        if model_type == "vit_h":
+            # VIT_H（デフォルト）の場合はローカルチェックポイントを使用
+            try:
+                if sam_checkpoint is not None:
+                    print(f"SAMチェックポイントをロード中: {sam_checkpoint}")
+                    if os.path.exists(sam_checkpoint):
+                        checkpoint_dict = torch.load(sam_checkpoint)
+                        self.visual_model = build_sam_vit_h()
+                        self.visual_model.load_state_dict(checkpoint_dict, strict=False)
+                    else:
+                        print(f"警告: SAMチェックポイントが見つかりません: {sam_checkpoint}")
+                        print("デフォルトのSAMモデルを使用します")
+                        # チェックポイントがない場合、HuggingFaceからダウンロード
+                        from segment_anything import sam_model_registry
+                        self.visual_model = sam_model_registry["vit_h"](checkpoint="sam_vit_h_4b8939.pth")
+                else:
+                    # チェックポイントが指定されていない場合
+                    print("デフォルトのSAMモデルを使用します")
+                    # HuggingFaceからダウンロード
+                    from segment_anything import sam_model_registry
+                    self.visual_model = sam_model_registry["vit_h"](checkpoint="sam_vit_h_4b8939.pth")
+            except Exception as e:
+                print(f"SAMモデルのロード中にエラー: {e}")
+                traceback.print_exc()
+                print("代替方法を試行中...")
+                try:
+                    # より一般的な初期化方法
+                    from segment_anything import sam_model_registry
+                    self.visual_model = sam_model_registry["vit_h"](checkpoint="sam_vit_h_4b8939.pth")
+                except Exception as e2:
+                    print(f"代替方法でもエラー: {e2}")
+                    traceback.print_exc()
+                    # 最後の手段
+                    print("SAMモデルの初期化に失敗したため、推論は画像セグメンテーションなしで実行されます")
+                    self.visual_model = None
+        else:
+            # 代替モデルタイプ（例：vit_lなど）
+            from segment_anything import sam_model_registry
+            self.visual_model = sam_model_registry[model_type](checkpoint=f"sam_{model_type}.pth")
+        
+        # モデルを推論モードに設定
+        if self.visual_model is not None:
+            self.visual_model.eval()
+            print("SAM視覚モデルが正常に初期化されました")
+        
+        return self.visual_model
+    
+    def get_masks(
+        self,
+        image_embeddings: torch.FloatTensor,
+        output_tokens: torch.LongTensor,
+        seg_token_indices: List[int],
+        original_sizes: Optional[List[Tuple[int, int]]] = None
     ) -> List[torch.Tensor]:
         """
         セグメントトークンの埋め込みを使用してマスクを生成します。
         
         Args:
-            images: SAMエンコーダ用の入力画像
-            input_ids: 入力テキストトークンID
+            image_embeddings: SAMエンコーダの出力画像埋め込み
+            output_tokens: 生成されたテキストトークンID
             seg_token_indices: <SEG>トークンのインデックス
-            original_sizes: 元の画像サイズ（高さ、幅）
+            original_sizes: 元の画像サイズ（高さ、幅）のリスト
             
         Returns:
             生成されたマスクのリスト
         """
+        print(f"get_masks: 画像埋め込み形状={image_embeddings.shape}, トークン長={len(output_tokens[0])}")
+        
+        # SAMモデルが初期化されているか確認
         if not hasattr(self, 'visual_model') or self.visual_model is None:
-            raise ValueError("SAM visual model has not been initialized yet!")
-            
+            print("警告: SAMモデルが初期化されていません")
+            return []
+        
         # モデルのフォワードパスを実行して埋め込みを取得
         with torch.no_grad():
             # メモリ効率のためCPU→GPU転送を最適化
-            device = images.device
-            
-            # SAMモデルをGPUに移動
-            if hasattr(self.visual_model, 'to') and not self.visual_model.device == device:
-                # 必要な場合のみGPUに移動
-                try:
-                    self.visual_model = self.visual_model.to(device)
-                except Exception as e:
-                    print(f"SAMモデルのGPU移動中にエラー: {e}")
-                    # エラー発生時はCPUでの推論を継続
-                    device = torch.device('cpu')
-                    images = images.to(device)
-                    self.visual_model = self.visual_model.to(device)
-            
-            # 画像をSAMのViTでエンコード
-            img_embeds = self.visual_model.image_encoder(images)
+            device = image_embeddings.device
             
             # 生成出力の隠れ状態を取得
-            # 多くの場合、生成出力は既に渡されており、隠れ状態も含まれているため、改めてforward()を呼ぶ必要はない
             hidden_states = None
             
             # 入力IDからセグメントトークンの隠れ状態を抽出
@@ -733,19 +956,19 @@ class Llama32LISAForCausalLM(nn.Module):
             # 各<SEG>トークンのインデックスからそれに対応する隠れ状態を取得
             for seg_token_idx in seg_token_indices:
                 # 安全対策：インデックスが存在するか確認
-                if not 0 <= seg_token_idx < input_ids.shape[1]:
+                if not 0 <= seg_token_idx < output_tokens.shape[1]:
                     print(f"警告: セグメントトークンのインデックス {seg_token_idx} が範囲外です")
                     continue
-                    
+                
                 # 隠れ状態が未取得の場合、取得を試みる
                 if hidden_states is None:
-                    # 入力IDを使用して推論実行（隠れ状態を取得するため）
-                    outputs = self.model(
-                input_ids=input_ids,
-                output_hidden_states=True,
+                    # 出力IDを使用して推論実行（隠れ状態を取得するため）
+                    model_outputs = self.model(
+                        input_ids=output_tokens,
+                        output_hidden_states=True,
                         return_dict=True
                     )
-                    hidden_states = outputs.hidden_states
+                    hidden_states = model_outputs.hidden_states
                 
                 # 最後のレイヤーの隠れ状態を取得
                 if isinstance(hidden_states, tuple):
@@ -793,74 +1016,74 @@ class Llama32LISAForCausalLM(nn.Module):
             
             # セグメント埋め込みが取得できない場合はエラー
             if len(sparse_embeddings) == 0:
-                raise ValueError("セグメント埋め込みを取得できませんでした。プロンプト処理中にエラーが発生したか、有効なセグメントトークンがありません。")
+                print("警告: セグメント埋め込みを取得できませんでした")
+                return []
             
             # SAMデコーダを使用してマスクを生成
             masks = []
-            for sparse_emb, dense_emb, original_size in zip(
-                sparse_embeddings, dense_embeddings, original_sizes
-            ):
-                # 各SAMプロンプトに対してマスクを生成
-                mask = self.visual_model.mask_decoder(
-                    image_embeddings=img_embeds,
-                    image_pe=self.visual_model.prompt_encoder.get_dense_pe(),
-                    sparse_prompt_embeddings=sparse_emb,
-                    dense_prompt_embeddings=dense_emb,
-                    multimask_output=False,
-                )["low_res_logits"]
-                
-                # マスクをシグモイド関数で確率に変換
-                mask = torch.sigmoid(mask)
-                
-                # 必要に応じてしきい値処理
-                binary_mask = (mask > 0.5).float()
-                
-                # マスクを元の解像度にリサイズ
-                # 元の画像サイズがある場合はリサイズする
-                if original_size and original_size != binary_mask.shape[-2:]:
-                    try:
-                        binary_mask = F.interpolate(
-                            binary_mask, size=original_size, mode="bilinear", align_corners=False
-                        )
-                    except Exception as resize_error:
-                        print(f"マスクのリサイズ中にエラー: {resize_error}")
-                        # エラー時は元のサイズを維持
-                
-                masks.append(binary_mask.squeeze())
-                
+            
+            # original_sizesがない場合、デフォルトサイズを使用
+            if original_sizes is None or len(original_sizes) == 0:
+                # 入力画像のサイズを取得（SAMデコーダのデフォルトサイズ）
+                # 一般的なSAMデフォルトサイズは1024x1024
+                default_size = (1024, 1024)
+                original_sizes = [default_size for _ in range(len(sparse_embeddings))]
+                print(f"元の画像サイズが指定されていないため、デフォルトサイズを使用: {default_size}")
+            
+            # 各セグメントプロンプトに対してマスクを生成
+            for i, (sparse_emb, dense_emb) in enumerate(zip(sparse_embeddings, dense_embeddings)):
+                try:
+                    # インデックスが範囲外の場合はスキップ
+                    if i >= len(original_sizes):
+                        original_size = original_sizes[-1]  # 最後のサイズを使用
+                    else:
+                        original_size = original_sizes[i]
+                    
+                    # SAM Mask Decoderを実行
+                    mask_output = self.visual_model.mask_decoder(
+                        image_embeddings=image_embeddings,
+                        image_pe=self.visual_model.prompt_encoder.get_dense_pe(),
+                        sparse_prompt_embeddings=sparse_emb,
+                        dense_prompt_embeddings=dense_emb,
+                        multimask_output=False,
+                    )
+                    
+                    # マスクを取得
+                    mask = mask_output["low_res_logits"]
+                    
+                    # マスクをシグモイド関数で確率に変換
+                    mask = torch.sigmoid(mask)
+                    
+                    # 必要に応じてしきい値処理
+                    binary_mask = (mask > 0.5).float()
+                    
+                    # マスクを元の解像度にリサイズ
+                    # 元の画像サイズがある場合はリサイズする
+                    if original_size and original_size != binary_mask.shape[-2:]:
+                        try:
+                            import torch.nn.functional as F
+                            binary_mask = F.interpolate(
+                                binary_mask, size=original_size, mode="bilinear", align_corners=False
+                            )
+                        except Exception as resize_error:
+                            print(f"マスクのリサイズ中にエラー: {resize_error}")
+                            # エラー時は元のサイズを維持
+                    
+                    masks.append(binary_mask.squeeze())
+                    
+                except Exception as mask_error:
+                    print(f"マスク{i}の生成中にエラー: {mask_error}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # 各マスクの形状を表示
+            for i, mask in enumerate(masks):
+                print(f"マスク {i} の形状: {mask.shape}")
+            
             # メモリの解放（大規模なテンソル）
-            del img_embeds, hidden_states
+            del hidden_states
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             
-            # SAMモデルをCPUに戻してGPUメモリを解放
-            if device.type == 'cuda' and hasattr(self.visual_model, 'to'):
-                self.visual_model = self.visual_model.cpu()
-                torch.cuda.empty_cache()
-                
+            # マスクの保存や視覚化はchat.pyで行われる
             return masks
-
-    def load_state_dict(self, state_dict, strict=False):
-        """
-        モデルの状態辞書をロードするメソッド
-        
-        Args:
-            state_dict: ロードする状態辞書
-            strict: 厳密なロードを行うかどうか
-        """
-        # プロパティとしてbase_modelが定義されていない場合は、通常のロード処理を行う
-        if not hasattr(self, 'base_model'):
-            return super().load_state_dict(state_dict, strict=strict)
-        
-        # 既に基本モデルが存在する場合は、そのままの状態を維持
-        return self
-
-    @property 
-    def base_model(self):
-        """基本モデルのプロパティ"""
-        return self.model
-
-    @base_model.setter
-    def base_model(self, model):
-        """基本モデルの設定"""
-        self.model = model
