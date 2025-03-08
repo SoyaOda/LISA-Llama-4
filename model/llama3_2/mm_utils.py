@@ -372,3 +372,94 @@ def run_test_mllama_processor(processor, model_name="Llama-3.2-Vision"):
         traceback.print_exc()
         print(f"\n===== {model_name} プロセッサのテスト完了: 失敗 =====")
         return False 
+
+def process_mllama_pixel_values(pixel_values, target_format="sam", verbose=True):
+    """
+    Mllamaプロセッサのpixel_values出力を別の形式に変換します
+    Args:
+        pixel_values: MllamaProcessorから出力されたpixel_values
+        target_format: 'sam'など、目的の形式
+        verbose: デバッグ情報を表示するかどうか
+    Returns:
+        変換されたpixel_values
+    """
+    if pixel_values is None:
+        return None
+    
+    original_shape = pixel_values.shape
+    if verbose:
+        print(f"元のpixel_values形状: {original_shape}, 型: {pixel_values.dtype}")
+    
+    # Mllamaプロセッサの出力形状を処理
+    if target_format == "sam":
+        # SAMは[バッチ, チャンネル, 高さ, 幅]形式を期待
+        if len(original_shape) == 4:
+            # すでに正しい形状
+            return pixel_values
+        elif len(original_shape) == 6 and original_shape[0] == 1 and original_shape[1] == 1:
+            # 形状[1, 1, 4, 3, 560, 560]など - MLlamaProcessorからの出力
+            # 最初の有用な画像データを使用（最初の画像）
+            if verbose:
+                print("複雑な形状を[バッチ, チャンネル, 高さ, 幅]形式に変換します")
+            
+            # [0, 0, 0]で最初の画像を取得し、バッチ次元を追加
+            converted = pixel_values[0, 0, 0].unsqueeze(0)
+            
+            if verbose:
+                print(f"変換後の形状: {converted.shape}")
+            
+            return converted
+        else:
+            # その他の形状
+            if verbose:
+                print(f"未知の形状: {original_shape} - 変換方法が不明です")
+            return pixel_values
+    else:
+        # その他の形式
+        if verbose:
+            print(f"サポートされていない変換先形式: {target_format}")
+        return pixel_values
+
+
+def is_valid_sam_input(tensor):
+    """
+    テンソルがSAM用の入力として有効かどうかをチェックします
+    Args:
+        tensor: 確認するテンソル
+    Returns:
+        bool: 有効な場合はTrue
+    """
+    if tensor is None:
+        return False
+    
+    # 4次元テンソル([バッチ, チャンネル, 高さ, 幅])であることを確認
+    if len(tensor.shape) != 4:
+        return False
+    
+    # チャンネル数が3であることを確認（RGB）
+    if tensor.shape[1] != 3:
+        return False
+    
+    return True
+
+
+def safe_mllama_to_sam(pixel_values):
+    """
+    MllamaのPIXEL_VALUESをSAM用に安全に変換する便利関数
+    Args:
+        pixel_values: MllamaProcessorからのpixel_values
+    Returns:
+        SAM用に適切に変換されたテンソル
+    """
+    # すでに適切な形状ならそのまま返す
+    if is_valid_sam_input(pixel_values):
+        return pixel_values
+    
+    # 変換を試みる
+    converted = process_mllama_pixel_values(pixel_values, target_format="sam")
+    
+    # 変換後も無効なら例外
+    if not is_valid_sam_input(converted):
+        raise ValueError(f"有効なSAM入力に変換できません。形状: {converted.shape}")
+    
+    return converted 

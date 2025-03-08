@@ -17,7 +17,7 @@ from model.llama3_2.constants import IMAGE_TOKEN, SEG_TOKEN
 from model.segment_anything.utils.transforms import ResizeLongestSide
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX)
-from model.llama3_2.mm_utils import create_mllama_message, process_images
+from model.llama3_2.mm_utils import create_mllama_message, process_images, safe_mllama_to_sam
 
 # Hugging Face認証を行う関数
 def authenticate_huggingface():
@@ -338,18 +338,62 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                                 print(f"入力テキスト: {processed_input}")
                                 
                                 # 明示的な引数順序でプロセッサを呼び出す
+                                print("Mllamaプロセッサでtokenizer呼び出し前...")
+                                print(f"画像タイプ: {type(image)}, テキスト: {processed_input[:50]}...")
+                                
+                                # Mllama tokenizer/processorを確認
+                                if hasattr(tokenizer, 'processor'):
+                                    print(f"processorタイプ: {type(tokenizer.processor)}")
+                                
                                 inputs = tokenizer(
                                     images=image,  # 画像を第1引数またはキーワード引数で
                                     text=processed_input,  # テキストを第2引数またはキーワード引数で
                                     return_tensors="pt"
                                 )
+                                
+                                # テンソル形状のデバッグ
+                                for k, v in inputs.items():
+                                    if isinstance(v, torch.Tensor):
+                                        print(f"inputs['{k}']の形状: {v.shape}, dtype: {v.dtype}")
+                                
+                                # pixel_valuesの特別処理
+                                if 'pixel_values' in inputs:
+                                    pixel_values = inputs['pixel_values']
+                                    print(f"pixel_values形状: {pixel_values.shape}, dtype: {pixel_values.dtype}")
+                                    
+                                    # 形状が複雑すぎる場合、調整を検討
+                                    if len(pixel_values.shape) > 4:
+                                        print(f"警告: pixel_valuesの形状が複雑すぎます: {pixel_values.shape}")
+                                        print("SAMはシンプルな[バッチ, チャンネル, 高さ, 幅]形式を期待します")
+                                        
+                                        # バックアップとして画像を直接PIL→テンソルに変換
+                                        if is_segment_request:
+                                            print("セグメンテーション用に画像を直接変換します...")
+                                            # SAM用の専用画像処理を実行
+                                            from model.segment_anything.utils.transforms import ResizeLongestSide
+                                            transform = ResizeLongestSide(1024)
+                                            
+                                            # PIL画像からNumPy配列を取得
+                                            import numpy as np
+                                            image_np = np.array(image)
+                                            
+                                            # SAMの変換を適用
+                                            image_transformed = transform.apply_image(image_np)
+                                            print(f"変換後の画像形状: {image_transformed.shape}")
+                                    
                             except Exception as e1:
                                 print(f"標準の処理中にエラー: {e1}")
                                 try:
                                     # フォーマットされたメッセージを作成
                                     print("代替方法: フォーマットされたメッセージを使用")
                                     message = create_mllama_message(image, user_input, verbose=True)
+                                    print(f"作成されたメッセージ: {message.keys()}")
                                     inputs = tokenizer(**message, return_tensors="pt")
+                                    
+                                    # テンソル形状のデバッグ
+                                    for k, v in inputs.items():
+                                        if isinstance(v, torch.Tensor):
+                                            print(f"代替inputs['{k}']の形状: {v.shape}, dtype: {v.dtype}")
                                 except Exception as e2:
                                     print(f"代替処理中にエラー: {e2}")
                                     raise ValueError("画像処理に失敗しました")
@@ -449,15 +493,46 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                                 import numpy as np
                                 image_np = np.array(image)
                                 
-                                # マスク生成はOK
-                                print("generate_masksを呼び出します...")
-                                generation = model.generate_masks(
-                                    image=image,  # PIL Image - SAM内部で適切に処理されるように修正
-                                    input_ids=input_ids,
-                                    attention_mask=inputs.get("attention_mask", torch.ones_like(input_ids)),
-                                    max_new_tokens=max_new_tokens,
-                                    **mask_inputs
-                                )
+                                # 入力テンソルに特別な処理が必要か確認
+                                if 'pixel_values' in inputs and len(inputs['pixel_values'].shape) > 4:
+                                    print("複雑な形状のpixel_valuesを検出しました。適切な形状に変換します...")
+                                    pixel_values = inputs['pixel_values']
+                                    
+                                    try:
+                                        # ユーティリティ関数を使用してSAM用に安全に変換
+                                        pixel_values = safe_mllama_to_sam(pixel_values)
+                                        print(f"SAM用に変換成功: 形状={pixel_values.shape}")
+                                        
+                                        # generate_masksにpixel_valuesとして明示的に渡す
+                                        generation = model.generate_masks(
+                                            image=None,  # PILを渡さない
+                                            input_ids=input_ids,
+                                            attention_mask=inputs.get("attention_mask", torch.ones_like(input_ids)),
+                                            pixel_values=pixel_values,  # 変換済みのテンソルを渡す
+                                            max_new_tokens=max_new_tokens,
+                                            **mask_inputs
+                                        )
+                                    except Exception as conversion_error:
+                                        print(f"テンソル変換中にエラー: {conversion_error}")
+                                        print("代わりにPIL画像を使用します...")
+                                        # 通常の処理 - PILイメージを使用
+                                        generation = model.generate_masks(
+                                            image=image,  # PIL Image
+                                            input_ids=input_ids,
+                                            attention_mask=inputs.get("attention_mask", torch.ones_like(input_ids)),
+                                            max_new_tokens=max_new_tokens,
+                                            **mask_inputs
+                                        )
+                                else:
+                                    # 通常の処理
+                                    print("マスク生成を呼び出します...")
+                                    generation = model.generate_masks(
+                                        image=image,  # PIL Image - SAM内部で適切に処理されるように修正
+                                        input_ids=input_ids,
+                                        attention_mask=inputs.get("attention_mask", torch.ones_like(input_ids)),
+                                        max_new_tokens=max_new_tokens,
+                                        **mask_inputs
+                                    )
                             except Exception as e:
                                 print(f"セグメンテーション処理中にエラー: {e}")
                                 print("通常のテキスト生成にフォールバックします...")

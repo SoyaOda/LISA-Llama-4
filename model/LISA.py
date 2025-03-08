@@ -695,6 +695,23 @@ class Llama32LISAForCausalLM(nn.Module):
             device = next(self.parameters()).device
             print(f"モデルデバイス: {device}")
             
+            # 入力パラメータのデバッグ情報を表示
+            if "inputs" in kwargs:
+                print("inputs引数が存在します")
+                for k, v in kwargs["inputs"].items():
+                    if isinstance(v, torch.Tensor):
+                        print(f"inputs[{k}]の形状: {v.shape}, 型: {v.dtype}, デバイス: {v.device}")
+            
+            if pixel_values is not None:
+                print(f"pixel_values形状: {pixel_values.shape}, 型: {pixel_values.dtype}, デバイス: {pixel_values.device}")
+            
+            # 他のパラメータを確認
+            for k, v in kwargs.items():
+                if isinstance(v, torch.Tensor):
+                    print(f"kwargs[{k}]の形状: {v.shape}, 型: {v.dtype}")
+                elif k == "pixel_values" and v is not None:
+                    print(f"別のpixel_values形状: {v.shape}, 型: {v.dtype}")
+            
             # SAMエンコーダがメモリにあるか確認
             if not hasattr(self, "visual_model") or self.visual_model is None:
                 print("警告: SAM視覚モデルが初期化されていません。初期化を試みます。")
@@ -714,9 +731,10 @@ class Llama32LISAForCausalLM(nn.Module):
                 except Exception as move_error:
                     print(f"SAMモデルの移動中にエラー: {move_error}")
                     print("CPUで処理を続行します")
-            
+                    
             # オリジナルのLISAコードに基づいて実装
             # 基本的な生成を実行（SEGトークンの位置を取得するため）
+            print("テキスト生成処理を開始...")
             outputs = self.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -725,6 +743,7 @@ class Llama32LISAForCausalLM(nn.Module):
                 output_hidden_states=True,
                 return_dict_in_generate=True,
             )
+            print("テキスト生成完了")
             
             output_hidden_states = outputs.hidden_states[-1]
             output_ids = outputs.sequences
@@ -747,19 +766,32 @@ class Llama32LISAForCausalLM(nn.Module):
                 indices = torch.where(seg_token_mask[i])[0].tolist()
                 seg_token_indices.append(indices)
             
+            print(f"見つかったセグメンテーショントークンインデックス: {seg_token_indices}")
+            
             # オリジナルサイズの画像情報を取得または推定
             original_size = image.size[::-1] if hasattr(image, "size") else (1024, 1024)
+            print(f"使用する画像サイズ: {original_size}")
             
             # 画像埋め込みとセグメンテーションマスクの取得
+            print("画像埋め込みを取得中...")
             image_embeddings = self.get_image_embeddings(image=image, pixel_values=pixel_values)
+            print(f"画像埋め込みの形状: {image_embeddings.shape}")
             
             # マスクの生成
+            print("マスクを生成中...")
             pred_masks = self.get_masks(
                 image_embeddings=image_embeddings,
                 output_tokens=output_ids,
                 seg_token_indices=seg_token_indices[0] if seg_token_indices else [],
                 original_sizes=[original_size]
             )
+            
+            if pred_masks:
+                print(f"生成されたマスクの数: {len(pred_masks)}")
+                for i, mask in enumerate(pred_masks):
+                    print(f"マスク{i+1}の形状: {mask.shape}")
+            else:
+                print("マスクは生成されませんでした")
             
             # 生成結果を返す
             return output_ids
@@ -1036,6 +1068,36 @@ class Llama32LISAForCausalLM(nn.Module):
         # pixel_valuesが指定されている場合はそれを使用
         if pixel_values is not None:
             print(f"既存のpixel_valuesを使用します。形状: {pixel_values.shape}")
+            print(f"テンソル型: {pixel_values.dtype}, デバイス: {pixel_values.device}")
+            
+            # pixel_valuesの形状をチェック
+            if len(pixel_values.shape) > 4:
+                print(f"警告: pixel_valuesの形状が予期せぬ次元を持っています: {pixel_values.shape}")
+                print("SAMは[バッチサイズ, チャンネル, 高さ, 幅]の形状を期待します")
+                print("形状を調整します...")
+                
+                # MllamaProcessorから来た複雑な形状のテンソルを変換
+                try:
+                    from model.llama3_2.mm_utils import safe_mllama_to_sam
+                    adjusted_pixel_values = safe_mllama_to_sam(pixel_values)
+                    print(f"調整後のpixel_values形状: {adjusted_pixel_values.shape}")
+                    
+                    # 調整されたテンソルでSAMのイメージエンコーダーを呼び出す
+                    return self.visual_model.image_encoder(adjusted_pixel_values)
+                except ImportError:
+                    print("変換ユーティリティが見つかりません。手動で変換します...")
+                    
+                    # 形状が[1, 1, 4, 3, 560, 560]の場合の処理
+                    # これはMLlamaProcessorからの出力と思われる
+                    if len(pixel_values.shape) == 6 and pixel_values.shape[0] == 1 and pixel_values.shape[1] == 1:
+                        # 画像固有の処理: 最初の画像のみを使用
+                        # 余分な次元を削除し、適切な形状に変換
+                        adjusted_pixel_values = pixel_values[0, 0, 0]  # [3, 560, 560]の形状を取得
+                        adjusted_pixel_values = adjusted_pixel_values.unsqueeze(0)  # バッチ次元を追加
+                        print(f"調整後のpixel_values形状: {adjusted_pixel_values.shape}")
+                        return self.visual_model.image_encoder(adjusted_pixel_values)
+            
+            # 通常の場合は変更なし
             return self.visual_model.image_encoder(pixel_values)
         
         # imageが指定されている場合は変換して使用
@@ -1079,6 +1141,7 @@ class Llama32LISAForCausalLM(nn.Module):
                 
                 image_tensor = preprocess(image_tensor).unsqueeze(0).to(device)
                 print(f"前処理後のテンソル形状: {image_tensor.shape}")
+                print(f"テンソル型: {image_tensor.dtype}, デバイス: {image_tensor.device}")
                 
                 # 必要に応じて精度を変換
                 if hasattr(self, 'torch_dtype') and self.torch_dtype == torch.float16:
@@ -1087,7 +1150,10 @@ class Llama32LISAForCausalLM(nn.Module):
                     image_tensor = image_tensor.bfloat16()
                 
                 # SAMイメージエンコーダーを実行
-                return self.visual_model.image_encoder(image_tensor)
+                print("SAMイメージエンコーダーを呼び出します...")
+                embeddings = self.visual_model.image_encoder(image_tensor)
+                print(f"生成された埋め込み形状: {embeddings.shape}")
+                return embeddings
                 
             except Exception as e:
                 print(f"画像エンコード処理中にエラーが発生しました: {e}")
