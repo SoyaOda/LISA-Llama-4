@@ -503,14 +503,24 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                                         pixel_values = safe_mllama_to_sam(pixel_values)
                                         print(f"SAM用に変換成功: 形状={pixel_values.shape}")
                                         
+                                        # デバイスをモデルに合わせる
+                                        device_to_use = next(model.parameters()).device
+                                        print(f"モデルデバイス: {device_to_use}")
+                                        pixel_values = pixel_values.to(device_to_use)
+                                        print(f"テンソルをデバイス{device_to_use}に移動しました")
+                                        
                                         # generate_masksにpixel_valuesとして明示的に渡す
+                                        # mask_inputsからpixel_valuesを削除して重複を防ぐ
+                                        clean_mask_inputs = {k: v for k, v in mask_inputs.items() 
+                                                           if k != 'pixel_values'}
+                                        
                                         generation = model.generate_masks(
                                             image=None,  # PILを渡さない
                                             input_ids=input_ids,
                                             attention_mask=inputs.get("attention_mask", torch.ones_like(input_ids)),
                                             pixel_values=pixel_values,  # 変換済みのテンソルを渡す
                                             max_new_tokens=max_new_tokens,
-                                            **mask_inputs
+                                            **clean_mask_inputs
                                         )
                                     except Exception as conversion_error:
                                         print(f"テンソル変換中にエラー: {conversion_error}")

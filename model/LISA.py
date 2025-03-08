@@ -698,19 +698,33 @@ class Llama32LISAForCausalLM(nn.Module):
             # 入力パラメータのデバッグ情報を表示
             if "inputs" in kwargs:
                 print("inputs引数が存在します")
+                # 重複を防ぐためにpixel_valuesが含まれる場合は削除
+                if "pixel_values" in kwargs["inputs"] and pixel_values is not None:
+                    print("重複するpixel_valuesを検出しました。kwargs['inputs']から削除します。")
+                    kwargs["inputs"].pop("pixel_values")
+                
                 for k, v in kwargs["inputs"].items():
                     if isinstance(v, torch.Tensor):
                         print(f"inputs[{k}]の形状: {v.shape}, 型: {v.dtype}, デバイス: {v.device}")
             
             if pixel_values is not None:
                 print(f"pixel_values形状: {pixel_values.shape}, 型: {pixel_values.dtype}, デバイス: {pixel_values.device}")
+                
+                # デバイスの不一致を修正
+                if pixel_values.device != device:
+                    print(f"デバイスの不一致を検出: pixel_values({pixel_values.device}) vs モデル({device})")
+                    pixel_values = pixel_values.to(device)
+                    print(f"pixel_valuesをデバイス{device}に移動しました")
             
             # 他のパラメータを確認
             for k, v in kwargs.items():
                 if isinstance(v, torch.Tensor):
                     print(f"kwargs[{k}]の形状: {v.shape}, 型: {v.dtype}")
-                elif k == "pixel_values" and v is not None:
-                    print(f"別のpixel_values形状: {v.shape}, 型: {v.dtype}")
+                elif k == "pixel_values" and v is not None and pixel_values is not None:
+                    print(f"重複するpixel_values検出: kwargs内にも存在します。削除します。")
+                    # 重複するpixel_valuesを削除
+                    kwargs.pop("pixel_values")
+                    break
             
             # SAMエンコーダがメモリにあるか確認
             if not hasattr(self, "visual_model") or self.visual_model is None:
@@ -1064,11 +1078,18 @@ class Llama32LISAForCausalLM(nn.Module):
             画像埋め込みテンソル
         """
         device = next(self.parameters()).device
+        print(f"get_image_embeddings: モデルデバイス = {device}")
         
         # pixel_valuesが指定されている場合はそれを使用
         if pixel_values is not None:
             print(f"既存のpixel_valuesを使用します。形状: {pixel_values.shape}")
             print(f"テンソル型: {pixel_values.dtype}, デバイス: {pixel_values.device}")
+            
+            # デバイスの不一致がある場合は修正
+            if pixel_values.device != device:
+                print(f"デバイスの不一致を検出: pixel_values({pixel_values.device}) vs モデル({device})")
+                pixel_values = pixel_values.to(device)
+                print(f"pixel_valuesをデバイス{device}に移動しました")
             
             # pixel_valuesの形状をチェック
             if len(pixel_values.shape) > 4:
@@ -1082,7 +1103,20 @@ class Llama32LISAForCausalLM(nn.Module):
                     adjusted_pixel_values = safe_mllama_to_sam(pixel_values)
                     print(f"調整後のpixel_values形状: {adjusted_pixel_values.shape}")
                     
+                    # デバイスの不一致がある場合は修正
+                    if adjusted_pixel_values.device != device:
+                        print(f"変換後のテンソルをデバイス{device}に移動します")
+                        adjusted_pixel_values = adjusted_pixel_values.to(device)
+                    
                     # 調整されたテンソルでSAMのイメージエンコーダーを呼び出す
+                    sam_encoder_device = next(self.visual_model.parameters()).device
+                    print(f"SAMエンコーダデバイス: {sam_encoder_device}")
+                    
+                    # SAMエンコーダとテンソルのデバイスを揃える
+                    if sam_encoder_device != adjusted_pixel_values.device:
+                        print(f"SAMエンコーダーをデバイス{adjusted_pixel_values.device}に移動します")
+                        self.visual_model = self.visual_model.to(adjusted_pixel_values.device)
+                    
                     return self.visual_model.image_encoder(adjusted_pixel_values)
                 except ImportError:
                     print("変換ユーティリティが見つかりません。手動で変換します...")
@@ -1095,7 +1129,23 @@ class Llama32LISAForCausalLM(nn.Module):
                         adjusted_pixel_values = pixel_values[0, 0, 0]  # [3, 560, 560]の形状を取得
                         adjusted_pixel_values = adjusted_pixel_values.unsqueeze(0)  # バッチ次元を追加
                         print(f"調整後のpixel_values形状: {adjusted_pixel_values.shape}")
+                        
+                        # デバイスを揃える
+                        if adjusted_pixel_values.device != device:
+                            adjusted_pixel_values = adjusted_pixel_values.to(device)
+                        
+                        # SAMエンコーダとテンソルのデバイスを揃える
+                        sam_encoder_device = next(self.visual_model.parameters()).device
+                        if sam_encoder_device != adjusted_pixel_values.device:
+                            self.visual_model = self.visual_model.to(adjusted_pixel_values.device)
+                        
                         return self.visual_model.image_encoder(adjusted_pixel_values)
+            
+            # SAMエンコーダとテンソルのデバイスを揃える
+            sam_encoder_device = next(self.visual_model.parameters()).device
+            if sam_encoder_device != pixel_values.device:
+                print(f"SAMエンコーダーをデバイス{pixel_values.device}に移動します")
+                self.visual_model = self.visual_model.to(pixel_values.device)
             
             # 通常の場合は変更なし
             return self.visual_model.image_encoder(pixel_values)
