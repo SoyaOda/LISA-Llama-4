@@ -358,7 +358,7 @@ class Llama32SAMForCausalLM(PreTrainedModel):
             # 画像入力の準備
             if isinstance(images_clip, dict):
                 # 既にプロセッサで処理済みの場合
-                inputs = {k: v.to(device) for k, v in images_clip.items()}
+                inputs = images_clip  # そのまま使用
             else:
                 # プロセッサで画像を処理
                 inputs = self.processor(
@@ -367,8 +367,9 @@ class Llama32SAMForCausalLM(PreTrainedModel):
                     return_tensors="pt"
                 ).to(device)
             
-            # 入力IDsを追加
-            inputs["input_ids"] = input_ids
+            # input_idsが提供されていて、かつinputsに含まれていない場合のみ追加
+            if "input_ids" not in inputs or (inputs["input_ids"] is not input_ids):
+                inputs["input_ids"] = input_ids
             
             # 出力を生成
             outputs = self.llama_model.generate(

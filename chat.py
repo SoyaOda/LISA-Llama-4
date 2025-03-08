@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, BitsAndBytesConfig, AutoProcessor
+from PIL import Image
 
 from model.llama3_2 import Llama32SAMForCausalLM, Llama32SAMConfig
 from model.llama3_2.hf_auth import login_huggingface
@@ -211,40 +212,38 @@ def process_image_and_prompt(model, tokenizer, prompt, image_path, args, transfo
         sam_tensor = sam_tensor.float()
 
     # Llama3.2 Vision用の処理
-    # 画像をプロセッサで処理
-    image_inputs = model.processor(
-        images=image_np, 
+    # 画像とテキストを一緒にプロセッサで処理
+    pil_image = Image.fromarray(image_np)
+    
+    # プロンプトをLlama3.2の形式に変換
+    messages = [
+        {"role": "user", "content": [
+            {"type": "image"},
+            {"type": "text", "text": prompt}
+        ]}
+    ]
+    
+    # プロセッサで画像とテキストを同時に処理
+    inputs = model.processor(
+        images=pil_image,
+        text=tokenizer.apply_chat_template(messages, add_generation_prompt=True),
         return_tensors="pt"
     ).to("cuda")
     
     # 精度変換
     if args.precision == "bf16":
-        image_inputs = {k: v.bfloat16() if isinstance(v, torch.Tensor) else v for k, v in image_inputs.items()}
+        inputs = {k: v.bfloat16() if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
     elif args.precision == "fp16":
-        image_inputs = {k: v.half() if isinstance(v, torch.Tensor) else v for k, v in image_inputs.items()}
-
-    # プロンプトをトークン化
-    input_text = f"{BEGIN_OF_TEXT_TOKEN}{IMAGE_TOKEN}{prompt}"
-    text_inputs = model.processor(
-        text=input_text,
-        return_tensors="pt"
-    ).to("cuda")
-    
-    # 入力を結合
-    combined_inputs = {
-        **image_inputs,
-        "input_ids": text_inputs["input_ids"],
-        "attention_mask": text_inputs["attention_mask"] if "attention_mask" in text_inputs else None
-    }
+        inputs = {k: v.half() if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
     
     # 推論
     print("Generating response...")
     output_ids, pred_masks = model.evaluate(
-        image_inputs,
-        sam_tensor,
-        combined_inputs["input_ids"],
-        [resize_size],
-        original_size_list,
+        inputs,  # モデルの入力
+        sam_tensor,  # SAM用の画像
+        inputs["input_ids"],  # 入力ID
+        [resize_size],  # リサイズサイズ
+        original_size_list,  # 元のサイズ
         max_new_tokens=512,
         tokenizer=tokenizer,
     )
