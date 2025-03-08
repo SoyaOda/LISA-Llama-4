@@ -7,8 +7,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, BitsAndBytesConfig, AutoProcessor
-from huggingface_hub import login
+from transformers import AutoTokenizer, BitsAndBytesConfig, AutoProcessor, AutoModelForVision2Seq
 
 from model.LISA import Llama32LISAForCausalLM
 from model.llama3_2 import conversation as llama3_2_conversation
@@ -72,6 +71,18 @@ def parse_args(args):
         type=str,
         choices=["llama32_lisa"],
         help="Model type: Llama3.2 Vision + SAM",
+    )
+    parser.add_argument(
+        "--out_dim",
+        default=256,
+        type=int,
+        help="Output dimension for mask embedding",
+    )
+    parser.add_argument(
+        "--train_mask_decoder",
+        action="store_true",
+        default=False,
+        help="Whether to train SAM's mask decoder",
     )
     return parser.parse_args(args)
 
@@ -147,20 +158,31 @@ def main(args):
     # SEGトークンのインデックスを取得
     seg_token_idx = tokenizer.convert_tokens_to_ids(SEG_TOKEN)
     
-    # モデルをロード
-    model = Llama32LISAForCausalLM.from_pretrained(
+    # モデルをロード - 標準的なTransformerパラメータのみを使用
+    print("Step 1: Loading base vision-language model...")
+    base_model = AutoModelForVision2Seq.from_pretrained(
         args.version,
-        vision_pretrained=sam_checkpoint,
-        train_mask_decoder=False,   # 推論モード（SAMマスクデコーダを訓練しない）
-        out_dim=256,                # マスク埋め込み次元（訓練設定と一致する必要あり）
         torch_dtype=dtype,
         device_map="auto" if torch.cuda.is_available() else None,
         quantization_config=quantization_config,
-        seg_token_idx=seg_token_idx,
     )
     
     # トークナイザの語彙サイズをリサイズ（新しい特殊トークンを追加した場合）
-    model.resize_token_embeddings(len(tokenizer))
+    base_model.resize_token_embeddings(len(tokenizer))
+    
+    # Step 2: LISAモデルをカスタマイズ
+    print("Step 2: Customizing with SAM integration...")
+    model = Llama32LISAForCausalLM(
+        base_model.config,
+        vision_pretrained=sam_checkpoint,
+        train_mask_decoder=args.train_mask_decoder,
+        out_dim=args.out_dim,
+        seg_token_idx=seg_token_idx,
+    )
+    
+    # ベースモデルの状態を転送
+    print("Step 3: Transferring model weights...")
+    model.load_state_dict(base_model.state_dict(), strict=False)
     
     # 会話テンプレート
     conv = llama3_2_conversation.conv_templates["llama3_2"].copy()
