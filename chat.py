@@ -481,6 +481,20 @@ def main(args):
         args.load_in_8bit = False
         args.very_low_memory = True
     
+    # メモリ設定の最適化
+    if torch.cuda.is_available():
+        # GPUメモリの断片化を防ぐための設定
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+        
+        # 低メモリモードではCPU↔GPU間でのOffloadを積極的に行う
+        if args.very_low_memory:
+            print("超低メモリモードを有効化します")
+            # 一度に保持する最大のバッチサイズを小さく設定
+            torch.cuda.set_per_process_memory_fraction(0.8)  # GPUメモリの80%まで使用
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+    
     # トークナイザーをロード
     tokenizer = AutoProcessor.from_pretrained(args.version)
     
@@ -489,68 +503,60 @@ def main(args):
         print("Adding <SEG> token to tokenizer vocabulary")
         tokenizer.tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
     
-    # デバイスマップを設定 - メモリ使用量を削減するための特別設定
-    device_map = None
-    
-    # 超低メモリモードの場合、一部のレイヤーをCPUにオフロード
-    if args.very_low_memory:
-        print("超低メモリモードを有効化します - 一部のレイヤーをCPUにオフロード")
-        device_map = {
-            "model.embed_tokens": 0,
-            "model.norm": 0,
-            "model.layers.0": 0, 
-            "model.layers.1": 0,
-            "model.layers.2": 0,
-            "model.layers.3": 0,
-            "model.layers.4": 0,
-            "model.layers.5": 0,
-            "model.layers.6": 0,
-            "model.layers.7": 0,
-            "model.layers.8": 0,
-            "model.layers.9": 0,
-            "model.layers.10": 0,
-            "model.layers.11": 0,
-            "model.layers.12": 0,
-            "model.layers.13": 0,
-            "model.layers.14": 0,
-            "model.layers.15": 0,
-            "model.layers.16": "cpu",
-            "model.layers.17": "cpu",
-            "model.layers.18": "cpu",
-            "model.layers.19": "cpu",
-            "model.layers.20": "cpu",
-            "model.layers.21": "cpu",
-            "model.layers.22": "cpu",
-            "model.layers.23": "cpu",
-            "model.layers.24": "cpu",
-            "model.layers.25": "cpu",
-            "model.layers.26": "cpu",
-            "model.layers.27": "cpu",
-            "model.layers.28": "cpu",
-            "model.layers.29": "cpu",
-            "model.layers.30": "cpu",
-            "model.layers.31": "cpu",
-            "lm_head": 0,
-            "vision_tower": 0,
-        }
-    elif args.low_memory:
-        print("低メモリモードを有効化します")
-        # auto device mapを使用
-        device_map = "auto"
-    
     # from_vision_modelメソッドを使用してモデルとトークナイザーを同時に取得
-    # メモリ効率を高めるためにdevice_mapを使用
-    model, tokenizer = Llama32LISAForCausalLM.from_vision_model(
-        vision_model_id=args.version,
-        vision_pretrained=args.sam_version,
-        train_mask_decoder=args.train_mask_decoder,
-        tokenizer=tokenizer,
-        torch_dtype=dtype,
-        device_map=device_map,  # 自動的にGPU/CPU間でレイヤーを配置
-        ignore_mismatched_sizes=args.ignore_mismatched_sizes,
-        load_in_8bit=False,  # BNBエラーのため無効化
-        load_in_4bit=False   # BNBエラーのため無効化
-    )
+    # メモリ管理を最適化
+    print("メモリ効率の良いモデルロードを実行します...")
+    device_map = "auto"  # Hugging Faceにデバイスマッピングを任せる
+    
+    # 超低メモリモードでの追加対策
+    offload_folder = None
+    if args.very_low_memory:
+        print("CPUオフロードを有効化します")
+        # モデルを部分的にディスクにオフロードするための一時フォルダを設定
+        import tempfile
+        offload_folder = tempfile.mkdtemp()
+        print(f"一時オフロードフォルダ: {offload_folder}")
+    
+    try:
+        model, tokenizer = Llama32LISAForCausalLM.from_vision_model(
+            vision_model_id=args.version,
+            vision_pretrained=args.sam_version,
+            train_mask_decoder=args.train_mask_decoder,
+            tokenizer=tokenizer,
+            torch_dtype=dtype,
+            device_map=device_map,  # 自動的にGPU/CPU間でレイヤーを配置
+            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+            load_in_8bit=False,  # BNBエラーのため無効化
+            load_in_4bit=False,   # BNBエラーのため無効化
+            offload_folder=offload_folder if args.very_low_memory else None,
+        )
+    except Exception as e:
+        print(f"モデルロード中にエラーが発生しました: {e}")
+        print("代替方法でモデルをロードします...")
+        
+        # 代替として、より単純な方法でロード
+        model, tokenizer = Llama32LISAForCausalLM.from_vision_model(
+            vision_model_id=args.version,
+            vision_pretrained=args.sam_version,
+            train_mask_decoder=args.train_mask_decoder,
+            tokenizer=tokenizer,
+            torch_dtype=dtype,
+            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+        )
+        
+        # モデルをCPUに一部移動して手動でメモリ管理
+        if args.very_low_memory and hasattr(model, 'model') and model.model is not None:
+            print("手動でモデルレイヤーをCPUに移動します...")
+            # モデルの一部のレイヤーを手動でCPUに移動
+            for i in range(20, 32):  # 後半のレイヤーをCPUに
+                try:
+                    layer_name = f"model.layers.{i}"
+                    if hasattr(model.model, "layers") and i < len(model.model.layers):
+                        layer = model.model.layers[i]
+                        layer.to("cpu")
+                        print(f"レイヤー {layer_name} をCPUに移動しました")
+                except Exception as layer_e:
+                    print(f"レイヤー移動中にエラー: {layer_e}")
     
     # モデルをデバイスに配置
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -575,6 +581,14 @@ def main(args):
     
     # チャットモードの起動
     chatting(args, model, tokenizer, device, prompt_template, model_max_length, max_new_tokens, sep, stop_str)
+
+    # 一時フォルダを削除
+    if offload_folder and os.path.exists(offload_folder):
+        import shutil
+        try:
+            shutil.rmtree(offload_folder)
+        except Exception as e:
+            print(f"一時フォルダの削除中にエラー: {e}")
 
 
 if __name__ == "__main__":

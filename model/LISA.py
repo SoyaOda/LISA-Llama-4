@@ -8,7 +8,7 @@ from transformers import BitsAndBytesConfig, CLIPVisionModel, AutoModelForVision
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          DEFAULT_IMAGE_PATCH_TOKEN)
 
-from .segment_anything import build_sam_vit_h
+from .segment_anything import build_sam_vit_h, sam_model_registry
 from .llama3_2.constants import SEG_TOKEN
 
 
@@ -237,7 +237,8 @@ class Llama32LISAForCausalLM(nn.Module):
     @classmethod
     def from_vision_model(cls, vision_model_id, seg_token_idx=None, vision_pretrained=None, train_mask_decoder=False, 
                          out_dim=256, tokenizer=None, torch_dtype=None, device_map=None, 
-                         quantization_config=None, ignore_mismatched_sizes=False, load_in_8bit=False, load_in_4bit=False, **kwargs):
+                         quantization_config=None, ignore_mismatched_sizes=False, load_in_8bit=False, 
+                         load_in_4bit=False, offload_folder=None, **kwargs):
         """
         Llama3.2 Vision modelとSAMを統合したモデルを生成します。
         
@@ -254,6 +255,7 @@ class Llama32LISAForCausalLM(nn.Module):
             ignore_mismatched_sizes: サイズの不一致を無視するかどうか
             load_in_8bit: 8ビット量子化を使用するかどうか
             load_in_4bit: 4ビット量子化を使用するかどうか
+            offload_folder: オフロード用一時フォルダのパス
             **kwargs: その他の引数
         """
         print("Step 1: Loading base vision-language model...")
@@ -280,19 +282,53 @@ class Llama32LISAForCausalLM(nn.Module):
             )
         
         # デバイスマップがない場合は設定（メモリ効率のため）
-        if device_map is None:
+        if device_map is None and torch.cuda.is_available():
             # 自動的にGPUとCPU間でレイヤーを配置
             device_map = "auto"
         
+        # メモリ効率のためのオプション
+        model_loading_kwargs = {
+            "torch_dtype": torch_dtype,
+            "device_map": device_map,
+            "quantization_config": quantization_config,
+            "ignore_mismatched_sizes": ignore_mismatched_sizes,
+        }
+        
+        # オフロードフォルダが指定されている場合は追加
+        if offload_folder:
+            model_loading_kwargs["offload_folder"] = offload_folder
+            model_loading_kwargs["low_cpu_mem_usage"] = True
+        
         # トークナイザーを拡張した後にモデルをロード
-        vision_model = AutoModelForVision2Seq.from_pretrained(
-            vision_model_id,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
-            quantization_config=quantization_config,
-            ignore_mismatched_sizes=ignore_mismatched_sizes,
-            **kwargs
-        )
+        try:
+            # メモリクリーンアップ
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+            
+            # モデルをロード
+            vision_model = AutoModelForVision2Seq.from_pretrained(
+                vision_model_id,
+                **model_loading_kwargs,
+                **kwargs
+            )
+        except Exception as e:
+            print(f"モデルロード中にエラーが発生: {e}")
+            print("代替方法でロード試行...")
+            
+            # 単純化した設定でロード試行
+            simplified_kwargs = {
+                "torch_dtype": torch_dtype,
+                "ignore_mismatched_sizes": ignore_mismatched_sizes
+            }
+            
+            # deviceを指定しない方法でロード
+            vision_model = AutoModelForVision2Seq.from_pretrained(
+                vision_model_id,
+                **simplified_kwargs,
+                **kwargs
+            )
         
         # SEGトークンのインデックスを取得
         if seg_token_idx is None:
@@ -333,40 +369,43 @@ class Llama32LISAForCausalLM(nn.Module):
         return None
         
     def initialize_sam_encoder(self):
-        """SAMの視覚エンコーダを初期化"""
-        # SAMの視覚エンコーダ（ViT-H）を初期化
-        print(f"Initializing SAM encoder from {self.vision_ckpt}...")
-        self.visual_model = build_sam_vit_h(self.vision_ckpt)
-        
-        # すべてのSAMパラメータを凍結（マスクデコーダを除く）
-        for param in self.visual_model.parameters():
-            param.requires_grad = False
+        """SAMエンコーダを初期化"""
+        if self.vision_ckpt:
+            print(f"Initializing SAM encoder from {self.vision_ckpt}...")
             
-        if self.train_mask_decoder:
-            # マスクデコーダを訓練可能に設定（セグメンテーションマスクを学習する場合）
-            self.visual_model.mask_decoder.train()
-            for param in self.visual_model.mask_decoder.parameters():
-                param.requires_grad = True
+            # メモリクリーンアップ
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+            
+            # SAMエンコーダを初期化
+            self.visual_model = sam_model_registry["vit_h"](checkpoint=self.vision_ckpt)
+            
+            for param in self.visual_model.parameters():
+                param.requires_grad = False
+                
+            # プロンプトエンコーダをトレーニングしない
+            if not self.train_mask_decoder:
+                for param in self.visual_model.mask_decoder.parameters():
+                    param.requires_grad = False
 
-        # プロジェクションレイヤー：LLM隠れ状態をマスク埋め込み次元にプロジェクション
-        # モデル設定からhidden_sizeを取得
-        if hasattr(self.config, 'text_config') and hasattr(self.config.text_config, 'hidden_size'):
-            hidden_size = self.config.text_config.hidden_size
-        elif hasattr(self.config, 'hidden_size'):
+            # プロジェクションレイヤーの作成
             hidden_size = self.config.hidden_size
-        else:
-            # デフォルト値として4096を使用（一般的なLlamaモデルの隠れ層サイズ）
-            hidden_size = 4096
+            print(f"Using hidden size: {hidden_size} for projection layers")
+            self.mm_projector = nn.Linear(256, hidden_size)
             
-        print(f"Using hidden size: {hidden_size} for projection layers")
-        self.text_hidden_fcs = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_size, hidden_size),
-                nn.ReLU(inplace=True),
-                nn.Linear(hidden_size, self.out_dim),
-                nn.Dropout(0.0)
-            )
-        ])
+            # メモリ使用量削減のため必要ない変数を削除
+            if not self.train_mask_decoder and hasattr(self.visual_model, 'prompt_encoder'):
+                # プロンプトエンコーダが必要ない場合は削除
+                self.visual_model.prompt_encoder = None
+                
+            # モデルの非トレーニング部分をCPUに移動
+            if torch.cuda.is_available() and hasattr(self, "device"):
+                # 必要な場合のみGPUにロード
+                # 画像処理直前にGPUに移動するため、ここではCPUに保持
+                self.visual_model = self.visual_model.cpu()
+                torch.cuda.empty_cache()
     
     @property
     def device(self):
@@ -589,86 +628,106 @@ class Llama32LISAForCausalLM(nn.Module):
             
         # モデルのフォワードパスを実行して埋め込みを取得
         with torch.no_grad():
+            # メモリ効率のためCPU→GPU転送を最適化
+            device = images.device
+            
+            # SAMモデルをGPUに移動
+            if hasattr(self.visual_model, 'to') and not self.visual_model.device == device:
+                # 必要な場合のみGPUに移動
+                try:
+                    self.visual_model = self.visual_model.to(device)
+                except Exception as e:
+                    print(f"SAMモデルのGPU移動中にエラー: {e}")
+                    # エラー発生時はCPUでの推論を継続
+                    device = torch.device('cpu')
+                    images = images.to(device)
+                    self.visual_model = self.visual_model.to(device)
+            
             # 画像をSAMのViTでエンコード
             img_embeds = self.visual_model.image_encoder(images)
             
             # 生成出力の隠れ状態を取得
             # 多くの場合、生成出力は既に渡されており、隠れ状態も含まれているため、改めてforward()を呼ぶ必要はない
-            # ただし、明示的にここでモデルに入力を渡すことも可能（以下のコメントアウト部分）
-            # outputs = self(input_ids=input_ids, **kwargs)
-            # # 隠れ状態を抽出
-            # if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
-            #     hidden_states = outputs.hidden_states[-1]
-            # else:
-            #     # 適切な構造で隠れ状態を取得できない場合
-            #     raise ValueError("Cannot access hidden states from model outputs")
+            hidden_states = None
             
-            # モデル自体から埋め込みレイヤーを使用して埋め込みを取得
-            if hasattr(self.model, 'get_input_embeddings'):
-                # 入力埋め込みを取得
-                embed_layer = self.model.get_input_embeddings()
-                hidden_states = embed_layer(input_ids)
-            else:
-                # 埋め込みレイヤーが直接アクセスできない場合
-                raise ValueError("Cannot access embedding layer of the model")
-            
-            # <SEG>トークンの埋め込みを取得
+            # 入力IDからセグメントトークンの隠れ状態を抽出
             seg_hidden_states = []
-            batch_size = input_ids.shape[0]
             
-            for i in range(batch_size):
-                for seg_idx in seg_token_indices:
-                    if seg_idx >= input_ids.shape[1]:
-                        continue
-                    if input_ids[i, seg_idx] == self.seg_token_idx:
-                        # <SEG>トークンの隠れ状態を取得
-                        seg_hidden = hidden_states[i, seg_idx]
-                        # プロジェクションレイヤを適用
-                        for layer in self.text_hidden_fcs:
-                            seg_hidden = layer(seg_hidden)
-                        seg_hidden_states.append((i, seg_hidden))
+            # 各<SEG>トークンのインデックスからそれに対応する隠れ状態を取得
+            for seg_token_idx in seg_token_indices:
+                # 安全対策：インデックスが存在するか確認
+                if not 0 <= seg_token_idx < input_ids.shape[1]:
+                    print(f"警告: セグメントトークンのインデックス {seg_token_idx} が範囲外です")
+                    continue
+                    
+                # 隠れ状態が未取得の場合、取得を試みる
+                if hidden_states is None:
+                    # 入力IDを使用して推論実行（隠れ状態を取得するため）
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        output_hidden_states=True,
+                        return_dict=True
+                    )
+                    hidden_states = outputs.hidden_states
+                
+                # 最後のレイヤーの隠れ状態を取得
+                if isinstance(hidden_states, tuple):
+                    last_hidden_states = hidden_states[-1]
+                else:
+                    last_hidden_states = hidden_states
+                    
+                # <SEG>トークンの埋め込みを取得
+                seg_hidden_state = last_hidden_states[0, seg_token_idx]
+                seg_hidden_states.append(seg_hidden_state)
             
-            # 各<SEG>トークンに対してマスクを生成
+            # <SEG>トークンの隠れ状態をプロジェクション
+            sparse_embeddings = []
+            dense_embeddings = []
+            
+            for seg_hidden_state in seg_hidden_states:
+                # 各セグメントトークンのプロジェクション実行
+                sparse_emb = self.mm_projector(seg_hidden_state).unsqueeze(0)
+                sparse_embeddings.append(sparse_emb)
+                dense_embeddings.append(None)  # SAMはプロンプトポイントのみを使用
+            
+            # SAMデコーダを使用してマスクを生成
             masks = []
-            for batch_idx, seg_embed in seg_hidden_states:
-                # SAMのマスクデコーダに埋め込みを渡してマスクを生成
-                mask_embed = seg_embed.unsqueeze(0)  # [1, out_dim]
-                
-                # 同じバッチの画像埋め込みを取得
-                img_embedding = img_embeds[batch_idx:batch_idx+1]
-                
-                # SAMのプロンプトエンコーダとマスクデコーダを使用
-                sparse_embeddings = mask_embed.unsqueeze(0)  # [1, 1, out_dim]
-                dense_embeddings = self.visual_model.prompt_encoder.no_mask_embed.weight.reshape(1, 1, -1).expand(
-                    1, img_embedding.shape[-2] * img_embedding.shape[-1], -1
-                )
-                
-                # マスクデコーダの出力
-                decoder_out = self.visual_model.mask_decoder(
-                    image_embeddings=img_embedding,
+            for sparse_emb, dense_emb, original_size in zip(
+                sparse_embeddings, dense_embeddings, original_sizes
+            ):
+                # 各SAMプロンプトに対してマスクを生成
+                mask = self.visual_model.mask_decoder(
+                    image_embeddings=img_embeds,
                     image_pe=self.visual_model.prompt_encoder.get_dense_pe(),
-                    sparse_prompt_embeddings=sparse_embeddings,
-                    dense_prompt_embeddings=dense_embeddings,
+                    sparse_prompt_embeddings=sparse_emb,
+                    dense_prompt_embeddings=dense_emb,
                     multimask_output=False,
-                )
+                )["low_res_logits"]
                 
-                # 生成されたマスク
-                mask = decoder_out.masks.squeeze(1)  # [1, H, W]
-                
-                # 元のサイズにリサイズ
-                orig_h, orig_w = original_sizes[batch_idx]
-                mask = F.interpolate(
-                    mask.unsqueeze(1),  # [1, 1, H, W]
-                    size=(orig_h, orig_w),
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze()  # [H, W]
-                
-                # シグモイド関数を適用して0-1の範囲に正規化
+                # マスクをシグモイド関数で確率に変換
                 mask = torch.sigmoid(mask)
-                masks.append(mask)
                 
-        return masks
+                # 必要に応じてしきい値処理
+                binary_mask = (mask > 0.5).float()
+                
+                # マスクを元の解像度にリサイズ
+                # binary_mask = F.interpolate(
+                #    binary_mask, size=original_size, mode="bilinear", align_corners=False
+                # )
+                
+                masks.append(binary_mask.squeeze())
+                
+            # メモリの解放（大規模なテンソル）
+            del img_embeds, hidden_states
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # SAMモデルをCPUに戻してGPUメモリを解放
+            if device.type == 'cuda' and hasattr(self.visual_model, 'to'):
+                self.visual_model = self.visual_model.cpu()
+                torch.cuda.empty_cache()
+                
+            return masks
 
     def load_state_dict(self, state_dict, strict=False):
         """
