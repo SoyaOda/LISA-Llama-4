@@ -430,11 +430,12 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                         outputs = model.generate_masks(
                             image=image,
                             **inputs,
-                            **generation_config
+                            **generation_config,
+                            tokenizer=tokenizer
                         )
                         
-                        # 結果の処理
-                        if outputs and 'masks' in outputs:
+                        # 結果の処理（outputs は辞書形式）
+                        if isinstance(outputs, dict) and 'masks' in outputs and outputs['masks']:
                             # マスクを画像として保存
                             print("セグメンテーション完了！マスクを保存中...")
                             masks = outputs['masks']
@@ -447,13 +448,14 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                             for i, mask in enumerate(masks):
                                 save_path = os.path.join(args.vis_save_path, f"{base_name}_mask_{i}.png")
                                 # マスクをPIL画像として保存
-                                mask_img = Image.fromarray((mask.cpu().numpy() * 255).astype(np.uint8))
+                                mask_np = mask.cpu().numpy() if isinstance(mask, torch.Tensor) else mask
+                                mask_img = Image.fromarray((mask_np * 255).astype(np.uint8))
                                 mask_img.save(save_path)
                                 
                                 # マスクを元画像に適用して可視化
                                 vis_path = os.path.join(args.vis_save_path, f"{base_name}_masked_img_{i}.jpg")
                                 img_np = np.array(image)
-                                mask_np = mask.cpu().numpy()
+                                mask_np = mask.cpu().numpy() if isinstance(mask, torch.Tensor) else mask
                                 masked_img = img_np.copy()
                                 # 半透明のオーバーレイを作成
                                 overlay = np.zeros_like(img_np)
@@ -465,6 +467,9 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                             # テキスト出力の処理
                             text_output = outputs.get('text', "セグメンテーション完了")
                             print(f"\nAssistant: {text_output}")
+                        elif isinstance(outputs, dict) and 'error' in outputs:
+                            # エラーメッセージの表示
+                            print(f"\nAssistant: セグメンテーション中にエラーが発生しました: {outputs['error']}")
                         else:
                             print("\nAssistant: セグメンテーションの結果が得られませんでした。")
                     else:
