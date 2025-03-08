@@ -1035,25 +1035,65 @@ class Llama32LISAForCausalLM(nn.Module):
         
         # pixel_valuesが指定されている場合はそれを使用
         if pixel_values is not None:
+            print(f"既存のpixel_valuesを使用します。形状: {pixel_values.shape}")
             return self.visual_model.image_encoder(pixel_values)
         
         # imageが指定されている場合は変換して使用
         if image is not None:
-            from PIL import Image
-            import torch
-            
-            # PILイメージをテンソルに変換
-            if isinstance(image, Image.Image):
-                # 画像の前処理
-                from torchvision import transforms
-                transform = transforms.Compose([
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                        std=[0.229, 0.224, 0.225])
-                ])
-                pixel_values = transform(image).unsqueeze(0).to(device)
-                print(f"画像をテンソルに変換: 形状{pixel_values.shape}")
-                return self.visual_model.image_encoder(pixel_values)
+            try:
+                from PIL import Image
+                import numpy as np
+                import torch
+                from model.segment_anything.utils.transforms import ResizeLongestSide
+                
+                # オリジナルのLISAコードと同様の処理を行う
+                print("SAM用に画像を前処理します")
+                
+                # PIL画像をNumPy配列に変換
+                if isinstance(image, Image.Image):
+                    image_np = np.array(image)
+                    print(f"NumPy画像形状: {image_np.shape}")
+                else:
+                    raise ValueError("サポートされていない画像タイプです")
+                
+                # ResizeLongestSideを使用してリサイズ
+                transform = ResizeLongestSide(1024)  # SAMはデフォルトで1024x1024を使用
+                image_transformed = transform.apply_image(image_np)
+                print(f"変換後の画像形状: {image_transformed.shape}")
+                
+                # 前処理関数
+                def preprocess(x, pixel_mean=torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1),
+                               pixel_std=torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1), img_size=1024):
+                    # Normalize colors
+                    x = (x - pixel_mean) / pixel_std
+                    # Pad
+                    h, w = x.shape[-2:]
+                    padh = img_size - h
+                    padw = img_size - w
+                    x = F.pad(x, (0, padw, 0, padh))
+                    return x
+                
+                # テンソルに変換して前処理
+                image_tensor = torch.from_numpy(image_transformed).permute(2, 0, 1).contiguous()
+                print(f"変換後のテンソル形状: {image_tensor.shape}")
+                
+                image_tensor = preprocess(image_tensor).unsqueeze(0).to(device)
+                print(f"前処理後のテンソル形状: {image_tensor.shape}")
+                
+                # 必要に応じて精度を変換
+                if hasattr(self, 'torch_dtype') and self.torch_dtype == torch.float16:
+                    image_tensor = image_tensor.half()
+                elif hasattr(self, 'torch_dtype') and self.torch_dtype == torch.bfloat16:
+                    image_tensor = image_tensor.bfloat16()
+                
+                # SAMイメージエンコーダーを実行
+                return self.visual_model.image_encoder(image_tensor)
+                
+            except Exception as e:
+                print(f"画像エンコード処理中にエラーが発生しました: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
         
         # どちらも指定されていない場合はエラー
         raise ValueError("画像またはピクセル値が必要です")

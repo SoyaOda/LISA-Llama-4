@@ -435,18 +435,49 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                         mask_inputs = {k: v for k, v in inputs.items() 
                                       if k not in ["input_ids", "attention_mask"]}
                         
+                        # SAM用に画像を適切に準備
+                        # オリジナルのLISAに合わせた方法で画像を処理
+                        from model.segment_anything.utils.transforms import ResizeLongestSide
+                        transform = ResizeLongestSide(1024)  # SAMは1024x1024を使用
+                        
                         # 画像が正しく処理されているか確認
                         if image is not None:
                             print(f"画像情報: {type(image)}, サイズ: {image.size if hasattr(image, 'size') else 'N/A'}")
                             
-                            # generate_masksに渡すパラメータを整理
-                            generation = model.generate_masks(
-                                image=image,  # PIL Image
-                                input_ids=input_ids,
-                                attention_mask=inputs.get("attention_mask", torch.ones_like(input_ids)),
-                                max_new_tokens=max_new_tokens,
-                                **mask_inputs
-                            )
+                            try:
+                                # SAM用の画像処理
+                                import numpy as np
+                                image_np = np.array(image)
+                                
+                                # マスク生成はOK
+                                print("generate_masksを呼び出します...")
+                                generation = model.generate_masks(
+                                    image=image,  # PIL Image - SAM内部で適切に処理されるように修正
+                                    input_ids=input_ids,
+                                    attention_mask=inputs.get("attention_mask", torch.ones_like(input_ids)),
+                                    max_new_tokens=max_new_tokens,
+                                    **mask_inputs
+                                )
+                            except Exception as e:
+                                print(f"セグメンテーション処理中にエラー: {e}")
+                                print("通常のテキスト生成にフォールバックします...")
+                                # 例外が発生した場合は通常のテキスト生成にフォールバック
+                                generation_config = {
+                                    "max_new_tokens": max_new_tokens,
+                                    "do_sample": args.do_sample,
+                                }
+                                
+                                if args.do_sample:
+                                    generation_config.update({
+                                        "temperature": args.temperature,
+                                        "top_p": args.top_p,
+                                        "top_k": args.top_k,
+                                    })
+                                
+                                generation = model.generate(
+                                    **inputs,
+                                    **generation_config
+                                )
                         else:
                             print("画像が正しく処理されていないため、通常の生成に切り替えます")
                             # 通常のテキスト生成にフォールバック
@@ -678,20 +709,34 @@ def main(args):
                         # 画像第一引数、テキスト第二引数
                         test_inputs = tokenizer(test_image, test_prompt, return_tensors="pt").to(device)
                         
+                        # test_inputsから冗長なキーを削除
+                        test_mask_inputs = {k: v for k, v in test_inputs.items() 
+                                          if k not in ["input_ids", "attention_mask"]}
+                        
                         # セグメンテーション実行
                         with torch.no_grad():
-                            # test_inputsから冗長なキーを削除
-                            test_mask_inputs = {k: v for k, v in test_inputs.items() 
-                                              if k not in ["input_ids", "attention_mask"]}
-                            
-                            generation = model.generate_masks(
-                                image=test_image,
-                                input_ids=test_inputs.input_ids,
-                                attention_mask=test_inputs.attention_mask,
-                                max_new_tokens=256,
-                                **test_mask_inputs
-                            )
-                            
+                            try:
+                                # オリジナルのLISAアプローチで画像を処理
+                                from model.segment_anything.utils.transforms import ResizeLongestSide
+                                print("SAM用の画像前処理を実行中...")
+                                
+                                # テスト実行
+                                generation = model.generate_masks(
+                                    image=test_image,  # SAM内部で適切に処理されるように修正済み
+                                    input_ids=test_inputs.input_ids,
+                                    attention_mask=test_inputs.attention_mask,
+                                    max_new_tokens=256,
+                                    **test_mask_inputs
+                                )
+                            except Exception as e:
+                                print(f"SAM処理中にエラー: {e}")
+                                print("通常の生成にフォールバック")
+                                # 例外発生時は通常の生成にフォールバック
+                                generation = model.generate(
+                                    **test_inputs,
+                                    max_new_tokens=256
+                                )
+                                
                             # 生成されたテキストをデコード
                             output = tokenizer.decode(generation[0][test_inputs.input_ids.shape[1]:], skip_special_tokens=True)
                             print(f"セグメンテーション出力: {output[:100]}...")
