@@ -1,12 +1,40 @@
 import base64
 from io import BytesIO
 from typing import List, Optional, Union
+import re
 
 import torch
 from PIL import Image
 from transformers import PreTrainedTokenizer
 
 from .constants import IMAGE_TOKEN
+
+def create_mllama_message(user_text, image_token="<image>"):
+    """
+    Llama 3.2 Vision (Mllama)モデル用のメッセージを作成します。
+    
+    Args:
+        user_text: ユーザーテキスト
+        image_token: 画像トークン（デフォルトは<image>）
+        
+    Returns:
+        メッセージ形式のリスト
+    """
+    # 画像トークンがない場合は先頭に追加
+    if image_token not in user_text:
+        user_text = f"{image_token} {user_text}"
+    
+    # Mllama用のメッセージ形式
+    messages = [
+        {
+            "role": "user", 
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": user_text}
+            ]
+        }
+    ]
+    return messages
 
 def load_image_from_base64(image_str: str) -> Image.Image:
     """Base64エンコードされた画像文字列からPIL Imageをロードする"""
@@ -28,46 +56,27 @@ def tokenizer_image_token(
         tokenizer: Llama3.2モデル用のトークナイザ。
         return_tensors: 'pt'の場合、PyTorchテンソルのトークンIDを返します。Noneの場合、トークンIDのリストを返します。
     """
-    # プロンプトを画像プレースホルダトークンで分割
-    parts = prompt.split(IMAGE_TOKEN)
-    tokenized_chunks = []
+    # 画像トークンに対応するパターン
+    image_token_pattern = r"<image>"
+    image_token_idx = tokenizer.convert_tokens_to_ids("<image>")
     
-    for part in parts:
-        if part == "":
-            token_ids = []  # このチャンクにはテキストがない
-        else:
-            # 特殊トークンを追加せずにテキストチャンクをトークン化（BOSを繰り返し追加しないため）
-            tokens = tokenizer(part, add_special_tokens=False)
-            token_ids = tokens["input_ids"] if isinstance(tokens, dict) else tokens
-        tokenized_chunks.append(token_ids if isinstance(token_ids, list) else list(token_ids))
+    # プロンプト内の画像トークンを置換
+    parts = re.split(image_token_pattern, prompt)
+    tokens = []
     
-    # 画像プレースホルダのトークンIDを取得
-    try:
-        image_token_id = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
-    except Exception as e:
-        raise ValueError(f"トークナイザには{IMAGE_TOKEN}トークンが定義されていません。") from e
-
-    # トークナイザがBOSトークンを使用する場合、シーケンスの先頭に追加（一度だけ）
-    bos_id = tokenizer.bos_token_id
-    output_ids: List[int] = []
-    if bos_id is not None:
-        output_ids.append(bos_id)
+    for i, part in enumerate(parts):
+        # パートをトークン化
+        part_tokens = tokenizer.encode(part, add_special_tokens=False)
+        tokens.extend(part_tokens)
+        
+        # 最後のパート以外では画像トークンを追加
+        if i < len(parts) - 1:
+            tokens.append(image_token_idx)
     
-    # テキストチャンクと画像トークンIDを交互に配置
-    for i, chunk in enumerate(tokenized_chunks):
-        # トークン化されたテキストチャンクを追加
-        output_ids.extend(chunk)
-        # 各チャンク（最後を除く）の後に画像トークンを追加
-        if i < len(tokenized_chunks) - 1:
-            output_ids.append(image_token_id)
-    
-    # 要求があれば、テンソルに変換
-    if return_tensors is not None:
-        if return_tensors == 'pt':
-            return torch.tensor([output_ids], dtype=torch.long)  # shape (1, sequence_length)
-        else:
-            raise ValueError(f"サポートされていないreturn_tensorsタイプ: {return_tensors}")
-    return output_ids
+    # テンソル形式で返す
+    if return_tensors == "pt":
+        return torch.tensor([tokens])
+    return tokens
 
 def process_images(
     images: Union[Image.Image, List[Image.Image], str, List[str], BytesIO, List[BytesIO]],
@@ -88,75 +97,80 @@ def process_images(
         モデルに応じて(batch_size, num_image_tiles, channels, height, width)または(batch_size, channels, height, width)の
         形状のテンソル。プロセッサを使用する場合は通常['pixel_values']でアクセス可能。
     """
-    # PIL画像のリストを確保
-    pil_images = []
     if images is None:
         return None
-    
-    if isinstance(images, list):
-        img_list = images
-    else:
-        img_list = [images]
         
-    for img in img_list:
-        if isinstance(img, str):
-            # 画像が文字列の場合、ファイルパスまたはURLと仮定
-            # （注：URLの場合、ユーザーは外部で処理する必要があります。ここではローカルパスを処理します）
-            try:
-                # ファイルパスとして開く
-                pil_img = Image.open(img).convert("RGB")
-            except Exception as e:
-                # 失敗した場合、base64文字列として扱う
-                pil_img = load_image_from_base64(img)
-        elif isinstance(img, BytesIO):
-            pil_img = Image.open(img).convert("RGB")
-        elif isinstance(img, Image.Image):
-            pil_img = img.convert("RGB")
-        else:
-            raise ValueError("サポートされていない画像形式です。PIL Images、ファイルパス、またはbase64文字列を提供してください。")
-        pil_images.append(pil_img)
+    # 単一画像の場合はリストに変換
+    if not isinstance(images, list):
+        images = [images]
     
-    # 提供されたプロセッサまたは画像プロセッサを使用してピクセル値を取得
+    # 画像を標準化されたPIL形式に変換
+    new_images = []
+    for image in images:
+        if isinstance(image, str):
+            image = load_image_from_base64(image)
+        elif isinstance(image, BytesIO):
+            image = Image.open(image)
+        
+        if not isinstance(image, Image.Image):
+            raise ValueError(f"Unsupported image type: {type(image)}")
+        
+        # RGBに変換
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        
+        new_images.append(image)
+    
+    # 適切なプロセッサで画像を処理
     if processor is not None:
-        # プロセッサはトークナイザと画像プロセッサを組み合わせたもの
-        processed = processor(images=pil_images, return_tensors=return_tensors)
-        # processedはBatchEncodingまたは類似のもので、'pixel_values'を含む
-        return processed.get("pixel_values", None)
-    elif image_processor is not None:
-        processed = image_processor(images=pil_images, return_tensors=return_tensors)
-        return processed.get("pixel_values", None)
-    else:
-        raise ValueError("画像を処理するには、プロセッサまたは画像プロセッサを提供する必要があります。")
+        # MllamaProcessorなどの複合プロセッサの場合
+        if hasattr(processor, 'image_processor'):
+            outputs = processor.image_processor(new_images, return_tensors=return_tensors)
+            if isinstance(outputs, dict) and "pixel_values" in outputs:
+                return outputs["pixel_values"]
+            return outputs
+        return processor(new_images, return_tensors=return_tensors)
+    
+    # 画像プロセッサが指定されている場合
+    if image_processor is not None:
+        return image_processor(new_images, return_tensors=return_tensors)["pixel_values"]
+    
+    # どのプロセッサも指定されていない場合
+    return None
 
 class KeywordsStoppingCriteria(torch.nn.Module):
     """指定されたキーワードが出力に表示されたときにテキスト生成を停止する基準"""
     def __init__(self, keywords: List[str], tokenizer: PreTrainedTokenizer, initial_input_ids: torch.LongTensor):
         super().__init__()
         self.keywords = keywords
-        # 各キーワードのトークンIDを事前に計算
-        self.keyword_ids = []
-        self.max_keyword_len = 0
-        for kw in keywords:
-            kw_ids = tokenizer(kw, add_special_tokens=False)["input_ids"]
-            if len(kw_ids) == 0:
-                continue
-            # 先頭にBOSがあれば削除
-            if kw_ids[0] == tokenizer.bos_token_id:
-                kw_ids = kw_ids[1:]
-            self.max_keyword_len = max(self.max_keyword_len, len(kw_ids))
-            self.keyword_ids.append(torch.tensor(kw_ids, dtype=torch.long))
-        self.start_len = initial_input_ids.shape[-1]  # 入力プロンプトの長さ（出力チェックで無視するため）
-    
+        self.tokenizer = tokenizer
+        self.initial_input_ids_len = initial_input_ids.shape[1]
+        
+        # キーワードごとにトークンIDリストを作成
+        self.keyword_token_ids = []
+        for keyword in keywords:
+            keyword_tokens = tokenizer.encode(keyword, add_special_tokens=False)
+            self.keyword_token_ids.append(torch.tensor(keyword_tokens))
+        
     def __call__(self, output_ids: torch.LongTensor, scores: torch.FloatTensor) -> bool:
         # 生成された部分のみを考慮
-        gen_sequence = output_ids[0, self.start_len:]  # 最初のシーケンスの新しく生成されたトークンのみを取得
-        if gen_sequence.numel() == 0:
-            return False
-        for kw_id_seq in self.keyword_ids:
-            seq_len = kw_id_seq.shape[0]
-            if seq_len > gen_sequence.shape[0]:
-                continue
-            # 生成されたシーケンスの末尾部分がキーワードシーケンスと一致するかチェック
-            if torch.equal(gen_sequence[-seq_len:], kw_id_seq.to(gen_sequence.device)):
-                return True
+        outputs = output_ids[:, self.initial_input_ids_len:]
+        
+        # バッチサイズは通常1
+        for batch_idx in range(outputs.shape[0]):
+            batch_output_ids = outputs[batch_idx]
+            
+            # 各キーワードについてチェック
+            for keyword_ids in self.keyword_token_ids:
+                # 出力シーケンス長がキーワードより短い場合はスキップ
+                if len(batch_output_ids) < len(keyword_ids):
+                    continue
+                
+                # 最後のn個（キーワード長）のトークンを取得
+                last_n_ids = batch_output_ids[-(len(keyword_ids)):]
+                
+                # キーワードと一致するか確認
+                if torch.all(last_n_ids == keyword_ids):
+                    return True
+        
         return False 

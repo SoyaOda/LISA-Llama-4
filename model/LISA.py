@@ -306,6 +306,16 @@ class Llama32LISAForCausalLM(nn.Module):
                 print("Adding <SEG> token to tokenizer vocabulary")
                 tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
         
+        # Mllamaタイプを検出
+        is_mllama = 'mllama' in vision_model_id.lower() or (hasattr(tokenizer, 'image_token'))
+        if is_mllama:
+            print("Llama 3.2 Vision (Mllama)モデルを検出しました")
+            
+            # 画像トークンの情報
+            if hasattr(tokenizer, 'image_token'):
+                image_token = tokenizer.image_token
+                print(f"Using image token: {image_token}")
+        
         # 量子化設定がない場合は作成
         if quantization_config is None and (load_in_8bit or load_in_4bit):
             quantization_config = BitsAndBytesConfig(

@@ -17,6 +17,7 @@ from model.llama3_2.constants import IMAGE_TOKEN, SEG_TOKEN
 from model.segment_anything.utils.transforms import ResizeLongestSide
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX)
+from model.llama3_2.mm_utils import create_mllama_message
 
 # Hugging Face認証を行う関数
 def authenticate_huggingface():
@@ -208,6 +209,23 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
     # トークナイザーのアクセス方法を決定
     tokenizer_func = tokenizer.tokenizer if hasattr(tokenizer, 'tokenizer') else tokenizer
     
+    # 画像トークンを取得（MllamaProcessorのための特別処理）
+    image_token = None
+    if hasattr(tokenizer, 'image_token'):
+        image_token = tokenizer.image_token
+    elif hasattr(tokenizer_func, 'special_tokens_map') and 'image' in tokenizer_func.special_tokens_map:
+        image_token = tokenizer_func.special_tokens_map['image']
+    else:
+        # デフォルトの画像トークン
+        image_token = "<image>"
+    
+    # モデルタイプの判定
+    is_mllama = hasattr(tokenizer, 'apply_chat_template')
+    if is_mllama:
+        print(f"Llama 3.2 Vision (Mllama)モデルを検出しました。画像トークン: {image_token}")
+    else:
+        print(f"使用する画像トークン: {image_token}")
+    
     while True:
         try:
             # ユーザー入力を取得
@@ -247,19 +265,70 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                 
                 # 推論中に不要なメモリを解放するためno_gradを使用
                 with torch.no_grad():
-                    # プロセッサで画像を処理
-                    inputs = tokenizer(
-                        text=user_input,
-                        images=image,
-                        return_tensors="pt"
-                    )
-                    
-                    # 入力をデバイスに送る
-                    if not is_auto_device_map:
-                        inputs = {k: v.to(device) for k, v in inputs.items()}
-                    
-                    input_ids = inputs["input_ids"]
-                    image_tensor = inputs["pixel_values"]
+                    try:
+                        # Mllama (Llama 3.2 Vision)モデルの場合
+                        if is_mllama:
+                            # チャットテンプレートを使用するスタイル
+                            messages = [
+                                {
+                                    "role": "user", 
+                                    "content": [
+                                        {"type": "image"},
+                                        {"type": "text", "text": user_input}
+                                    ]
+                                }
+                            ]
+                            # ロギング
+                            print("Mllamaメッセージ形式を使用")
+                            
+                            # 入力を処理（画像とテキスト）
+                            inputs = tokenizer(
+                                text=messages,
+                                images=image,
+                                return_tensors="pt"
+                            )
+                        else:
+                            # 直接テキスト+画像のスタイル
+                            if image_token not in user_input:
+                                # 画像トークンを追加
+                                modified_input = f"{image_token} {user_input}"
+                            else:
+                                modified_input = user_input
+                                
+                            # 入力を処理
+                            inputs = tokenizer(
+                                text=modified_input,
+                                images=image,
+                                return_tensors="pt"
+                            )
+                        
+                        # デバイスに移動
+                        if not is_auto_device_map:
+                            inputs = {k: v.to(device) for k, v in inputs.items()}
+                        
+                        # 入力IDsと画像テンソルを取得
+                        input_ids = inputs["input_ids"]
+                        if "pixel_values" in inputs:
+                            image_tensor = inputs["pixel_values"]
+                    except Exception as e:
+                        print(f"画像処理中にエラー: {e}")
+                        print("別の方法で試行...")
+                        
+                        # MllamaProcessorの別のインターフェースを試す
+                        messages = create_mllama_message(user_input, image_token)
+                        inputs = tokenizer(
+                            text=messages,
+                            images=image,
+                            return_tensors="pt"
+                        )
+                        
+                        # デバイスに移動
+                        if not is_auto_device_map:
+                            inputs = {k: v.to(device) for k, v in inputs.items()}
+                        
+                        input_ids = inputs["input_ids"]
+                        if "pixel_values" in inputs:
+                            image_tensor = inputs["pixel_values"]
             else:
                 # テキストのみの処理
                 with torch.no_grad():
