@@ -708,9 +708,20 @@ class Llama32LISAForCausalLM(nn.Module):
         print("LISA.generate_masksが呼び出されました")
         print(f"モデルデバイス: {self.device}")
         
+        # kwargs内に重複するpixel_valuesがある場合は削除
+        if 'pixel_values' in kwargs:
+            print("警告: kwargsにもpixel_valuesが存在します。引数の重複を避けるため削除します。")
+            del kwargs['pixel_values']
+        
         # 引数のデバッグ
         if pixel_values is not None:
             print(f"pixel_values形状: {pixel_values.shape}, 型: {pixel_values.dtype}, デバイス: {pixel_values.device}")
+            
+            # デバイスの不一致を修正
+            if pixel_values.device != self.device:
+                print(f"デバイスの不一致を検出: pixel_values({pixel_values.device}) vs モデル({self.device})")
+                pixel_values = pixel_values.to(self.device)
+                print(f"pixel_valuesをデバイス{self.device}に移動しました")
         
         # kwargsからトークナイザーを取得し保存
         if 'tokenizer' in kwargs:
@@ -758,14 +769,23 @@ class Llama32LISAForCausalLM(nn.Module):
                 forward_kwargs[key] = value
         
         # 生成の実行
-        output_tokens = self.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            **generation_kwargs
-        )
-        
-        print("テキスト生成完了")
+        try:
+            output_tokens = self.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                **generation_kwargs
+            )
+            
+            print("テキスト生成完了")
+        except Exception as gen_error:
+            print(f"テキスト生成中にエラー: {gen_error}")
+            import traceback
+            traceback.print_exc()
+            # エラー時は空のテンソルを返す
+            if input_ids is not None:
+                return input_ids  # 入力をそのまま返す
+            return None  # 入力もない場合はNoneを返す
         
         # 生成されたテキストから<SEG>トークンのインデックスを検索
         seg_token_indices = []
@@ -774,6 +794,7 @@ class Llama32LISAForCausalLM(nn.Module):
         if hasattr(self, 'tokenizer') and self.tokenizer is not None:
             try:
                 seg_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+                print(f"SEGトークンID: {seg_token_id}")
                 # 生成されたトークン列の中からSEGトークンの位置を検索
                 for i in range(output_tokens.size(0)):
                     positions = torch.where(output_tokens[i] == seg_token_id)[0].tolist()

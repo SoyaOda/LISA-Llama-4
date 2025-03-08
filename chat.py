@@ -510,6 +510,13 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                                         pixel_values = pixel_values.to(device_to_use)
                                         print(f"テンソルをデバイス{device_to_use}に移動しました")
                                         
+                                        # mask_inputsからpixel_valuesを削除して重複を防ぐ
+                                        clean_mask_inputs = {k: v for k, v in mask_inputs.items() 
+                                                           if k != 'pixel_values'}
+                                        
+                                        # トークナイザーを追加
+                                        clean_mask_inputs["tokenizer"] = tokenizer
+                                        
                                         # generate_masksを実行
                                         result = model.generate_masks(
                                             image=None,  # PILを渡さない
@@ -517,11 +524,19 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                                             attention_mask=inputs.get("attention_mask", None),
                                             pixel_values=pixel_values,  # 変換済みのテンソルを渡す
                                             max_new_tokens=max_new_tokens,
-                                            **mask_inputs
+                                            **clean_mask_inputs
                                         )
                                     except Exception as conversion_error:
                                         print(f"テンソル変換中にエラー: {conversion_error}")
                                         print("代わりにPIL画像を使用します...")
+                                        
+                                        # mask_inputsからpixel_valuesを削除して重複を防ぐ
+                                        clean_mask_inputs = {k: v for k, v in mask_inputs.items() 
+                                                           if k != 'pixel_values'}
+                                        
+                                        # トークナイザーを追加
+                                        clean_mask_inputs["tokenizer"] = tokenizer
+                                        
                                         # 通常の処理 - PILイメージを使用
                                         result = model.generate_masks(
                                             image=image,  # PIL Image
@@ -529,16 +544,24 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                                             attention_mask=inputs.get("attention_mask", None),
                                             pixel_values=None,  # pixel_valuesは渡さない
                                             max_new_tokens=max_new_tokens,
-                                            **mask_inputs
+                                            **clean_mask_inputs
                                         )
                                 else:
+                                    # mask_inputsからpixel_valuesを削除して重複を防ぐ
+                                    clean_mask_inputs = {k: v for k, v in mask_inputs.items() 
+                                                       if k != 'pixel_values'}
+                                    
+                                    # トークナイザーを追加
+                                    clean_mask_inputs["tokenizer"] = tokenizer
+                                    
                                     # 通常の処理 - PILイメージを使用
                                     result = model.generate_masks(
                                         image=image,  # PIL Image
                                         input_ids=input_ids,
                                         attention_mask=inputs.get("attention_mask", None),
+                                        pixel_values=None,  # pixel_valuesを明示的にNoneに設定
                                         max_new_tokens=max_new_tokens,
-                                        **mask_inputs
+                                        **clean_mask_inputs
                                     )
                                     
                                 # 結果の処理

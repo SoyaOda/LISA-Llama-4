@@ -386,86 +386,97 @@ def process_mllama_pixel_values(pixel_values, target_format="sam", verbose=True)
     if pixel_values is None:
         return None
     
-    original_shape = pixel_values.shape
-    if verbose:
-        print(f"元のpixel_values形状: {original_shape}, 型: {pixel_values.dtype}")
-    
-    # Mllamaプロセッサの出力形状を処理
-    if target_format == "sam":
-        # SAMは[バッチ, チャンネル, 高さ, 幅]形式を期待
-        if len(original_shape) == 4:
-            # すでに正しい形状
-            # ピクセル値の範囲を確認
-            if verbose:
-                min_val = pixel_values.min().item()
-                max_val = pixel_values.max().item()
-                print(f"ピクセル値の範囲: [{min_val}, {max_val}]")
-            
-            return pixel_values
-        elif len(original_shape) == 6 and original_shape[0] == 1 and original_shape[1] == 1:
-            # 形状[1, 1, 4, 3, 560, 560]など - MLlamaProcessorからの出力
-            # 最初の有用な画像データを使用（最初の画像）
-            if verbose:
-                print("複雑な形状を[バッチ, チャンネル, 高さ, 幅]形式に変換します")
-            
-            # [0, 0, 0]で最初の画像を取得し、バッチ次元を追加
-            # MllamaProcessorの出力は通常 [バッチ, seq_len, img_token_pos, チャンネル, 高さ, 幅]
-            # 元のLISAコードと一致するように、最初の画像トークンを使用
-            converted = pixel_values[0, 0, 0].unsqueeze(0)
-            
-            if verbose:
-                min_val = converted.min().item()
-                max_val = converted.max().item()
-                print(f"変換後の形状: {converted.shape}, 範囲: [{min_val}, {max_val}]")
-            
-            return converted
-        elif len(original_shape) == 5:
-            # 形状[バッチ, トークン位置, チャンネル, 高さ, 幅]の場合
-            if verbose:
-                print(f"5次元形状を処理: {original_shape}")
-            
-            # 最初の画像トークンを取得
-            converted = pixel_values[0, 0].unsqueeze(0)
-            
-            if verbose:
-                min_val = converted.min().item()
-                max_val = converted.max().item()
-                print(f"変換後の形状: {converted.shape}, 範囲: [{min_val}, {max_val}]")
-            
-            return converted
-        else:
-            # その他の形状の場合は可能な限り変換を試みる
-            if verbose:
-                print(f"警告: 予期しない形状: {original_shape}, 変換を試みます")
-            
-            # バッチ次元を保持し、チャンネル、高さ、幅の次元を検出する
-            if len(original_shape) > 4:
-                # 最終の3次元をチャンネル、高さ、幅と見なす
-                try:
-                    # 最初のバッチだけ使用
-                    reshaped = pixel_values.view(1, -1, original_shape[-3], original_shape[-2], original_shape[-1])
-                    # 最初の有効な画像トークンを使用
-                    converted = reshaped[0, 0].unsqueeze(0)
-                    
-                    if verbose:
-                        min_val = converted.min().item()
-                        max_val = converted.max().item()
-                        print(f"変換後の形状: {converted.shape}, 範囲: [{min_val}, {max_val}]")
-                    
-                    return converted
-                except Exception as e:
-                    if verbose:
-                        print(f"リシェイプエラー: {e}")
-                    # ベストエフォートで変換を試みる
-                    pass
-            
-            # もし上記の変換が失敗した場合、元の形状を返す
-            if verbose:
-                print("警告: 適切な変換が見つかりませんでした。元の形状を返します")
-            return pixel_values
-    else:
+    # 例外処理を追加
+    try:
+        original_shape = pixel_values.shape
         if verbose:
-            print(f"未知のターゲット形式: {target_format}, 元の形状を返します")
+            print(f"元のpixel_values形状: {original_shape}, 型: {pixel_values.dtype}")
+        
+        # Mllamaプロセッサの出力形状を処理
+        if target_format == "sam":
+            # SAMは[バッチ, チャンネル, 高さ, 幅]形式を期待
+            if len(original_shape) == 4:
+                # すでに正しい形状
+                # ピクセル値の範囲を確認
+                if verbose:
+                    min_val = pixel_values.min().item()
+                    max_val = pixel_values.max().item()
+                    print(f"ピクセル値の範囲: [{min_val}, {max_val}]")
+                
+                return pixel_values
+            elif len(original_shape) == 6 and original_shape[0] == 1 and original_shape[1] == 1:
+                # 形状[1, 1, 4, 3, 560, 560]など - MLlamaProcessorからの出力
+                # 最初の有用な画像データを使用（最初の画像）
+                if verbose:
+                    print("複雑な形状を[バッチ, チャンネル, 高さ, 幅]形式に変換します")
+                
+                # [0, 0, 0]で最初の画像を取得し、バッチ次元を追加
+                # MllamaProcessorの出力は通常 [バッチ, seq_len, img_token_pos, チャンネル, 高さ, 幅]
+                # 元のLISAコードと一致するように、最初の画像トークンを使用
+                converted = pixel_values[0, 0, 0].unsqueeze(0)
+                
+                if verbose:
+                    min_val = converted.min().item()
+                    max_val = converted.max().item()
+                    print(f"変換後の形状: {converted.shape}, 範囲: [{min_val}, {max_val}]")
+                
+                return converted
+            elif len(original_shape) == 5:
+                # 形状[バッチ, トークン位置, チャンネル, 高さ, 幅]の場合
+                if verbose:
+                    print(f"5次元形状を処理: {original_shape}")
+                
+                # 最初の画像トークンを取得
+                converted = pixel_values[0, 0].unsqueeze(0)
+                
+                if verbose:
+                    min_val = converted.min().item()
+                    max_val = converted.max().item()
+                    print(f"変換後の形状: {converted.shape}, 範囲: [{min_val}, {max_val}]")
+                
+                return converted
+            else:
+                # その他の形状の場合は可能な限り変換を試みる
+                if verbose:
+                    print(f"警告: 予期しない形状: {original_shape}, 変換を試みます")
+                
+                # バッチ次元を保持し、チャンネル、高さ、幅の次元を検出する
+                if len(original_shape) > 4:
+                    # 最終の3次元をチャンネル、高さ、幅と見なす
+                    try:
+                        # 最初のバッチだけ使用
+                        reshaped = pixel_values.view(1, -1, original_shape[-3], original_shape[-2], original_shape[-1])
+                        # 最初の有効な画像トークンを使用
+                        converted = reshaped[0, 0].unsqueeze(0)
+                        
+                        if verbose:
+                            min_val = converted.min().item()
+                            max_val = converted.max().item()
+                            print(f"変換後の形状: {converted.shape}, 範囲: [{min_val}, {max_val}]")
+                        
+                        return converted
+                    except Exception as e:
+                        if verbose:
+                            print(f"リシェイプエラー: {e}")
+                        # ベストエフォートで変換を試みる
+                        pass
+                
+                # もし上記の変換が失敗した場合、元の形状を返す
+                if verbose:
+                    print("警告: 適切な変換が見つかりませんでした。元の形状を返します")
+                return pixel_values
+        else:
+            if verbose:
+                print(f"未知のターゲット形式: {target_format}, 元の形状を返します")
+            return pixel_values
+    
+    except Exception as e:
+        if verbose:
+            print(f"process_mllama_pixel_values処理中の例外: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # エラー時は元のテンソルを返す
         return pixel_values
 
 
@@ -503,81 +514,137 @@ def safe_mllama_to_sam(pixel_values, target_size=1024):
     import torch
     import numpy as np
     
+    # None処理
+    if pixel_values is None:
+        print("pixel_valuesがNoneです")
+        return None
+    
+    # 入力デバイスを保存
+    device = pixel_values.device
+    dtype = pixel_values.dtype
+    
+    # 詳細なデバッグ情報
+    print(f"safe_mllama_to_sam - 入力形状: {pixel_values.shape}, dtype: {dtype}, device: {device}")
+    
     # すでに適切な形状ならそのまま返す
     if is_valid_sam_input(pixel_values):
         # サイズをチェック - SAMは大きなサイズを想定
         h, w = pixel_values.shape[2], pixel_values.shape[3]
         if h >= target_size and w >= target_size:
+            print(f"すでに適切なSAM入力形式です: {pixel_values.shape}")
             return pixel_values
+        else:
+            print(f"SAM入力形式ですが、サイズが小さいです: {h}x{w} (目標: {target_size}x{target_size})")
     
     # 変換を試みる
-    converted = process_mllama_pixel_values(pixel_values, target_format="sam")
-    
-    # 変換後も無効なら例外
-    if not is_valid_sam_input(converted):
-        raise ValueError(f"有効なSAM入力に変換できません。形状: {converted.shape}")
-    
-    # サイズをチェック
-    h, w = converted.shape[2], converted.shape[3]
-    if h < target_size or w < target_size:
-        print(f"警告: 変換後の画像サイズ ({h}x{w}) がSAMの想定より小さいです。")
-        print(f"SAMはより大きなサイズ (約{target_size}x{target_size}) を想定しています。")
+    try:
+        converted = process_mllama_pixel_values(pixel_values, target_format="sam", verbose=True)
         
+        # 変換後も無効なら例外
+        if not is_valid_sam_input(converted):
+            raise ValueError(f"有効なSAM入力に変換できません。形状: {converted.shape}")
+        
+        # サイズをチェック
+        h, w = converted.shape[2], converted.shape[3]
+        if h < target_size or w < target_size:
+            print(f"警告: 変換後の画像サイズ ({h}x{w}) がSAMの想定より小さいです。")
+            print(f"SAMはより大きなサイズ (約{target_size}x{target_size}) を想定しています。")
+            
+            try:
+                # リサイズが必要な場合はNumPy経由で変換
+                from model.segment_anything.utils.transforms import ResizeLongestSide
+                
+                # 画像をNumPy配列に変換
+                img_np = converted[0].permute(1, 2, 0).cpu().numpy()
+                
+                # NumPy配列をuint8形式に変換（SAMのtransformsが期待する形式）
+                if img_np.dtype == np.float32:
+                    # [0,1]の範囲にある場合は255を掛ける
+                    if img_np.max() <= 1.0:
+                        img_np = (img_np * 255.0).astype(np.uint8)
+                    else:
+                        # すでに[0,255]の範囲にある場合はそのままuint8に変換
+                        img_np = img_np.astype(np.uint8)
+                
+                print(f"リサイズ前のNumPy配列型: {img_np.dtype}, 範囲: [{img_np.min()}, {img_np.max()}]")
+                
+                # SAMのResizeLongestSideを使用してリサイズ
+                transform = ResizeLongestSide(target_size)
+                resized_img = transform.apply_image(img_np)
+                print(f"リサイズ後の形状: {resized_img.shape}")
+                
+                # 前処理関数（SAMが期待する正規化と形状に変換）
+                import torch.nn.functional as F
+                def preprocess(x, pixel_mean=torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1),
+                            pixel_std=torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1), img_size=1024):
+                    # Normalize colors
+                    x = (x - pixel_mean) / pixel_std
+                    # Pad
+                    h, w = x.shape[-2:]
+                    padh = img_size - h
+                    padw = img_size - w
+                    x = F.pad(x, (0, padw, 0, padh))
+                    return x
+                
+                # テンソルに変換して前処理
+                image_tensor = torch.from_numpy(resized_img).permute(2, 0, 1).contiguous()
+                image_tensor = preprocess(image_tensor).unsqueeze(0).to(device)
+                print(f"前処理後のテンソル形状: {image_tensor.shape}")
+                
+                # 精度合わせ
+                if dtype == torch.float16:
+                    image_tensor = image_tensor.half()
+                elif dtype == torch.bfloat16:
+                    image_tensor = image_tensor.bfloat16()
+                
+                return image_tensor
+                
+            except Exception as e:
+                print(f"リサイズ中にエラー: {e}")
+                import traceback
+                traceback.print_exc()
+                # エラーが発生した場合は変換前のテンソルを返す
+                print("元のテンソルをそのまま返します")
+        
+        # 変換成功、元のデバイスと精度を維持
+        if converted.device != device:
+            converted = converted.to(device)
+        if converted.dtype != dtype:
+            if dtype == torch.float16:
+                converted = converted.half()
+            elif dtype == torch.bfloat16:
+                converted = converted.bfloat16()
+        
+        print(f"変換成功: 形状 {converted.shape}")
+        return converted
+        
+    except Exception as e:
+        print(f"safe_mllama_to_sam処理中のエラー: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # エラーが発生した場合のフォールバック処理
         try:
-            # リサイズが必要な場合はNumPy経由で変換
-            from model.segment_anything.utils.transforms import ResizeLongestSide
+            print("フォールバック処理: 標準的な形状に変換を試みます")
+            # 6次元テンソルの場合は最初の有用な画像を取り出す
+            if len(pixel_values.shape) == 6:
+                converted = pixel_values[0, 0, 0].unsqueeze(0)  # [1, 3, H, W]の形状に
+                print(f"フォールバック後の形状: {converted.shape}")
+                return converted
             
-            # 画像をNumPy配列に変換
-            device = converted.device
-            img_np = converted[0].permute(1, 2, 0).cpu().numpy()
+            # その他の場合は、可能な限り標準形式に近づける
+            if len(pixel_values.shape) > 4:
+                # 最初のバッチと最後の3次元を使用
+                shape = pixel_values.shape
+                converted = pixel_values.view(1, shape[-3], shape[-2], shape[-1])
+                print(f"フォールバック後の形状: {converted.shape}")
+                return converted
             
-            # NumPy配列をuint8形式に変換（SAMのtransformsが期待する形式）
-            if img_np.dtype == np.float32:
-                # [0,1]の範囲にある場合は255を掛ける
-                if img_np.max() <= 1.0:
-                    img_np = (img_np * 255.0).astype(np.uint8)
-                else:
-                    # すでに[0,255]の範囲にある場合はそのままuint8に変換
-                    img_np = img_np.astype(np.uint8)
+            # それでも変換できない場合は元のテンソルを返す
+            print("変換できないため元のテンソルを返します")
+            return pixel_values
             
-            print(f"リサイズ前のNumPy配列型: {img_np.dtype}, 範囲: [{img_np.min()}, {img_np.max()}]")
-            
-            # SAMのResizeLongestSideを使用してリサイズ
-            transform = ResizeLongestSide(target_size)
-            resized_img = transform.apply_image(img_np)
-            print(f"リサイズ後の形状: {resized_img.shape}")
-            
-            # 前処理関数（SAMが期待する正規化と形状に変換）
-            import torch.nn.functional as F
-            def preprocess(x, pixel_mean=torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1),
-                        pixel_std=torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1), img_size=1024):
-                # Normalize colors
-                x = (x - pixel_mean) / pixel_std
-                # Pad
-                h, w = x.shape[-2:]
-                padh = img_size - h
-                padw = img_size - w
-                x = F.pad(x, (0, padw, 0, padh))
-                return x
-            
-            # テンソルに変換して前処理
-            image_tensor = torch.from_numpy(resized_img).permute(2, 0, 1).contiguous()
-            image_tensor = preprocess(image_tensor).unsqueeze(0).to(device)
-            print(f"前処理後のテンソル形状: {image_tensor.shape}")
-            
-            # 精度合わせ
-            if converted.dtype == torch.float16:
-                image_tensor = image_tensor.half()
-            elif converted.dtype == torch.bfloat16:
-                image_tensor = image_tensor.bfloat16()
-            
-            return image_tensor
-            
-        except Exception as e:
-            print(f"リサイズ中にエラーが発生: {e}")
-            import traceback
-            traceback.print_exc()
-            # エラーが発生した場合は変換前のテンソルを返す
-            print("元のテンソルをそのまま返します")
-    
-    return converted 
+        except Exception as fallback_error:
+            print(f"フォールバック処理中のエラー: {fallback_error}")
+            # 最終手段として元のテンソルを返す
+            return pixel_values 
