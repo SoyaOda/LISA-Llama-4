@@ -316,6 +316,7 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                     # SEGトークンをプロンプトに追加（必要な場合）
                     if is_seg_request and "<SEG>" not in user_input and "[SEG]" not in user_input:
                         user_input += " [SEG]"
+                        print("ユーザー入力にSEGトークンを追加しました")
                     
                     # テキストにセグメンテーション指示がある場合は必ず画像トークンを追加
                     is_segment_request = "segment" in user_input.lower() or "<SEG>" in user_input or "[SEG]" in user_input
@@ -330,9 +331,11 @@ def chatting(args, model, tokenizer, device, prompt_template, model_max_length, 
                                 print("Mllamaプロセッサを使用")
                                 # セグメンテーション要求の場合は画像トークンを追加
                                 if is_segment_request and "<|image|>" not in user_input:
-                                    processed_input = "<|image|> " + user_input
+                                    # SEGトークンを[SEG]から<SEG>に変換
+                                    processed_input = "<|image|> " + user_input.replace("[SEG]", "<SEG>")
                                 else:
-                                    processed_input = user_input
+                                    # SEGトークンを[SEG]から<SEG>に変換
+                                    processed_input = user_input.replace("[SEG]", "<SEG>")
                                 
                                 # メッセージの表示
                                 print(f"入力テキスト: {processed_input}")

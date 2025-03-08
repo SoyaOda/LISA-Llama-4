@@ -294,17 +294,67 @@ class Llama32LISAForCausalLM(nn.Module):
         if tokenizer is None:
             tokenizer = AutoProcessor.from_pretrained(vision_model_id)
         
-        # <SEG>トークンをトークナイザーに追加
+        # トークナイザーのタイプを確認
+        tokenizer_dict = {}
         if hasattr(tokenizer, 'tokenizer'):
-            # Processor with internal tokenizer (MllamaProcessor)
-            if "<SEG>" not in tokenizer.tokenizer.get_vocab():
-                print("Adding <SEG> token to tokenizer vocabulary")
-                tokenizer.tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
+            print(f"MllamaProcessorタイプのトークナイザーを検出: 内部tokenizerを使用")
+            target_tokenizer = tokenizer.tokenizer
+            tokenizer_dict = target_tokenizer.get_vocab()
         else:
-            # Direct tokenizer
-            if "<SEG>" not in tokenizer.get_vocab():
-                print("Adding <SEG> token to tokenizer vocabulary")
-                tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
+            print(f"直接トークナイザーを使用")
+            target_tokenizer = tokenizer
+            tokenizer_dict = target_tokenizer.get_vocab()
+        
+        # <SEG>トークンをトークナイザーに追加
+        if "<SEG>" not in tokenizer_dict:
+            print("Adding <SEG> token to tokenizer vocabulary")
+            if hasattr(tokenizer, 'tokenizer'):
+                special_tokens = {"additional_special_tokens": ["<SEG>"]}
+                tokenizer.tokenizer.add_special_tokens(special_tokens)
+                
+                # トークナイザーのボキャブラリを再取得
+                tokenizer_dict = tokenizer.tokenizer.get_vocab()
+                if "<SEG>" in tokenizer_dict:
+                    print(f"トークナイザーに<SEG>トークンを追加しました。ID: {tokenizer_dict['<SEG>']}")
+                else:
+                    print("警告: <SEG>トークンを追加できませんでした")
+            else:
+                special_tokens = {"additional_special_tokens": ["<SEG>"]}
+                tokenizer.add_special_tokens(special_tokens)
+                
+                # トークナイザーのボキャブラリを再取得
+                tokenizer_dict = tokenizer.get_vocab()
+                if "<SEG>" in tokenizer_dict:
+                    print(f"トークナイザーに<SEG>トークンを追加しました。ID: {tokenizer_dict['<SEG>']}")
+                else:
+                    print("警告: <SEG>トークンを追加できませんでした")
+        else:
+            print(f"トークナイザーにすでに<SEG>トークンが存在します。ID: {tokenizer_dict['<SEG>']}")
+        
+        # SEGトークンが本当に追加されたか確認
+        try:
+            if hasattr(tokenizer, 'tokenizer'):
+                # 直接変換テスト
+                seg_id = tokenizer.tokenizer.convert_tokens_to_ids("<SEG>")
+                print(f"<SEG>トークンID（直接変換）: {seg_id}")
+                
+                # テスト文でのトークナイズ
+                test_text = "テスト <SEG> 文"
+                test_ids = tokenizer.tokenizer.encode(test_text)
+                test_tokens = tokenizer.tokenizer.convert_ids_to_tokens(test_ids)
+                print(f"テストトークン化: {test_tokens}")
+            else:
+                # 直接変換テスト
+                seg_id = tokenizer.convert_tokens_to_ids("<SEG>")
+                print(f"<SEG>トークンID（直接変換）: {seg_id}")
+                
+                # テスト文でのトークナイズ
+                test_text = "テスト <SEG> 文"
+                test_ids = tokenizer.encode(test_text)
+                test_tokens = tokenizer.convert_ids_to_tokens(test_ids)
+                print(f"テストトークン化: {test_tokens}")
+        except Exception as e:
+            print(f"トークン変換テスト中にエラー: {e}")
         
         # Mllamaタイプを検出
         is_mllama = 'mllama' in vision_model_id.lower() or (hasattr(tokenizer, 'image_token'))
@@ -375,18 +425,31 @@ class Llama32LISAForCausalLM(nn.Module):
                 **kwargs
             )
         
-        # SEGトークンのインデックスを取得
+        # SEGトークンのインデックスを設定
         if seg_token_idx is None:
-            if hasattr(tokenizer, 'tokenizer'):
-                seg_token_idx = tokenizer.tokenizer.get_vocab()["<SEG>"]
-            else:
-                seg_token_idx = tokenizer.get_vocab()["<SEG>"]
+            try:
+                if hasattr(tokenizer, 'tokenizer') and "<SEG>" in tokenizer.tokenizer.get_vocab():
+                    seg_token_idx = tokenizer.tokenizer.get_vocab()["<SEG>"]
+                    print(f"MllamaProcessorの内部トークナイザーから<SEG>トークンID取得: {seg_token_idx}")
+                elif not hasattr(tokenizer, 'tokenizer') and "<SEG>" in tokenizer.get_vocab():
+                    seg_token_idx = tokenizer.get_vocab()["<SEG>"]
+                    print(f"トークナイザーから<SEG>トークンID取得: {seg_token_idx}")
+                else:
+                    # ハードコードしたデフォルト値
+                    seg_token_idx = 128257
+                    print(f"警告: <SEG>トークンをボキャブラリから取得できませんでした。デフォルト値使用: {seg_token_idx}")
+            except Exception as e:
+                # エラー時はデフォルト値を使用
+                seg_token_idx = 128257
+                print(f"SEGトークンID取得中にエラー: {e}。デフォルト値を使用: {seg_token_idx}")
+        else:
+            print(f"指定された<SEG>トークンIDを使用: {seg_token_idx}")
         
         # モデルの設定を取得
         config = vision_model.config
         
         # LISA modelを初期化
-        print("Step 2: Customizing with SAM integration...")
+        print(f"初期化: SAM checkpoint={vision_pretrained}, train_mask_decoder={train_mask_decoder}, out_dim={out_dim}, seg_token_idx={seg_token_idx}")
         model = cls(
             config,
             vision_pretrained=vision_pretrained,
@@ -698,201 +761,291 @@ class Llama32LISAForCausalLM(nn.Module):
         Returns:
             生成されたテキストとマスク
         """
-        # モデルが正しいデバイスにあるか確認
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        else:
-            device = torch.device("cpu")
-
-        # デバッグ情報
-        print("LISA.generate_masksが呼び出されました")
-        print(f"モデルデバイス: {self.device}")
-        
-        # kwargs内に重複するpixel_valuesがある場合は削除
-        if 'pixel_values' in kwargs:
-            print("警告: kwargsにもpixel_valuesが存在します。引数の重複を避けるため削除します。")
-            del kwargs['pixel_values']
-        
-        # 引数のデバッグ
-        if pixel_values is not None:
-            print(f"pixel_values形状: {pixel_values.shape}, 型: {pixel_values.dtype}, デバイス: {pixel_values.device}")
-            
-            # デバイスの不一致を修正
-            if pixel_values.device != self.device:
-                print(f"デバイスの不一致を検出: pixel_values({pixel_values.device}) vs モデル({self.device})")
-                pixel_values = pixel_values.to(self.device)
-                print(f"pixel_valuesをデバイス{self.device}に移動しました")
-        
-        # kwargsからトークナイザーを取得し保存
-        if 'tokenizer' in kwargs:
-            self.tokenizer = kwargs.pop('tokenizer')
-            print("トークナイザーをモデルに保存しました")
-        
-        # その他のパラメータを表示
-        for key, value in kwargs.items():
-            if isinstance(value, torch.Tensor):
-                print(f"kwargs[{key}]の形状: {value.shape}, 型: {value.dtype}")
-        
-        # SAMが初期化されているか確認
-        if not hasattr(self, 'visual_model') or self.visual_model is None:
-            print("警告: SAMモデルが初期化されていません")
-            # generate関数を使用して通常のテキスト生成に切り替え
-            return self.generate(
-                input_ids=input_ids, 
-                attention_mask=attention_mask, 
-                **kwargs
-            )
-        
-        print(f"SAMモデルデバイス: {next(self.visual_model.parameters()).device}")
-        
-        # テキスト生成のパラメーター
-        max_new_tokens = kwargs.pop('max_new_tokens', 100)
-        
-        # 通常の生成関数を呼び出し
-        print("テキスト生成処理を開始...")
-        
-        # 生成パラメータをforward関数に渡さないようにする
-        generation_kwargs = {}
-        forward_kwargs = {}
-        
-        # 生成関数で使用される一般的なパラメータ
-        generation_params = [
-            'do_sample', 'temperature', 'top_p', 'top_k', 'repetition_penalty',
-            'max_length', 'min_length', 'length_penalty', 'no_repeat_ngram_size'
-        ]
-        
-        # kwargs内のパラメータを適切に振り分ける
-        for key, value in kwargs.items():
-            if key in generation_params:
-                generation_kwargs[key] = value
-            else:
-                forward_kwargs[key] = value
-        
-        # 生成の実行
         try:
-            output_tokens = self.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens,
-                **generation_kwargs
-            )
+            # モデルが正しいデバイスにあるか確認
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            else:
+                device = torch.device("cpu")
+    
+            # デバッグ情報
+            print("LISA.generate_masksが呼び出されました")
+            print(f"モデルデバイス: {self.device}")
             
-            print("テキスト生成完了")
-        except Exception as gen_error:
-            print(f"テキスト生成中にエラー: {gen_error}")
-            import traceback
-            traceback.print_exc()
-            # エラー時は空のテンソルを返す
-            if input_ids is not None:
-                return input_ids  # 入力をそのまま返す
-            return None  # 入力もない場合はNoneを返す
-        
-        # 生成されたテキストから<SEG>トークンのインデックスを検索
-        seg_token_indices = []
-        
-        # セグメントトークンIDを取得するための方法
-        seg_token_id = None
-        
-        # 方法1: トークナイザーからSEGトークンのIDを取得
-        if hasattr(self, 'tokenizer'):
+            # kwargs内に重複するpixel_valuesがある場合は削除
+            if 'pixel_values' in kwargs:
+                print("警告: kwargsにもpixel_valuesが存在します。引数の重複を避けるため削除します。")
+                del kwargs['pixel_values']
+            
+            # 引数のデバッグ
+            if pixel_values is not None:
+                print(f"pixel_values形状: {pixel_values.shape}, 型: {pixel_values.dtype}, デバイス: {pixel_values.device}")
+                
+                # デバイスの不一致を修正
+                if pixel_values.device != self.device:
+                    print(f"デバイスの不一致を検出: pixel_values({pixel_values.device}) vs モデル({self.device})")
+                    pixel_values = pixel_values.to(self.device)
+                    print(f"pixel_valuesをデバイス{self.device}に移動しました")
+            
+            # kwargsからトークナイザーを取得し保存
+            if 'tokenizer' in kwargs:
+                self.tokenizer = kwargs.pop('tokenizer')
+                print("トークナイザーをモデルに保存しました")
+                
+                # トークナイザーのSEGトークンIDをテスト
+                try:
+                    if hasattr(self.tokenizer, 'tokenizer'):
+                        seg_token_id = self.tokenizer.tokenizer.convert_tokens_to_ids("<SEG>")
+                        print(f"トークナイザーからSEGトークンIDを取得: {seg_token_id}")
+                        
+                        # None or -100の場合は問題
+                        if seg_token_id is None or seg_token_id == -100:
+                            print("警告: トークナイザーからSEGトークンIDを取得できませんでした。直接インデックスを使用します。")
+                            self.tokenizer._seg_token_id = self.seg_token_idx  # 直接保存
+                    else:
+                        seg_token_id = self.tokenizer.convert_tokens_to_ids("<SEG>")
+                        print(f"トークナイザーからSEGトークンIDを取得: {seg_token_id}")
+                        
+                        # None or -100の場合は問題
+                        if seg_token_id is None or seg_token_id == -100:
+                            print("警告: トークナイザーからSEGトークンIDを取得できませんでした。直接インデックスを使用します。")
+                            self.tokenizer._seg_token_id = self.seg_token_idx  # 直接保存
+                except Exception as e:
+                    print(f"SEGトークンIDテスト中にエラー: {e}")
+                    # 直接インデックスを保存
+                    self.tokenizer._seg_token_id = self.seg_token_idx
+                    print(f"SEGトークンIDをトークナイザーに直接保存: {self.seg_token_idx}")
+            
+            # その他のパラメータを表示
+            for key, value in kwargs.items():
+                if isinstance(value, torch.Tensor):
+                    print(f"kwargs[{key}]の形状: {value.shape}, 型: {value.dtype}")
+            
+            # SAMが初期化されているか確認
+            if not hasattr(self, 'visual_model') or self.visual_model is None:
+                print("警告: SAMモデルが初期化されていません")
+                # generate関数を使用して通常のテキスト生成に切り替え
+                return self.generate(
+                    input_ids=input_ids, 
+                    attention_mask=attention_mask, 
+                    **kwargs
+                )
+            
+            print(f"SAMモデルデバイス: {next(self.visual_model.parameters()).device}")
+            
+            # テキスト生成のパラメーター
+            max_new_tokens = kwargs.pop('max_new_tokens', 100)
+            
+            # 通常の生成関数を呼び出し
+            print("テキスト生成処理を開始...")
+            
+            # 生成パラメータをforward関数に渡さないようにする
+            generation_kwargs = {}
+            forward_kwargs = {}
+            
+            # 生成関数で使用される一般的なパラメータ
+            generation_params = [
+                'do_sample', 'temperature', 'top_p', 'top_k', 'repetition_penalty',
+                'max_length', 'min_length', 'length_penalty', 'no_repeat_ngram_size'
+            ]
+            
+            # kwargs内のパラメータを適切に振り分ける
+            for key, value in kwargs.items():
+                if key in generation_params:
+                    generation_kwargs[key] = value
+                else:
+                    forward_kwargs[key] = value
+            
+            # 生成の実行
             try:
-                # MllamaProcessorの場合、内部にtokenizerプロパティがある
-                if hasattr(self.tokenizer, 'tokenizer'):
-                    # tokenizer.tokenizerからconvert_tokens_to_idsを取得
-                    seg_token_id = self.tokenizer.tokenizer.convert_tokens_to_ids("[SEG]")
-                    print(f"MllamaProcessor内部tokenizer経由でSEGトークンID取得: {seg_token_id}")
-                elif hasattr(self.tokenizer, 'convert_tokens_to_ids'):
-                    # 通常のトークナイザーからconvert_tokens_to_idsを直接取得
-                    seg_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
-                    print(f"Tokenizerから直接SEGトークンID取得: {seg_token_id}")
-            except Exception as e:
-                print(f"トークナイザーからSEGトークンID取得中にエラー: {e}")
-                seg_token_id = None
-        
-        # 方法2: モデルからSEGトークンIDを取得
-        if seg_token_id is None and hasattr(self, 'seg_token_idx'):
-            seg_token_id = self.seg_token_idx
-            print(f"モデルのseg_token_idxからSEGトークンID取得: {seg_token_id}")
-        
-        # 方法3: ハードコード - セグメントトークンIDのデフォルト値
-        if seg_token_id is None:
-            seg_token_id = 128257  # <SEG>トークンのデフォルトID
-            print(f"ハードコードされたSEGトークンIDを使用: {seg_token_id}")
-        
-        # SEGトークンインデックスを検索
-        if seg_token_id is not None:
-            # 生成されたトークン列の中からSEGトークンの位置を検索
-            for i in range(output_tokens.size(0)):
-                positions = torch.where(output_tokens[i] == seg_token_id)[0].tolist()
-                seg_token_indices.append(positions)
-            
-            print(f"見つかったセグメンテーショントークンインデックス: {seg_token_indices}")
-        else:
-            # トークナイザーがない場合は空リストを使用
-            print("SEGトークンIDが見つからないため、セグメンテーションを実行できません")
-            seg_token_indices = [[]]
-        
-        # SEGトークンが見つからない場合は、通常の生成結果のみを返す
-        if not any(seg_token_indices):
-            return output_tokens
-        
-        # 画像埋め込みの取得
-        print("画像埋め込みを取得中...")
-        try:
-            image_embeddings = self.get_image_embeddings(image=image, pixel_values=pixel_values)
-            if image_embeddings is not None:
-                print(f"画像埋め込みの形状: {image_embeddings.shape}")
-            else:
-                print("警告: 画像埋め込みを取得できませんでした")
-                return output_tokens
-        except Exception as e:
-            print(f"画像埋め込み取得中にエラー: {e}")
-            import traceback
-            traceback.print_exc()
-            return output_tokens
-        
-        # マスクの生成
-        print("マスクを生成中...")
-        masks = []
-        
-        # 入力画像のサイズの取得（デフォルトはSAMの期待サイズ）
-        original_sizes = None
-        if 'original_sizes' in kwargs:
-            original_sizes = kwargs['original_sizes']
-        
-        # 各バッチサンプルに対してマスクを生成
-        try:
-            for i, indices in enumerate(seg_token_indices):
-                if not indices:  # インデックスが空の場合はスキップ
-                    continue
-                    
-                # 現在のサンプルのマスクを生成
-                sample_masks = self.get_masks(
-                    image_embeddings=image_embeddings,
-                    output_tokens=output_tokens[i:i+1],  # バッチ次元を保持
-                    seg_token_indices=indices,
-                    original_sizes=original_sizes
+                output_tokens = self.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    **generation_kwargs
                 )
                 
-                # マスクをリストに追加
-                masks.extend(sample_masks)
+                print("テキスト生成完了")
+                
+                # デバッグ: 最初の数トークンを表示
+                if hasattr(self, 'tokenizer'):
+                    try:
+                        if hasattr(self.tokenizer, 'tokenizer'):
+                            first_tokens = self.tokenizer.tokenizer.decode(output_tokens[0, :20])
+                        else:
+                            first_tokens = self.tokenizer.decode(output_tokens[0, :20])
+                        print(f"生成された最初のトークン: {first_tokens}")
+                    except Exception as e:
+                        print(f"トークンデコード中にエラー: {e}")
+            except Exception as gen_error:
+                print(f"テキスト生成中にエラー: {gen_error}")
+                import traceback
+                traceback.print_exc()
+                # エラー時は空のテンソルを返す
+                if input_ids is not None:
+                    return input_ids  # 入力をそのまま返す
+                return None  # 入力もない場合はNoneを返す
+            
+            # 生成されたテキストから<SEG>トークンのインデックスを検索
+            seg_token_indices = []
+            
+            # セグメントトークンIDを取得するための方法
+            seg_token_id = None
+            
+            # 方法1: 直接設定されたSEGトークンIDを使用
+            if hasattr(self, 'seg_token_idx'):
+                seg_token_id = self.seg_token_idx
+                print(f"モデルから直接SEGトークンIDを取得: {seg_token_id}")
+            
+            # 方法2: トークナイザーからSEGトークンのIDを取得
+            if seg_token_id is None and hasattr(self, 'tokenizer'):
+                try:
+                    # トークナイザーに直接保存された値を優先
+                    if hasattr(self.tokenizer, '_seg_token_id'):
+                        seg_token_id = self.tokenizer._seg_token_id
+                        print(f"トークナイザーから直接SEGトークンIDを取得: {seg_token_id}")
+                    # MllamaProcessorの場合、内部にtokenizerプロパティがある
+                    elif hasattr(self.tokenizer, 'tokenizer'):
+                        # tokenizer.tokenizerからconvert_tokens_to_idsを取得
+                        seg_token_id = self.tokenizer.tokenizer.convert_tokens_to_ids("<SEG>")
+                        print(f"MllamaProcessor内部tokenizer経由でSEGトークンID取得: {seg_token_id}")
+                    elif hasattr(self.tokenizer, 'convert_tokens_to_ids'):
+                        # 通常のトークナイザーからconvert_tokens_to_idsを直接取得
+                        seg_token_id = self.tokenizer.convert_tokens_to_ids("<SEG>")
+                        print(f"Tokenizerから直接SEGトークンID取得: {seg_token_id}")
+                except Exception as e:
+                    print(f"トークナイザーからSEGトークンID取得中にエラー: {e}")
+                    seg_token_id = None
+            
+            # 方法3: ハードコード - セグメントトークンIDのデフォルト値
+            if seg_token_id is None:
+                seg_token_id = 128257  # <SEG>トークンのデフォルトID
+                print(f"ハードコードされたSEGトークンIDを使用: {seg_token_id}")
+            elif seg_token_id == -100:
+                seg_token_id = 128257  # 無効な値を修正
+                print(f"無効なSEGトークンIDを検出。ハードコードされた値を使用: {seg_token_id}")
+            
+            # SEGトークンインデックスを検索
+            if seg_token_id is not None:
+                try:
+                    # 生成されたトークン列の中からSEGトークンの位置を検索
+                    for i in range(output_tokens.size(0)):
+                        positions = torch.where(output_tokens[i] == seg_token_id)[0].tolist()
+                        seg_token_indices.append(positions)
+                        print(f"サンプル{i}のSEGトークン位置: {positions}")
+                
+                    print(f"見つかったセグメンテーショントークンインデックス: {seg_token_indices}")
+                except Exception as e:
+                    print(f"SEGトークン検索中にエラー: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    seg_token_indices = [[]]
+            else:
+                # トークナイザーがない場合は空リストを使用
+                print("SEGトークンIDが見つからないため、セグメンテーションを実行できません")
+                seg_token_indices = [[]]
+            
+            # テストとして生成されたトークンを全てデコードしてSEGトークンがあるか確認
+            if not any(seg_token_indices) and hasattr(self, 'tokenizer'):
+                try:
+                    print("デコードされた全出力から手動でSEGトークンを検索...")
+                    if hasattr(self.tokenizer, 'tokenizer'):
+                        full_text = self.tokenizer.tokenizer.decode(output_tokens[0])
+                    else:
+                        full_text = self.tokenizer.decode(output_tokens[0])
+                    
+                    if "<SEG>" in full_text:
+                        print("テキスト内にSEGトークンが見つかりました。トークンインデックスを再計算中...")
+                        
+                        # 個別トークンを取得してSEGを含むインデックスを探す
+                        if hasattr(self.tokenizer, 'tokenizer'):
+                            all_tokens = [self.tokenizer.tokenizer.decode([token_id]) for token_id in output_tokens[0].tolist()]
+                        else:
+                            all_tokens = [self.tokenizer.decode([token_id]) for token_id in output_tokens[0].tolist()]
+                        
+                        # SEGを含むトークンのインデックスを検索
+                        seg_positions = [i for i, token_str in enumerate(all_tokens) if "<SEG>" in token_str]
+                        if seg_positions:
+                            print(f"SEGを含むトークン位置: {seg_positions}")
+                            seg_token_indices = [seg_positions]
+                except Exception as decode_error:
+                    print(f"手動SEGトークン検索中にエラー: {decode_error}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # SEGトークンが見つからない場合は、通常の生成結果のみを返す
+            if not any(seg_token_indices):
+                print("SEGトークンが見つかりませんでした。通常の生成結果を返します。")
+                return output_tokens
+            
+            # 画像埋め込みの取得
+            print("画像埋め込みを取得中...")
+            try:
+                image_embeddings = self.get_image_embeddings(image=image, pixel_values=pixel_values)
+                if image_embeddings is not None:
+                    print(f"画像埋め込みの形状: {image_embeddings.shape}")
+                else:
+                    print("警告: 画像埋め込みを取得できませんでした")
+                    return output_tokens
+            except Exception as e:
+                print(f"画像埋め込み取得中にエラー: {e}")
+                import traceback
+                traceback.print_exc()
+                return output_tokens
+            
+            # マスクの生成
+            print("マスクを生成中...")
+            masks = []
+            
+            # 入力画像のサイズの取得（デフォルトはSAMの期待サイズ）
+            original_sizes = None
+            if 'original_sizes' in kwargs:
+                original_sizes = kwargs['original_sizes']
+            
+            # 各バッチサンプルに対してマスクを生成
+            try:
+                for i, indices in enumerate(seg_token_indices):
+                    if not indices:  # インデックスが空の場合はスキップ
+                        continue
+                        
+                    # 現在のサンプルのマスクを生成
+                    sample_masks = self.get_masks(
+                        image_embeddings=image_embeddings,
+                        output_tokens=output_tokens[i:i+1],  # バッチ次元を保持
+                        seg_token_indices=indices,
+                        original_sizes=original_sizes
+                    )
+                    
+                    # マスクをリストに追加
+                    masks.extend(sample_masks)
+            except Exception as e:
+                print(f"マスク生成中にエラー: {e}")
+                import traceback
+                traceback.print_exc()
+                # エラー時はテキスト生成結果のみ返す
+                return output_tokens
+            
+            # マスクが生成されたかどうかを確認
+            if not masks:
+                print("マスクは生成されませんでした")
+                return output_tokens
+            
+            # 結果を返す（生成されたテキストとマスク）
+            print(f"成功: {len(masks)}個のマスクを生成しました")
+            return {
+                "output_tokens": output_tokens,
+                "masks": masks
+            }
+        
         except Exception as e:
-            print(f"マスク生成中にエラー: {e}")
+            print(f"generate_masks全体で予期せぬエラーが発生: {e}")
             import traceback
             traceback.print_exc()
-            # エラー時はテキスト生成結果のみ返す
-            return output_tokens
-        
-        # マスクが生成されたかどうかを確認
-        if not masks:
-            print("マスクは生成されませんでした")
-            return output_tokens
-        
-        # 結果を返す（生成されたテキストとマスク）
-        return {
-            "output_tokens": output_tokens,
-            "masks": masks
-        }
+            # 何らかのエラーがあった場合、入力トークンを返す
+            if input_ids is not None:
+                return input_ids
+            # 入力もない場合は空のテンソルを返す
+            return torch.tensor([[]], device=self.device, dtype=torch.long)
 
     def load_state_dict(self, state_dict, strict=False):
         """
