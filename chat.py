@@ -108,6 +108,12 @@ def parse_args(args):
         help="Temperature for sampling, 0 means greedy decoding",
     )
     parser.add_argument(
+        "--top_k",
+        type=int,
+        default=50,
+        help="Top-k sampling parameter",
+    )
+    parser.add_argument(
         "--top_p",
         type=float,
         default=0.9,
@@ -156,6 +162,11 @@ def parse_args(args):
         action="store_true",
         default=False,
         help="Enable mixed precision inference",
+    )
+    parser.add_argument(
+        "--do_sample",
+        action="store_true",
+        help="Whether to use sampling for generation",
     )
     return parser.parse_args(args)
 
