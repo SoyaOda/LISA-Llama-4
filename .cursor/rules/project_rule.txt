@@ -1,0 +1,16 @@
+最終目標：オリジナルのLISAレポジトリから./model/llava/を削除したものを改変している。LISAではLllavaとSAMの統合モデルを開発しているが、VLMをLlavaからLlama3.2 vision 11B instructに変更し、学習するプロジェクトにしたい。
+さらに、オリジナルのLISAのレポジトリコードのうち、改変が進んだ後も参照する可能性のあるファイルは./Original-LISA-Codeフォルダに保管しているので、原則元のLISAのスクリプトやコードの構成を踏襲して、Llama3.2 visionにきちんと互換されるように削除した部分に対応するコードなりスクリプトなりフォルダファイルなどを補填することでアップデートすること！
+
+現在の目標：./model/llama3_2/の中を./References/Original-LISA-Code/model/llava/の構成にならって構築する（±その他スクリプトの編集）ことで、chat.pyを実行した時に、LISA（LlavaとSAMの統合モデル）でなく、Llama3.2 vision 11b instructとSAMの統合モデルで実行できるようにする。
+
+llama3.2 vision 11b instructに関してはMllamaForConditionalGeneration, AutoProcessorを用いること。また、llama3.2 vision 11b instructのコーディング上の仕様については./References/llama-vision-code-references/llama3.2&huggingface.mdを参照して。
+
+SAMの重みは./checkpoints/sam_vit_h_4b8939.pthに存在する。
+
+./References./Official-llama-models/には公式のLlamaのコードがあり、./References./Official-llama-models/models/llama3_2には本プロジェクトで用いるllama3.2 vision instructの個別コードも存在するので、llama3.2 vision instuct周辺のコードの仕様に迷った時はこちらを参照すること！
+
+./References./Original-LISA-Codeを積極的に参照し、もし参照したうえでコード修正を行う場合はオリジナルではどのような根拠があったのかも述べること。
+
+※Llama3.2 visionの仕様で不明な部分があればリサーチするので伝えて（Hallucination対策）。
+
+※一気に大量のファイルを作らず少しずつ足してきちんとコードが走るかこまめに確かめながら安定的に実装を進めるようにすること。
