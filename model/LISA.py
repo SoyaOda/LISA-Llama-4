@@ -299,7 +299,7 @@ class Llama32LISAForCausalLM(nn.Module):
             print("Adding <SEG> token to tokenizer vocabulary")
             if hasattr(tokenizer, 'tokenizer'):
                 tokenizer.tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
-            else:
+        else:
                 tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
         
         # 量子化設定がない場合は作成
@@ -445,7 +445,7 @@ class Llama32LISAForCausalLM(nn.Module):
                 # 必要な場合のみGPUにロード
                 # 画像処理直前にGPUに移動するため、ここではCPUに保持
                 self.visual_model = self.visual_model.cpu()
-                torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
     
     @property
     def device(self):
@@ -631,15 +631,38 @@ class Llama32LISAForCausalLM(nn.Module):
         
     def generate(self, **kwargs):
         """
-        テキスト生成を行う
-        ベースモデルのgenerateメソッドを呼び出す
+        モデル生成のラッパーメソッド
         """
         if hasattr(self, 'model') and self.model is not None:
             # output_hidden_statesを指定して、隠れ状態を取得
             if 'output_hidden_states' not in kwargs:
                 kwargs['output_hidden_states'] = True
-                
-            return self.model.generate(**kwargs)
+            
+            # BFloat16データ型の問題を解決するためのパッチ
+            orig_dtype = None
+            if hasattr(self.model, 'dtype') and self.model.dtype == torch.bfloat16:
+                print("BFloat16からFloat16へデータ型を変換して生成します")
+                # モデルのデータ型を一時的にfloat16に変換
+                orig_dtype = self.model.dtype
+                # 代わりにfloat16またはfloat32を使用
+                self.model = self.model.to(torch.float16)
+            
+            try:
+                # 生成実行
+                return self.model.generate(**kwargs)
+            except RuntimeError as e:
+                if "triu_tril_cuda_template" in str(e) and "BFloat16" in str(e):
+                    print("BFloat16エラーが発生したため、float32で再試行します")
+                    # BFloat16エラーの場合、float32でもう一度試す
+                    self.model = self.model.to(torch.float32)
+                    return self.model.generate(**kwargs)
+                else:
+                    # その他のエラーは再度発生させる
+                    raise
+            finally:
+                # 元のデータ型に戻す
+                if orig_dtype is not None:
+                    self.model = self.model.to(orig_dtype)
         else:
             raise ValueError("Base model has not been initialized yet!")
         
@@ -704,8 +727,8 @@ class Llama32LISAForCausalLM(nn.Module):
                 if hidden_states is None:
                     # 入力IDを使用して推論実行（隠れ状態を取得するため）
                     outputs = self.model(
-                        input_ids=input_ids,
-                        output_hidden_states=True,
+                input_ids=input_ids,
+                output_hidden_states=True,
                         return_dict=True
                     )
                     hidden_states = outputs.hidden_states

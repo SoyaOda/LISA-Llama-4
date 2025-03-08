@@ -65,9 +65,9 @@ def parse_args(args):
     parser.add_argument(
         '--precision',
         type=str,
-        default='bf16',
+        default='fp16',
         choices=['fp32', 'bf16', 'fp16'],
-        help='Precision for model weights'
+        help='Precision for model weights (fp16推奨)'
     )
     parser.add_argument(
         "--vis_save_path",
@@ -466,10 +466,13 @@ def main(args):
     # モデル精度の設定
     if args.precision == "fp32":
         dtype = torch.float32
+        print("警告: fp32精度は多くのGPUメモリを使用します")
     elif args.precision == "bf16":
         dtype = torch.bfloat16
+        print("警告: bf16精度はtorch.triuと互換性がない場合があります。エラーが発生した場合はfp16を使用してください。")
     elif args.precision == "fp16":
         dtype = torch.float16
+        print("fp16精度を使用します（推奨設定）")
     else:
         raise ValueError(f"Unsupported precision: {args.precision}")
     
