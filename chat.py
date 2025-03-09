@@ -288,429 +288,352 @@ def create_segment_prompt(text):
         return f"{text}. {SEG_TOKEN}"
 
 def chatting(args, model, tokenizer, device, prompt_template, model_max_length, max_new_tokens, sep, stop_str):
-    """チャットインターフェース関数"""
-    # メモリ使用量に基づいた画像サイズの選択
-    if args.low_memory:
-        max_img_size = 256
-        print(f"低メモリモード: 画像処理の最大サイズ: {max_img_size}x{max_img_size}")
-    elif args.very_low_memory:
-        max_img_size = 384
-        print(f"超低メモリモード: 画像処理の最大サイズ: {max_img_size}x{max_img_size}")
+    """
+    チャットループを実行する関数
+    """
+    # 会話履歴の初期化
+    if args.conv_type == "llama3_2":
+        from model.llama3_2.conversation import get_default_conv_template
+        conv = get_default_conv_template()
     else:
-        max_img_size = 768
-        print(f"通常モード: 画像処理の最大サイズ: {max_img_size}x{max_img_size}")
-
-    # 画像ファイルパスを検索するための正規表現パターン
-    img_path_pattern = re.compile(r'(https?://\S+\.(?:jpg|jpeg|png|gif|bmp|webp)|\S+\.(?:jpg|jpeg|png|gif|bmp|webp))')
-
-    try:
-        # 連続チャットループ
-        while True:
+        from model.llava.conversation import conv_templates
+        conv = conv_templates["llava_v1"].copy()
+    
+    # メモリ使用量を表示
+    if torch.cuda.is_available():
+        print(f"チャット開始時のGPUメモリ使用量: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
+        torch.cuda.empty_cache()
+    
+    # 画像サイズの設定
+    # メモリ使用量を削減するために小さいサイズを使用
+    if args.very_low_memory:
+        max_image_size = 256  # 超低メモリモードでは256x256に制限
+    elif args.low_memory:
+        max_image_size = 384  # 低メモリモードでは384x384に制限
+    else:
+        max_image_size = 512  # 通常モードでは512x512に制限
+    
+    print(f"画像サイズを{max_image_size}x{max_image_size}に制限します")
+    
+    # チャットループ
+    while True:
+        try:
             # ユーザー入力の取得
-            user_input = input("\nユーザー: ")
-            if user_input.lower() in ["exit", "quit", "q", "終了"]:
-                print("チャットを終了します。")
+            prompt = input("\n- Please input your prompt: ")
+            if prompt == "exit":
                 break
-
-            # SEGトークンの処理
-            has_seg_request = "<SEG>" in user_input or "[SEG]" in user_input or "segment" in user_input.lower()
-            if has_seg_request:
-                print("セグメンテーションモードで実行中...")
-                # 必要に応じてSEGトークンを追加
-                if "<SEG>" not in user_input and "[SEG]" not in user_input:
-                    user_input = create_segment_prompt(user_input)
-                print(f"ユーザー入力にSEGトークンを追加しました: {user_input}")
-
-            # 画像パスの検出と処理
-            image = None
-            img_path_match = img_path_pattern.search(user_input)
             
-            if img_path_match:
-                # 検出された画像パスを処理
-                img_path = img_path_match.group(0)
-                user_input = user_input.replace(img_path, "").strip()
+            # SEGトークンの処理
+            prompt = create_segment_prompt(prompt)
+            
+            # 画像パスの取得
+            image_path = input("- Please input the image path: ")
+            if not os.path.exists(image_path):
+                print(f"画像が見つかりません: {image_path}")
+                continue
+            
+            # 画像の読み込みと前処理
+            try:
+                # PILで画像を読み込む
+                image = Image.open(image_path).convert('RGB')
                 
-                try:
-                    if os.path.exists(img_path):
-                        print(f"画像を読み込み中: {img_path}")
-                        image = Image.open(img_path).convert('RGB')
-                    else:
-                        print(f"画像が見つかりません: {img_path}")
-                        continue
-                except Exception as img_err:
-                    print(f"画像の読み込みに失敗しました: {img_err}")
-                    continue
-            else:
-                # 画像パスが指定されていない場合は入力を促す
-                img_path = input("画像ファイルのパスを入力してください: ")
-                if img_path and os.path.exists(img_path):
-                    try:
-                        print(f"画像を読み込み中: {img_path}")
-                        image = Image.open(img_path).convert('RGB')
-                    except Exception as img_err:
-                        print(f"画像の読み込みに失敗しました: {img_err}")
-                        continue
-                else:
-                    print("有効な画像パスが指定されていません。テキストのみで続行します。")
-
-            # 画像のリサイズ処理（アスペクト比を保持）
-            if image:
+                # メモリ使用量削減のために画像をリサイズ
+                # アスペクト比を維持しながら最大サイズを制限
                 width, height = image.size
-                if max(width, height) > max_img_size:
-                    ratio = max_img_size / max(width, height)
-                    new_width = int(width * ratio)
-                    new_height = int(height * ratio)
+                if max(width, height) > max_image_size:
+                    # アスペクト比を維持しながらリサイズ
+                    if width > height:
+                        new_width = max_image_size
+                        new_height = int(height * (max_image_size / width))
+                    else:
+                        new_height = max_image_size
+                        new_width = int(width * (max_image_size / height))
+                    
+                    print(f"画像をリサイズします: {width}x{height} -> {new_width}x{new_height}")
                     image = image.resize((new_width, new_height), Image.LANCZOS)
-                    print(f"画像をリサイズしました: {width}x{height} -> {new_width}x{new_height}")
-
-            # モデルタイプに応じた処理
-            if args.version.startswith("meta-llama/Llama-3.2"):
-                # Llama 3.2 Visionモデル用の処理
+                
+                # メモリ使用量を表示
+                if torch.cuda.is_available():
+                    print(f"画像読み込み後のGPUメモリ使用量: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
+                
+                # 画像処理
                 try:
-                    # ユーザーメッセージの作成
+                    # MllamaProcessorを使用して画像を処理
+                    processed_images = process_images(image, tokenizer)
+                    
+                    # メッセージの作成
                     messages = [
                         {"role": "user", "content": [
-                            {"type": "image"} if image else None,
-                            {"type": "text", "text": user_input}
+                            {"type": "image"},
+                            {"type": "text", "text": prompt}
                         ]}
                     ]
                     
-                    # None要素を除去
-                    messages[0]["content"] = [item for item in messages[0]["content"] if item is not None]
-                    
-                    # チャットテンプレートを適用
+                    # チャットテンプレートの適用
                     input_text = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
                     
-                    # 入力の作成
-                    try:
-                        inputs = tokenizer(
-                            image,
-                            input_text,
-                            add_special_tokens=False,
-                            return_tensors="pt"
-                        ).to(device)
-                    except Exception as processor_error:
-                        print(f"画像処理エラー: {processor_error}")
-                        if "Invalid input type" in str(processor_error):
-                            print("画像形式のエラー: 画像処理方法を変更します")
-                            # 代替処理法：画像を先に変換してからテキストと組み合わせる
-                            from transformers import CLIPImageProcessor
-                            clip_processor = CLIPImageProcessor()
-                            pixel_values = clip_processor(images=image, return_tensors="pt").pixel_values.to(device)
-                            
-                            # テキストのみの処理
-                            text_inputs = tokenizer.tokenizer(
-                                input_text, 
-                                add_special_tokens=False, 
-                                return_tensors="pt"
-                            ).to(device)
-                            
-                            # 手動で入力を結合
-                            inputs = {
-                                "input_ids": text_inputs.input_ids,
-                                "attention_mask": text_inputs.attention_mask,
-                                "pixel_values": pixel_values
-                            }
-                        else:
-                            raise
-
+                    # 入力の処理
+                    inputs = tokenizer(
+                        text=input_text,
+                        images=processed_images,
+                        return_tensors="pt",
+                        padding=True
+                    )
+                    
+                    # デバイスに移動
+                    inputs = {k: v.to(device) for k, v in inputs.items()}
+                    
+                    # メモリ使用量を表示
+                    if torch.cuda.is_available():
+                        print(f"入力処理後のGPUメモリ使用量: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
+                        torch.cuda.empty_cache()
+                    
+                    # マスク生成のための入力を準備
+                    mask_inputs = {
+                        "tokenizer": tokenizer,
+                        "image": image,  # オリジナルサイズの画像
+                    }
+                    
                     # 生成パラメータの設定
-                    generation_config = {
+                    gen_kwargs = {
                         "max_new_tokens": max_new_tokens,
                         "do_sample": args.do_sample,
                         "temperature": args.temperature if args.temperature > 0 else 0.7,
                         "top_p": args.top_p if args.top_p > 0 else 0.9,
-                        "repetition_penalty": args.repetition_penalty if args.repetition_penalty > 0 else 1.1,
                     }
                     
-                    # 生成を実行
-                    print("応答を生成中...")
-                    if has_seg_request:
-                        # セグメンテーション要求の場合
+                    # マスク生成の実行
+                    print("マスク生成を開始します...")
+                    with torch.no_grad():  # メモリ使用量削減のためgrad不要モードで実行
                         outputs = model.generate_masks(
-                            image=image,
-                            **inputs,
-                            **generation_config,
-                            tokenizer=tokenizer
+                            input_ids=inputs["input_ids"],
+                            attention_mask=inputs["attention_mask"],
+                            pixel_values=inputs.get("pixel_values"),
+                            **mask_inputs,
+                            **gen_kwargs
                         )
+                    
+                    # メモリ使用量を表示
+                    if torch.cuda.is_available():
+                        print(f"生成後のGPUメモリ使用量: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
+                        torch.cuda.empty_cache()
+                    
+                    # 出力の処理
+                    if "error" in outputs:
+                        print(f"エラーが発生しました: {outputs['error']}")
+                        continue
+                    
+                    # 生成されたテキストの表示
+                    generated_text = outputs.get("generated_text", "")
+                    if generated_text:
+                        print("\n" + "="*50)
+                        print("生成されたテキスト:")
+                        print(generated_text)
+                        print("="*50)
+                    
+                    # マスクの処理と保存
+                    masks = outputs.get("masks", [])
+                    if masks:
+                        print(f"\n{len(masks)}個のマスクが生成されました")
                         
-                        # 結果の処理（outputs は辞書形式）
-                        if isinstance(outputs, dict) and 'masks' in outputs and outputs['masks']:
-                            # マスクを画像として保存
-                            print("セグメンテーション完了！マスクを保存中...")
-                            masks = outputs['masks']
-                            
-                            # 出力フォルダの確認
-                            os.makedirs(args.vis_save_path, exist_ok=True)
-                            base_name = os.path.basename(img_path).split('.')[0]
-                            
-                            # マスクの保存とビジュアライズ
-                            for i, mask in enumerate(masks):
-                                save_path = os.path.join(args.vis_save_path, f"{base_name}_mask_{i}.png")
-                                # マスクをPIL画像として保存
+                        # マスクの可視化と保存
+                        for i, mask in enumerate(masks):
+                            try:
+                                # マスクをCPUに移動
                                 mask_np = mask.cpu().numpy() if isinstance(mask, torch.Tensor) else mask
-                                mask_img = Image.fromarray((mask_np * 255).astype(np.uint8))
-                                mask_img.save(save_path)
                                 
-                                # マスクを元画像に適用して可視化
-                                vis_path = os.path.join(args.vis_save_path, f"{base_name}_masked_img_{i}.jpg")
-                                img_np = np.array(image)
-                                mask_np = mask.cpu().numpy() if isinstance(mask, torch.Tensor) else mask
-                                masked_img = img_np.copy()
-                                # 半透明のオーバーレイを作成
-                                overlay = np.zeros_like(img_np)
-                                overlay[mask_np > 0.5] = [0, 255, 0]  # 緑色でマスクを強調
-                                masked_img = cv2.addWeighted(masked_img, 0.7, overlay, 0.3, 0)
-                                cv2.imwrite(vis_path, cv2.cvtColor(masked_img, cv2.COLOR_RGB2BGR))
-                                print(f"マスク{i+1}を保存しました: {save_path}, {vis_path}")
-                            
-                            # テキスト出力の処理
-                            text_output = outputs.get('text', "セグメンテーション完了")
-                            print(f"\nAssistant: {text_output}")
-                        elif isinstance(outputs, dict) and 'error' in outputs:
-                            # エラーメッセージの表示
-                            print(f"\nAssistant: セグメンテーション中にエラーが発生しました: {outputs['error']}")
-                        else:
-                            print("\nAssistant: セグメンテーションの結果が得られませんでした。")
+                                # 画像にマスクを適用
+                                image_np = np.array(image)
+                                masked_img = image_np.copy()
+                                
+                                # マスクのサイズが画像と異なる場合はリサイズ
+                                if mask_np.shape[:2] != image_np.shape[:2]:
+                                    from skimage.transform import resize
+                                    mask_np = resize(mask_np, image_np.shape[:2], order=0, preserve_range=True)
+                                
+                                # マスクを適用（半透明の色付きオーバーレイ）
+                                mask_color = np.array([30, 144, 255])  # 青色
+                                masked_img[mask_np > 0.5] = masked_img[mask_np > 0.5] * 0.7 + mask_color * 0.3
+                                
+                                # 保存
+                                output_path = os.path.join(
+                                    args.vis_save_path, 
+                                    f"{os.path.basename(image_path).split('.')[0]}_masked_img_{i}.jpg"
+                                )
+                                Image.fromarray(masked_img.astype(np.uint8)).save(output_path)
+                                print(f"マスク付き画像を保存しました: {output_path}")
+                            except Exception as mask_error:
+                                print(f"マスク処理中にエラー: {mask_error}")
                     else:
-                        # 通常のテキスト生成
-                        output_ids = model.generate(**inputs, **generation_config)
-                        
-                        # 入力長を取得して出力から除外
-                        input_length = inputs["input_ids"].shape[1]
-                        generated_text = tokenizer.decode(output_ids[0][input_length:], skip_special_tokens=True)
-                        
-                        print(f"\nAssistant: {generated_text}")
-                
-                except Exception as e:
-                    print(f"チャット処理中に予期せぬエラーが発生: {e}")
+                        print("マスクは生成されませんでした")
+                    
+                except Exception as proc_error:
+                    print(f"画像処理中にエラー: {proc_error}")
                     import traceback
                     traceback.print_exc()
             
-            else:
-                # 従来のLISAモデル用の処理（既存コードを再利用）
-                print("従来のLISAモデルは現在サポートされていません。")
-                # ここに従来のLISAモデル用の処理コードを追加
-
-    except KeyboardInterrupt:
-        print("\nチャットを終了しました。")
-    except Exception as e:
-        print(f"チャット実行中にエラーが発生: {e}")
-        import traceback
-        traceback.print_exc()
+            except Exception as img_error:
+                print(f"画像読み込み中にエラー: {img_error}")
+        
+        except KeyboardInterrupt:
+            print("\nチャットを終了します")
+            break
+        
+        except Exception as e:
+            print(f"エラーが発生しました: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # メモリ使用量を表示
+    if torch.cuda.is_available():
+        print(f"チャット終了時のGPUメモリ使用量: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
+        torch.cuda.empty_cache()
 
 
 def main(args):
     # Hugging Face認証
-    authenticate_huggingface()
+    if args.authenticate:
+        authenticate_huggingface()
     
-    # 出力ディレクトリの作成
-    if not os.path.exists(args.vis_save_path):
-        os.makedirs(args.vis_save_path)
-
-    # モデルの読み込み
-    print(f"Loading Llama3.2 Vision + SAM model: {args.version}")
+    # 一時フォルダの設定
+    offload_folder = None
+    if args.offload_folder:
+        offload_folder = args.offload_folder
+        os.makedirs(offload_folder, exist_ok=True)
+        print(f"オフロードフォルダを作成しました: {offload_folder}")
     
-    # モデル精度の設定
-    if args.precision == "fp32":
-        dtype = torch.float32
-        print("警告: fp32精度は多くのGPUメモリを使用します")
-    elif args.precision == "bf16":
-        dtype = torch.bfloat16
-        print("警告: bf16精度はtorch.triuと互換性がない場合があります。エラーが発生した場合はfp16を使用してください。")
-    elif args.precision == "fp16":
-        dtype = torch.float16
-        print("fp16精度を使用します（推奨設定）")
-    else:
-        raise ValueError(f"Unsupported precision: {args.precision}")
-    
-    # 4bit/8bit量子化をスキップするためのチェック
-    if args.load_in_4bit or args.load_in_8bit:
-        print("警告: bitsandbytesライブラリのセットアップに問題があるため、4bit/8bit量子化をスキップします")
-        print("代わりにGPUメモリ最適化を実施します")
-        args.load_in_4bit = False
-        args.load_in_8bit = False
-        args.very_low_memory = True
-    
-    # メモリ設定の最適化
+    # メモリ使用量を表示
     if torch.cuda.is_available():
-        # GPUメモリの断片化を防ぐための設定
-        torch.cuda.empty_cache()
-        import gc
-        gc.collect()
-        
-        # 低メモリモードではCPU↔GPU間でのOffloadを積極的に行う
-        if args.very_low_memory:
-            print("超低メモリモードを有効化します")
-            # 一度に保持する最大のバッチサイズを小さく設定
-            torch.cuda.set_per_process_memory_fraction(0.8)  # GPUメモリの80%まで使用
-            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+        print(f"初期GPUメモリ使用量: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
+        print(f"利用可能なGPUメモリ: {torch.cuda.get_device_properties(0).total_memory/1024**2:.2f} MB")
+    
+    # メモリ使用量を削減するための設定
+    # very_low_memoryモードを強制的に有効化
+    args.very_low_memory = True
+    print("メモリ使用量削減のためにvery_low_memoryモードを有効化しました")
+    
+    # 最大画像サイズをさらに小さく設定
+    max_image_size = 256  # very_low_memoryモードでの最大サイズ
+    print(f"画像サイズを{max_image_size}x{max_image_size}に制限します")
     
     try:
-        # トークナイザーをロード
-        tokenizer = AutoProcessor.from_pretrained(args.version)
-        print(f"トークナイザータイプ: {type(tokenizer)}")
+        # モデル設定
+        print(f"モデルをロード中: {args.version}")
         
-        # トークナイザーが持つメソッドとプロパティを表示
-        print("Tokenizer functions:", [method for method in dir(tokenizer) if not method.startswith('_') and callable(getattr(tokenizer, method))])
+        # 量子化設定
+        quantization_config = None
+        if args.load_in_8bit:
+            print("8ビット量子化を使用します")
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_threshold=6.0
+            )
+        elif args.load_in_4bit:
+            print("4ビット量子化を使用します")
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4"
+            )
         
-        # トークナイザーがチャットテンプレートメソッドを持つか確認
-        if hasattr(tokenizer, 'apply_chat_template'):
-            print("このトークナイザーはapply_chat_templateメソッドを持っています")
+        # デバイス設定
+        device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
+        print(f"使用デバイス: {device}")
         
-        # <SEG>トークンをトークナイザーに追加
-        # MllamaProcessorの場合、内部tokenizer属性を使用
-        if hasattr(tokenizer, 'tokenizer'):
-            print("トークナイザーは内部tokenizer属性を持っています")
-            if "<SEG>" not in tokenizer.tokenizer.get_vocab():
-                print("Adding <SEG> token to tokenizer vocabulary")
-                tokenizer.tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
+        # データ型設定
+        torch_dtype = torch.float32
+        if args.precision == "bf16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            torch_dtype = torch.bfloat16
+            print("BFloat16精度を使用します")
+        elif args.precision == "fp16":
+            torch_dtype = torch.float16
+            print("Float16精度を使用します")
         else:
-            # 通常のトークナイザーの場合
-            print("トークナイザーは直接アクセス可能です")
-            if "<SEG>" not in tokenizer.get_vocab():
-                print("Adding <SEG> token to tokenizer vocabulary")
-                tokenizer.add_special_tokens({"additional_special_tokens": ["<SEG>"]})
+            print("Float32精度を使用します")
         
-        # from_vision_modelメソッドを使用してモデルとトークナイザーを同時に取得
-        # メモリ管理を最適化
-        print("メモリ効率の良いモデルロードを実行します...")
-        device_map = "auto"  # Hugging Faceにデバイスマッピングを任せる
+        # トークナイザーのロード
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.version,
+            trust_remote_code=args.trust_remote_code
+        )
         
-        # 超低メモリモードでの追加対策
-        offload_folder = None
-        if args.very_low_memory:
-            print("CPUオフロードを有効化します")
-            # モデルを部分的にディスクにオフロードするための一時フォルダを設定
-            import tempfile
-            offload_folder = tempfile.mkdtemp()
-            print(f"一時オフロードフォルダ: {offload_folder}")
+        # SAMチェックポイントの設定
+        sam_checkpoint = args.sam_checkpoint
+        if not sam_checkpoint or not os.path.exists(sam_checkpoint):
+            print(f"警告: SAMチェックポイントが見つかりません: {sam_checkpoint}")
+            print("デフォルトのSAMモデルを使用します")
+            sam_checkpoint = None
         
-        try:
-            model, tokenizer = Llama32LISAForCausalLM.from_vision_model(
-                vision_model_id=args.version,
-                vision_pretrained=args.sam_version,
-                train_mask_decoder=args.train_mask_decoder,
-                tokenizer=tokenizer,
-                torch_dtype=dtype,
-                device_map=device_map,  # 自動的にGPU/CPU間でレイヤーを配置
-                ignore_mismatched_sizes=args.ignore_mismatched_sizes,
-                load_in_8bit=False,  # BNBエラーのため無効化
-                load_in_4bit=False,   # BNBエラーのため無効化
-                offload_folder=offload_folder if args.very_low_memory else None,
-            )
-        except Exception as e:
-            print(f"モデルロード中にエラーが発生しました: {e}")
-            print("代替方法でモデルをロードします...")
-            
-            # 代替として、より単純な方法でロード
-            model, tokenizer = Llama32LISAForCausalLM.from_vision_model(
-                vision_model_id=args.version,
-                vision_pretrained=args.sam_version,
-                train_mask_decoder=args.train_mask_decoder,
-                tokenizer=tokenizer,
-                torch_dtype=dtype,
-                ignore_mismatched_sizes=args.ignore_mismatched_sizes,
-            )
-            
-            # モデルをCPUに一部移動して手動でメモリ管理
-            if args.very_low_memory and hasattr(model, 'model') and model.model is not None:
-                print("手動でモデルレイヤーをCPUに移動します...")
-                # モデルの一部のレイヤーを手動でCPUに移動
-                for i in range(20, 32):  # 後半のレイヤーをCPUに
-                    try:
-                        layer_name = f"model.layers.{i}"
-                        if hasattr(model.model, "layers") and i < len(model.model.layers):
-                            layer = model.model.layers[i]
-                            layer.to("cpu")
-                            print(f"レイヤー {layer_name} をCPUに移動しました")
-                    except Exception as layer_e:
-                        print(f"レイヤー移動中にエラー: {layer_e}")
+        # モデルのロード
+        print("モデルをロード中...")
         
-        # モデルをデバイスに配置
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # テスト用のシンプルな例で動作確認
-        try:
-            # Mllama処理テスト
-            from model.llama3_2.mm_utils import run_test_mllama_processor, print_debug_info_for_mllama
-            
-            # プロセッサとモデルの詳細情報を出力
-            print_debug_info_for_mllama(tokenizer, model)
-            
-            # テスト画像パスがあれば読み込む
-            test_image_path = args.test_image if hasattr(args, 'test_image') and args.test_image else None
-            
-            if test_image_path and os.path.exists(test_image_path):
-                print(f"テスト画像 {test_image_path} を使って処理テスト")
-                from PIL import Image
-                test_image = Image.open(test_image_path).convert('RGB')
-                
-                # プロセッサの動作テスト
-                run_test_mllama_processor(tokenizer, model_name=args.version)
-                
-                # セグメンテーションテスト
-                if args.run_segment_test and hasattr(model, 'generate_masks'):
-                    print("\n===== セグメンテーションテスト =====")
-                    try:
-                        # 最もシンプルな形式でテスト
-                        test_prompt = "Please segment all the persons in this image. <SEG>"
-                        # 画像第一引数、テキスト第二引数
-                        test_inputs = tokenizer(test_image, test_prompt, return_tensors="pt").to(device)
-                        
-                        # test_inputsから冗長なキーを削除
-                        test_mask_inputs = {k: v for k, v in test_inputs.items() 
-                                          if k not in ["input_ids", "attention_mask"]}
-                        
-                        # セグメンテーション実行
-                        with torch.no_grad():
-                            try:
-                                # オリジナルのLISAアプローチで画像を処理
-                                from model.segment_anything.utils.transforms import ResizeLongestSide
-                                print("SAM用の画像前処理を実行中...")
-                                
-                                # テスト実行
-                                generation = model.generate_masks(
-                                    image=test_image,  # SAM内部で適切に処理されるように修正済み
-                                    input_ids=test_inputs.input_ids,
-                                    attention_mask=test_inputs.attention_mask,
-                                    max_new_tokens=256,
-                                    **test_mask_inputs
-                                )
-                            except Exception as e:
-                                print(f"SAM処理中にエラー: {e}")
-                                print("通常の生成にフォールバック")
-                                # 例外発生時は通常の生成にフォールバック
-                                generation = model.generate(
-                                    **test_inputs,
-                                    max_new_tokens=256
-                                )
-                                
-                            # 生成されたテキストをデコード
-                            output = tokenizer.decode(generation[0][test_inputs.input_ids.shape[1]:], skip_special_tokens=True)
-                            print(f"セグメンテーション出力: {output[:100]}...")
-                            print("セグメンテーションテスト成功!")
-                    except Exception as segment_e:
-                        print(f"セグメンテーションテスト中にエラー: {segment_e}")
-                        import traceback
-                        traceback.print_exc()
-            
-        except Exception as test_exc:
-            print(f"テスト中にエラー発生: {test_exc}")
-        
-        # チャットループの設定
-        prompt_template = get_prompt_template()
-        # model_max_lengthを適切に取得
-        model_max_length = tokenizer.tokenizer.model_max_length if hasattr(tokenizer, 'tokenizer') else tokenizer.model_max_length
-        max_new_tokens = args.max_new_tokens
-        sep = "[/INST]"
-        stop_str = "</s>"
-        
-        # メモリの状態を報告
+        # メモリ使用量を監視
         if torch.cuda.is_available():
-            print(f"GPUメモリ使用状況: {torch.cuda.memory_allocated() / 1024**2:.2f} MB / {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
+            torch.cuda.empty_cache()
+            print(f"モデルロード前のGPUメモリ使用量: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
         
-        # チャットモードの起動
+        # モデルをロード
+        model = Llama32LISAForCausalLM.from_vision_model(
+            args.version,
+            vision_pretrained=sam_checkpoint,
+            train_mask_decoder=args.train_mask_decoder,
+            tokenizer=tokenizer,
+            torch_dtype=torch_dtype,
+            device_map="auto" if device == "cuda" else None,
+            quantization_config=quantization_config,
+            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+            load_in_8bit=args.load_in_8bit,
+            load_in_4bit=args.load_in_4bit,
+            offload_folder=offload_folder
+        )
+        
+        # メモリ使用量を表示
+        if torch.cuda.is_available():
+            print(f"モデルロード後のGPUメモリ使用量: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
+        
+        # モデルを評価モードに設定
+        model.eval()
+        
+        # 会話設定
+        if args.conv_type == "llava_v1":
+            from model.llava.conversation import conv_templates
+            conv_mode = "llava_v1"
+        elif args.conv_type == "llama3_2":
+            from model.llama3_2.conversation import get_default_conv_template
+            conv_mode = "llama3_2"
+        else:
+            raise ValueError(f"未知の会話タイプ: {args.conv_type}")
+        
+        # プロンプトテンプレートの取得
+        prompt_template = get_prompt_template()
+        
+        # モデルの最大長とトークン設定
+        model_max_length = None
+        if hasattr(model, 'config') and hasattr(model.config, 'max_position_embeddings'):
+            model_max_length = model.config.max_position_embeddings
+        elif hasattr(tokenizer, 'model_max_length'):
+            model_max_length = tokenizer.model_max_length
+        
+        # 最大長が設定されていない場合はデフォルト値を使用
+        if not model_max_length or model_max_length > 8192:
+            model_max_length = 4096
+            print(f"モデルの最大長をデフォルト値に設定: {model_max_length}")
+        
+        # 最大新トークン数の設定
+        max_new_tokens = min(args.max_new_tokens, 1024)  # メモリ使用量削減のため制限
+        print(f"最大新トークン数: {max_new_tokens}")
+        
+        # 区切り文字と停止文字列の設定
+        sep = "\n"
+        stop_str = None
+        
+        # チャット開始
+        print("\n" + "="*50)
+        print(f"チャットを開始します。終了するには 'exit' と入力してください。")
+        print("="*50 + "\n")
+        
+        # チャット関数を呼び出し
         chatting(args, model, tokenizer, device, prompt_template, model_max_length, max_new_tokens, sep, stop_str)
     
     except Exception as main_error:

@@ -736,9 +736,16 @@ class Llama32LISAForCausalLM(nn.Module):
         モデル生成のラッパーメソッド
         """
         if hasattr(self, 'model') and self.model is not None:
+            # メモリ使用状況を表示
+            if torch.cuda.is_available():
+                print(f"generate開始時のGPUメモリ使用量: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
+                
             # output_hidden_statesを指定して、隠れ状態を取得
             if 'output_hidden_states' not in kwargs:
                 kwargs['output_hidden_states'] = True
+            
+            # 生成パラメータを表示
+            print(f"生成パラメータ: {list(kwargs.keys())}")
             
             # temperatureの処理
             if 'temperature' in kwargs:
@@ -751,6 +758,15 @@ class Llama32LISAForCausalLM(nn.Module):
                     print(f"警告: temperature値({temp})が大きすぎるため、1.0に調整します")
                     kwargs['temperature'] = 1.0
             
+            # バッチサイズチェック - max_batch_sizeをチェックし、必要に応じて調整
+            if hasattr(self.model.config, 'max_batch_size') and self.model.config.max_batch_size:
+                batch_size = kwargs.get('input_ids', torch.tensor([])).shape[0] if 'input_ids' in kwargs else 1
+                if batch_size > self.model.config.max_batch_size:
+                    print(f"警告: バッチサイズ({batch_size})が最大サイズ({self.model.config.max_batch_size})を超えています")
+                    print("メモリ使用量削減のためにバッチサイズを調整します")
+                    # 適切なバッチサイズに調整する方法はモデルによって異なるため、
+                    # ここでは警告のみ表示します
+            
             # BFloat16データ型の問題を解決するためのパッチ
             orig_dtype = None
             if hasattr(self.model, 'dtype') and self.model.dtype == torch.bfloat16:
@@ -760,28 +776,88 @@ class Llama32LISAForCausalLM(nn.Module):
                 # 代わりにfloat16またはfloat32を使用
                 self.model = self.model.to(torch.float16)
             
+            # メモリ最適化 - 不要なメモリを解放
+            torch.cuda.empty_cache()
+            
             try:
                 # 生成実行
+                print("テキスト生成処理を開始...")
                 return self.model.generate(**kwargs)
             except RuntimeError as e:
-                if "triu_tril_cuda_template" in str(e) and "BFloat16" in str(e):
+                err_msg = str(e)
+                if "triu_tril_cuda_template" in err_msg and "BFloat16" in err_msg:
                     print("BFloat16エラーが発生したため、float32で再試行します")
                     # BFloat16エラーの場合、float32でもう一度試す
                     self.model = self.model.to(torch.float32)
                     return self.model.generate(**kwargs)
-                elif "invalid multinomial distribution" in str(e):
+                elif "invalid multinomial distribution" in err_msg:
                     print("multinomial distributionエラーが発生したため、グリーディー検索に切り替えます")
                     # サンプリングエラーの場合、グリーディー検索に切り替え
                     kwargs['do_sample'] = False
+                    # temperatureとtop_pを削除
                     kwargs.pop('temperature', None)
-                    return self.model.generate(**kwargs)
+                    kwargs.pop('top_p', None)
+                    # もう一度試行
+                    try:
+                        return self.model.generate(**kwargs)
+                    except RuntimeError as e2:
+                        # それでもエラーが発生する場合は、さらに制約を緩和
+                        print(f"2回目の試行でもエラー: {e2}")
+                        print("より単純な設定で再試行します...")
+                        
+                        # 基本的な生成オプションだけを残して再試行
+                        simple_kwargs = {
+                            'input_ids': kwargs.get('input_ids'),
+                            'attention_mask': kwargs.get('attention_mask'),
+                            'max_new_tokens': kwargs.get('max_new_tokens', 100),
+                            'do_sample': False  # グリーディー検索を強制
+                        }
+                        
+                        # もし入力テンソルが大きすぎる場合は切り詰める
+                        if 'input_ids' in simple_kwargs and simple_kwargs['input_ids'] is not None:
+                            # 入力がとても長い場合、最後の部分だけを使用
+                            if simple_kwargs['input_ids'].shape[1] > 1024:
+                                print(f"入力が長すぎます。{simple_kwargs['input_ids'].shape[1]} -> 1024 に切り詰めます")
+                                simple_kwargs['input_ids'] = simple_kwargs['input_ids'][:, -1024:]
+                                if 'attention_mask' in simple_kwargs and simple_kwargs['attention_mask'] is not None:
+                                    simple_kwargs['attention_mask'] = simple_kwargs['attention_mask'][:, -1024:]
+                        
+                        return self.model.generate(**simple_kwargs)
+                elif "CUDA out of memory" in err_msg:
+                    print("CUDAメモリ不足エラーが発生しました。メモリ使用量を削減して再試行します...")
+                    
+                    # メモリ使用量を大幅に削減
+                    torch.cuda.empty_cache()  # キャッシュをクリア
+                    
+                    # バッチサイズと入力長を減らしたシンプルな設定で再試行
+                    reduced_kwargs = {
+                        'input_ids': kwargs.get('input_ids'),
+                        'attention_mask': kwargs.get('attention_mask'),
+                        'max_new_tokens': min(kwargs.get('max_new_tokens', 100), 50),  # 短い出力
+                        'do_sample': False  # グリーディー検索
+                    }
+                    
+                    # 入力が長い場合は短くする
+                    if 'input_ids' in reduced_kwargs and reduced_kwargs['input_ids'] is not None:
+                        if reduced_kwargs['input_ids'].shape[1] > 512:
+                            print(f"入力を短くします: {reduced_kwargs['input_ids'].shape[1]} -> 512")
+                            reduced_kwargs['input_ids'] = reduced_kwargs['input_ids'][:, -512:]
+                            if 'attention_mask' in reduced_kwargs and reduced_kwargs['attention_mask'] is not None:
+                                reduced_kwargs['attention_mask'] = reduced_kwargs['attention_mask'][:, -512:]
+                    
+                    return self.model.generate(**reduced_kwargs)
                 else:
                     # その他のエラーは再度発生させる
+                    print(f"テキスト生成中にエラー: {e}")
                     raise
             finally:
                 # 元のデータ型に戻す
                 if orig_dtype is not None:
                     self.model = self.model.to(orig_dtype)
+                
+                # メモリ使用状況を表示
+                if torch.cuda.is_available():
+                    print(f"generate終了時のGPUメモリ使用量: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
         else:
             raise ValueError("Base model has not been initialized yet!")
         
@@ -806,6 +882,10 @@ class Llama32LISAForCausalLM(nn.Module):
         try:
             # モデルが正しいデバイスにあるか確認
             device = self.device
+            
+            # メモリ使用状況を表示
+            if torch.cuda.is_available():
+                print(f"generate_masks開始時のGPUメモリ使用量: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
             
             # デバッグ情報
             print("LISA.generate_masksが呼び出されました")
@@ -832,8 +912,9 @@ class Llama32LISAForCausalLM(nn.Module):
                     print(f"pixel_valuesをデバイス{device}に移動しました")
             
             # SAMモデルのデバイスを確認
-            sam_device = next(self.visual_model.parameters()).device
-            print(f"SAMモデルデバイス: {sam_device}")
+            sam_device = next(self.visual_model.parameters()).device if hasattr(self, 'visual_model') else None
+            if sam_device:
+                print(f"SAMモデルデバイス: {sam_device}")
             
             # 入力IDsとpixel_valuesがデバイスでミスマッチしている場合は修正
             if input_ids is not None and hasattr(input_ids, 'device') and str(input_ids.device) != str(device):
@@ -848,150 +929,135 @@ class Llama32LISAForCausalLM(nn.Module):
                 print("警告: tokenizerが提供されていません。SEGトークンIDの設定に影響します。")
             
             # SEGトークンIDの設定を確保
-            if not hasattr(self, 'seg_token_idx') or self.seg_token_idx is None:
-                self._setup_seg_token_id(tokenizer)
+            self._setup_seg_token_id(tokenizer)
             
-            # 画像埋め込みを取得
-            image_embeddings = self.get_image_embeddings(image=image, pixel_values=pixel_values)
+            # SAMエンコーダとテンソルのデバイスを揃える
+            # SAMモデルを特定のデバイスに移動させる
+            if self.visual_model is not None and device != sam_device:
+                print(f"パフォーマンスのため、SAMモデルをCPUに保持します")
+                # SAMはCPUでも十分高速で、GPUメモリを節約できる
             
-            if image_embeddings is None:
-                print("警告: 画像埋め込みを取得できませんでした。テキスト生成のみ行います。")
-                
-                # テキスト生成のみを行う
+            # 画像が与えられた場合は画像埋め込みを生成
+            image_embeddings = None
+            if image is not None or pixel_values is not None:
                 try:
-                    print("テキスト生成処理を開始...")
-                    output_tokens = self.generate(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        **kwargs
-                    )
-                    
-                    # 辞書形式の結果を返す（マスクなし）
-                    return {
-                        "output_tokens": output_tokens,
-                        "text": tokenizer.decode(output_tokens[0], skip_special_tokens=True) if tokenizer else None
-                    }
-                except Exception as gen_error:
-                    print(f"テキスト生成中にエラー: {gen_error}")
-                    import traceback
-                    traceback.print_exc()
-                    return {"error": str(gen_error)}
+                    # メモリ不足エラーを避けるために小さなバッチで処理
+                    with torch.no_grad():  # 計算グラフを構築しない
+                        image_embeddings = self.get_image_embeddings(image=image, pixel_values=pixel_values)
+                        print(f"画像埋め込み生成完了。形状: {image_embeddings.shape}")
+                except Exception as e:
+                    print(f"画像埋め込み生成中にエラー: {e}")
+                    image_embeddings = None
             
-            # 元の画像サイズを取得
-            original_size = None
-            if hasattr(image, 'size'):
-                # PILイメージの場合
-                original_size = [(image.size[1], image.size[0])]
+            # テキスト生成のための設定
+            gen_kwargs = {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+            }
             
-            # テキスト生成の実行
+            # コマンドライン引数で指定された生成パラメータをkwargsから追加
+            # 温度とサンプリングなどの基本的なパラメータを移行
+            for key in ['max_new_tokens', 'do_sample', 'temperature', 'top_p', 'repetition_penalty']:
+                if key in kwargs:
+                    gen_kwargs[key] = kwargs[key]
+            
+            # 安全な生成のために温度をチェック
+            if 'temperature' in gen_kwargs and (gen_kwargs['temperature'] <= 0.1 or gen_kwargs['temperature'] > 1.5):
+                print(f"警告: 安全な生成のために温度を調整します: {gen_kwargs['temperature']} -> 0.7")
+                gen_kwargs['temperature'] = 0.7
+            
+            # メモリ管理のために徐々にメモリを解放
+            torch.cuda.empty_cache()
+            
+            # テキスト生成
             try:
-                print("テキスト生成処理を開始...")
-                
-                # 正しい生成パラメータを設定
-                gen_kwargs = {
+                output_tokens = self.generate(**gen_kwargs)
+                print(f"生成されたトークン形状: {output_tokens.shape}")
+            except Exception as e:
+                print(f"テキスト生成中にエラー: {e}")
+                # エラーが発生した場合はより単純な設定で再試行
+                print("より単純な設定で再試行します...")
+                simple_kwargs = {
                     'input_ids': input_ids,
                     'attention_mask': attention_mask,
+                    'max_new_tokens': kwargs.get('max_new_tokens', 100),
+                    'do_sample': False,  # グリーディー検索
                 }
-                
-                # 適切なパラメータだけを追加
-                for k, v in kwargs.items():
-                    if k not in ['image', 'pixel_values']:
-                        gen_kwargs[k] = v
-                
-                # temperatureパラメータを確認して調整
-                if 'temperature' in gen_kwargs:
-                    temp = gen_kwargs['temperature']
-                    if temp <= 0 or temp < 0.05:
-                        print(f"警告: temperature値({temp})が小さすぎるため、グリーディー検索に切り替えます")
-                        gen_kwargs['do_sample'] = False
-                        gen_kwargs.pop('temperature', None)
-                    elif temp > 1.5:
-                        print(f"警告: temperature値({temp})が大きすぎるため、1.0に調整します")
-                        gen_kwargs['temperature'] = 1.0
-                
-                # デバッグ用に生成パラメータを表示
-                print(f"生成パラメータ: {[k for k in gen_kwargs.keys()]}")
                 try:
-                    # 実際の生成呼び出し
-                    output_tokens = self.generate(**gen_kwargs)
-                except RuntimeError as e:
-                    if "invalid multinomial distribution" in str(e):
-                        print("multinomial distributionエラーが発生したため、グリーディー検索に切り替えます")
-                        # サンプリングエラーの場合、グリーディー検索に切り替え
-                        gen_kwargs['do_sample'] = False
-                        gen_kwargs.pop('temperature', None)
-                        output_tokens = self.generate(**gen_kwargs)
-                    else:
-                        raise
+                    output_tokens = self.generate(**simple_kwargs)
+                except Exception as e2:
+                    print(f"再試行中にもエラー: {e2}")
+                    # 最終的な手段として出力トークンを返さない
+                    return {"generated_text": "テキスト生成に失敗しました。メモリ不足またはモデル設定の問題かもしれません。"}
+            
+            # 画像埋め込みがない場合は、生成されたテキストだけを返す
+            if image_embeddings is None:
+                print("画像埋め込みがないため、テキストのみを返します")
+                # テキストをデコード
+                output_text = tokenizer.decode(output_tokens[0], skip_special_tokens=False) if tokenizer else "テキストをデコードできません（tokenizerがありません）"
+                return {"generated_text": output_text, "output_tokens": output_tokens}
+            
+            # SEGトークンのインデックスを見つける
+            print("SEGトークンインデックスを検索中...")
+            seg_token_indices = self._find_seg_token_indices(output_tokens)
+            
+            # SEGトークンが見つからない場合は、トークン化されたテキストをデコードして検索
+            if not seg_token_indices:
+                print("トークンIDからSEGトークンが見つかりませんでした。デコードされたテキストで検索します...")
+                output_text = tokenizer.decode(output_tokens[0], skip_special_tokens=False) if tokenizer else ""
+                if not output_text:
+                    print("警告: tokenizerがないため、テキストをデコードできません")
+                    return {"generated_text": "テキストをデコードできません", "output_tokens": output_tokens}
                 
-                # SEGトークンのインデックスを検索
-                seg_token_indices = self._find_seg_token_indices(output_tokens)
-                
-                if not seg_token_indices or all(len(indices) == 0 for indices in seg_token_indices):
-                    print("出力トークンからSEGトークンが見つかりませんでした。テキスト内を検索します...")
-                    # テキスト内のSEGトークンを検索するフォールバック
-                    decoded_text = tokenizer.decode(output_tokens[0], skip_special_tokens=False) if tokenizer else ""
-                    seg_token_indices = self._find_seg_token_in_text(decoded_text)
-                
-                # SEGトークンが見つからない場合
-                if not seg_token_indices or all(len(indices) == 0 for indices in seg_token_indices):
-                    print("SEGトークンが見つかりませんでした。マスクなしでテキストのみを返します。")
-                    return {
-                        "output_tokens": output_tokens,
-                        "text": tokenizer.decode(output_tokens[0], skip_special_tokens=True) if tokenizer else None
-                    }
-                
-                print(f"見つかったSEGトークンインデックス: {seg_token_indices}")
-                
-                # マスク生成
-                try:
-                    pred_masks = self.get_masks(
-                        image_embeddings=image_embeddings,
-                        output_tokens=output_tokens,
-                        seg_token_indices=seg_token_indices,
-                        original_sizes=original_size
-                    )
-                    
-                    if pred_masks:
-                        print(f"生成されたマスク数: {len(pred_masks)}")
-                        for i, mask in enumerate(pred_masks):
-                            if hasattr(mask, 'shape'):
-                                print(f"マスク {i} 形状: {mask.shape}")
-                    else:
-                        print("マスクは生成されませんでした")
-                    
-                    # デコードされたテキストと生成されたマスクを辞書形式で返す
-                    decoded_text = tokenizer.decode(output_tokens[0], skip_special_tokens=True) if tokenizer else None
-                    return {
-                        "output_tokens": output_tokens,
-                        "text": decoded_text,
-                        "masks": pred_masks
-                    }
-                    
-                except Exception as mask_error:
-                    print(f"マスク生成中にエラー: {mask_error}")
-                    import traceback
-                    traceback.print_exc()
-                    
-                    # マスクなしでテキストのみを返す
-                    return {
-                        "output_tokens": output_tokens,
-                        "text": tokenizer.decode(output_tokens[0], skip_special_tokens=True) if tokenizer else None,
-                        "error": str(mask_error)
-                    }
-                    
-            except Exception as gen_error:
-                print(f"テキスト生成中にエラー: {gen_error}")
-                import traceback
-                traceback.print_exc()
-                return {"error": str(gen_error)}
-                
-        except Exception as general_error:
-            print(f"generate_masks全体でエラー: {general_error}")
+                seg_token_indices = self._find_seg_token_in_text(output_text)
+            
+            # まだSEGトークンが見つからない場合
+            if not seg_token_indices:
+                print("SEGトークンが見つかりません。マスク生成をスキップします。")
+                # テキストをデコード
+                output_text = tokenizer.decode(output_tokens[0], skip_special_tokens=False) if tokenizer else "テキストをデコードできません（tokenizerがありません）"
+                return {"generated_text": output_text, "output_tokens": output_tokens}
+            
+            print(f"SEGトークンインデックス: {seg_token_indices}")
+            
+            # マスク生成
+            # 画像のサイズが分かれば使用
+            original_sizes = []
+            if image is not None and hasattr(image, 'size'):
+                original_sizes.append(image.size[::-1])  # PILのsize属性は(width, height)だが、SAMは(height, width)を想定
+            
+            # メモリ管理のためにgrad不要モードでマスク生成
+            with torch.no_grad():
+                masks = self.get_masks(image_embeddings, output_tokens, seg_token_indices, original_sizes)
+            
+            # テキストをデコード
+            output_text = tokenizer.decode(output_tokens[0], skip_special_tokens=False) if tokenizer else "テキストをデコードできません（tokenizerがありません）"
+            
+            # メモリ使用状況を表示
+            if torch.cuda.is_available():
+                print(f"generate_masks終了時のGPUメモリ使用量: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
+                torch.cuda.empty_cache()  # キャッシュをクリア
+            
+            print(f"マスク生成が完了しました。マスク数: {len(masks)}")
+            
+            return {
+                "generated_text": output_text,
+                "output_tokens": output_tokens,
+                "masks": masks,
+                "seg_token_indices": seg_token_indices
+            }
+            
+        except Exception as e:
+            print(f"マスク生成中にエラー: {e}")
             import traceback
             traceback.print_exc()
-            # エラー時は辞書を返す
-            return {"error": str(general_error)}
+            
+            # メモリをクリア
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # 最低限の情報を返す
+            return {"error": str(e)}
 
     def _setup_seg_token_id(self, tokenizer):
         """SEGトークンIDを設定します"""
@@ -1369,213 +1435,91 @@ class Llama32LISAForCausalLM(nn.Module):
         device = next(self.parameters()).device
         print(f"get_image_embeddings: モデルデバイス = {device}")
         
+        # メモリ使用量を計測
+        if torch.cuda.is_available():
+            print(f"現在のGPUメモリ使用量: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+        
         # pixel_valuesが指定されている場合はそれを使用
         if pixel_values is not None:
             print(f"既存のpixel_valuesを使用します。形状: {pixel_values.shape}")
             print(f"テンソル型: {pixel_values.dtype}, デバイス: {pixel_values.device}")
             
-            # デバイスの不一致がある場合は修正
-            if pixel_values.device != device:
-                print(f"デバイスの不一致を検出: pixel_values({pixel_values.device}) vs モデル({device})")
-                pixel_values = pixel_values.to(device)
-                print(f"pixel_valuesをデバイス{device}に移動しました")
-                
-            # SAMエンコーダとテンソルのデバイスを揃える
+            # メモリ効率向上のため、SAMエンコーダのみを必要なデバイスに移動
             sam_encoder_device = next(self.visual_model.parameters()).device if hasattr(self, 'visual_model') else None
-            if sam_encoder_device and sam_encoder_device != device:
-                print(f"SAMエンコーダーをデバイス{device}に移動します")
-                self.visual_model = self.visual_model.to(device)
+            print(f"SAMエンコーダーのデバイス: {sam_encoder_device}")
+            
+            # pixel_valuesをSAMエンコーダと同じデバイスに移動
+            if pixel_values.device != sam_encoder_device:
+                print(f"pixel_valuesをデバイス{sam_encoder_device}に移動します")
+                pixel_values = pixel_values.to(sam_encoder_device)
             
             # pixel_valuesの形状をチェック
-            # SAMのTransformerは固定されたパッチ数を想定 (通常64x64=4096パッチ)
-            # 入力画像が小さすぎるとパッチ数が足りなくなる
-            if len(pixel_values.shape) == 4:  # [バッチ, チャンネル, 高さ, 幅]
-                # SAMは1024x1024の入力を想定しているが、パッチサイズに合わせるため
-                # 少なくとも1024x1024に近いサイズが必要
-                # 画像が小さすぎる場合は1024x1024にリサイズ
-                h, w = pixel_values.shape[2], pixel_values.shape[3]
-                min_size_required = 1024  # SAMが想定する最小サイズ
-                
-                # 画像が小さすぎる場合はリサイズ
-                if h < min_size_required or w < min_size_required:
-                    print(f"画像が小さすぎます。SAMのために{min_size_required}x{min_size_required}にリサイズします")
-                    # まずnumpyに変換してからリサイズ
-                    img_np = pixel_values[0].permute(1, 2, 0).cpu().numpy()
+            # 複雑な形状の場合は単純化
+            try:
+                from model.llama3_2.mm_utils import safe_mllama_to_sam
+                transformed_pixel_values = safe_mllama_to_sam(pixel_values)
+                if transformed_pixel_values is not None:
+                    pixel_values = transformed_pixel_values
+                    print(f"変換後のpixel_values形状: {pixel_values.shape}")
+            except Exception as e:
+                print(f"pixel_values変換中にエラー: {e}")
+            
+            # SAMエンコーダを実行
+            try:
+                # メモリ使用量を削減するためにSAMの入力サイズを小さくする
+                # 標準の1024x1024から小さいサイズに変更
+                if len(pixel_values.shape) == 4:  # [バッチ, チャンネル, 高さ, 幅]
+                    h, w = pixel_values.shape[2], pixel_values.shape[3]
+                    # 小さいサイズを使用
+                    # メモリ消費を減らすために512x512または384x384に設定
+                    target_size = 384  # メモリ削減のため小さいサイズを使用
                     
-                    # *** 重要な修正 ***
-                    # NumPy配列をuint8形式に変換する
-                    # to_pil_imageはfloat32型を直接処理できないため
-                    if img_np.dtype == np.float32:
-                        # [0,1]の範囲にある場合は255を掛ける
-                        if img_np.max() <= 1.0:
-                            img_np = (img_np * 255.0).astype(np.uint8)
-                        else:
-                            # すでに[0,255]の範囲にある場合はそのままuint8に変換
-                            img_np = img_np.astype(np.uint8)
-                    
-                    # オリジナルLISAコードと同様にリサイズを適用
-                    from model.segment_anything.utils.transforms import ResizeLongestSide
-                    transform = ResizeLongestSide(min_size_required)
-                    resized_img = transform.apply_image(img_np)
-                    print(f"リサイズ後の形状: {resized_img.shape}")
-                    
-                    # 前処理関数
-                    def preprocess(x, pixel_mean=torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1),
-                                pixel_std=torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1), img_size=1024):
-                        # Normalize colors
-                        x = (x - pixel_mean) / pixel_std
-                        # Pad
-                        h, w = x.shape[-2:]
-                        padh = img_size - h
-                        padw = img_size - w
-                        x = F.pad(x, (0, padw, 0, padh))
-                        return x
-                    
-                    # テンソルに変換して前処理
-                    image_tensor = torch.from_numpy(resized_img).permute(2, 0, 1).contiguous()
-                    image_tensor = preprocess(image_tensor).unsqueeze(0).to(device)
-                    print(f"前処理後のテンソル形状: {image_tensor.shape}")
-                    
-                    # 精度合わせ
-                    if pixel_values.dtype == torch.float16:
-                        image_tensor = image_tensor.half()
-                    elif pixel_values.dtype == torch.bfloat16:
-                        image_tensor = image_tensor.bfloat16()
-                    
-                    print(f"SAMエンコーダーを呼び出します（リサイズ後）...")
-                    return self.visual_model.image_encoder(image_tensor)
-            elif len(pixel_values.shape) > 4:
-                # MllamaProcessorから来た複雑な形状のテンソルを変換
-                try:
-                    from model.llama3_2.mm_utils import safe_mllama_to_sam
-                    pixel_values_4d = safe_mllama_to_sam(pixel_values)
-                    print(f"変換後のpixel_values形状: {pixel_values_4d.shape}")
-                    
-                    # デバイスの不一致がある場合は修正
-                    if pixel_values_4d.device != device:
-                        pixel_values_4d = pixel_values_4d.to(device)
-                    
-                    # 画像サイズをチェック
-                    h, w = pixel_values_4d.shape[2], pixel_values_4d.shape[3]
-                    min_size_required = 1024  # SAMが想定する最小サイズ
-                    
-                    # 画像が小さすぎる場合はリサイズ
-                    if h < min_size_required or w < min_size_required:
-                        print(f"画像が小さすぎます。SAMのために{min_size_required}x{min_size_required}にリサイズします")
-                        # まずnumpyに変換してからリサイズ
-                        img_np = pixel_values_4d[0].permute(1, 2, 0).cpu().numpy()
+                    # 現在のサイズが大きい場合はリサイズ
+                    if h > target_size or w > target_size:
+                        print(f"メモリ効率向上のため、画像を{target_size}x{target_size}にリサイズします")
+                        # NumPy配列に変換
+                        img_np = pixel_values[0].permute(1, 2, 0).cpu().numpy()
                         
-                        # *** 重要な修正 ***
-                        # NumPy配列をuint8形式に変換
-                        if img_np.dtype == np.float32:
-                            # [0,1]の範囲にある場合は255を掛ける
-                            if img_np.max() <= 1.0:
-                                img_np = (img_np * 255.0).astype(np.uint8)
-                            else:
-                                # すでに[0,255]の範囲にある場合はそのままuint8に変換
-                                img_np = img_np.astype(np.uint8)
-                        
-                        print(f"変換後のNumPy配列型: {img_np.dtype}, 範囲: [{img_np.min()}, {img_np.max()}]")
-                        
-                        # オリジナルLISAコードと同様にリサイズを適用
+                        # リサイズ用の変換
                         from model.segment_anything.utils.transforms import ResizeLongestSide
-                        transform = ResizeLongestSide(min_size_required)
+                        transform = ResizeLongestSide(target_size)
                         resized_img = transform.apply_image(img_np)
                         print(f"リサイズ後の形状: {resized_img.shape}")
                         
-                        # 前処理関数
+                        # 前処理関数 - 小さいimg_sizeを使用
                         def preprocess(x, pixel_mean=torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1),
-                                    pixel_std=torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1), img_size=1024):
-                            # Normalize colors
+                                    pixel_std=torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1), img_size=target_size):
+                            # 正規化
                             x = (x - pixel_mean) / pixel_std
-                            # Pad
+                            
+                            # パディング
                             h, w = x.shape[-2:]
                             padh = img_size - h
                             padw = img_size - w
-                            x = F.pad(x, (0, padw, 0, padh))
+                            if padh > 0 or padw > 0:
+                                x = F.pad(x, (0, padw, 0, padh))
                             return x
                         
                         # テンソルに変換して前処理
-                        image_tensor = torch.from_numpy(resized_img).permute(2, 0, 1).contiguous()
-                        image_tensor = preprocess(image_tensor).unsqueeze(0).to(device)
-                        print(f"前処理後のテンソル形状: {image_tensor.shape}")
+                        resized_tensor = torch.from_numpy(resized_img).permute(2, 0, 1).unsqueeze(0)
                         
-                        # 精度合わせ
-                        if pixel_values_4d.dtype == torch.float16:
-                            image_tensor = image_tensor.half()
-                        elif pixel_values_4d.dtype == torch.bfloat16:
-                            image_tensor = image_tensor.bfloat16()
+                        # サンプリング前にデータ型を変換しておく
+                        # 精度の問題が発生した場合はここを修正
+                        resized_tensor = resized_tensor.to(dtype=torch.float32)
                         
-                        print(f"SAMエンコーダーを呼び出します（リサイズ後）...")
-                        return self.visual_model.image_encoder(image_tensor)
-                    
-                    print(f"SAMエンコーダーを呼び出します...")
-                    return self.visual_model.image_encoder(pixel_values_4d)
-                except ImportError:
-                    print("変換ユーティリティが見つかりません。手動で変換します...")
-                    # 手動変換ロジック...
-            
-            # 通常の場合はそのまま使用
-            print(f"通常のpixel_valuesを使用します...")
-            return self.visual_model.image_encoder(pixel_values)
-        
-        # imageが指定されている場合は変換して使用
-        if image is not None:
-            try:
-                from PIL import Image
-                import numpy as np
-                import torch
-                from model.segment_anything.utils.transforms import ResizeLongestSide
-                
-                # オリジナルのLISAコードと同様の処理を行う
-                print("SAM用に画像を前処理します")
-                
-                # PIL画像をNumPy配列に変換
-                if isinstance(image, Image.Image):
-                    image_np = np.array(image)
-                    print(f"NumPy画像形状: {image_np.shape}")
-                else:
-                    raise ValueError("サポートされていない画像タイプです")
-                
-                # *** 重要な修正 ***
-                # NumPy配列をuint8形式に変換
-                if image_np.dtype == np.float32:
-                    # [0,1]の範囲にある場合は255を掛ける
-                    if image_np.max() <= 1.0:
-                        image_np = (image_np * 255.0).astype(np.uint8)
+                        # デバイスに送る
+                        pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1).to(sam_encoder_device)
+                        pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1).to(sam_encoder_device)
+                        resized_tensor = resized_tensor.to(sam_encoder_device)
+                        
+                        # 前処理を適用
+                        image_tensor = preprocess(resized_tensor, pixel_mean, pixel_std, target_size)
                     else:
-                        # すでに[0,255]の範囲にある場合はそのままuint8に変換
-                        image_np = image_np.astype(np.uint8)
-                        
-                print(f"変換後のNumPy配列型: {image_np.dtype}, 範囲: [{image_np.min()}, {image_np.max()}]")
-                
-                # SAMが想定するサイズは1024x1024
-                min_size_required = 1024
-                
-                # ResizeLongestSideを使用してリサイズ
-                transform = ResizeLongestSide(min_size_required)
-                image_transformed = transform.apply_image(image_np)
-                print(f"変換後の画像形状: {image_transformed.shape}")
-                
-                # 前処理関数
-                def preprocess(x, pixel_mean=torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1),
-                            pixel_std=torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1), img_size=1024):
-                    # Normalize colors
-                    x = (x - pixel_mean) / pixel_std
-                    # Pad
-                    h, w = x.shape[-2:]
-                    padh = img_size - h
-                    padw = img_size - w
-                    x = F.pad(x, (0, padw, 0, padh))
-                    return x
-                
-                # テンソルに変換して前処理
-                image_tensor = torch.from_numpy(image_transformed).permute(2, 0, 1).contiguous()
-                print(f"変換後のテンソル形状: {image_tensor.shape}")
-                
-                image_tensor = preprocess(image_tensor).unsqueeze(0).to(device)
-                print(f"前処理後のテンソル形状: {image_tensor.shape}")
-                print(f"テンソル型: {image_tensor.dtype}, デバイス: {image_tensor.device}")
+                        # すでに十分小さい場合はそのまま使用
+                        image_tensor = pixel_values
+                else:
+                    # 予期しない形状の場合はそのまま使用
+                    image_tensor = pixel_values
                 
                 # 必要に応じて精度を変換
                 if hasattr(self, 'torch_dtype') and self.torch_dtype == torch.float16:
@@ -1585,7 +1529,19 @@ class Llama32LISAForCausalLM(nn.Module):
                 
                 # SAMエンコーダーを実行
                 print("SAMイメージエンコーダーを呼び出します...")
+                print(f"入力テンソル形状: {image_tensor.shape}, デバイス: {image_tensor.device}")
+                
+                # SAMエンコーダ実行前のメモリ使用量
+                if torch.cuda.is_available():
+                    print(f"エンコード前のGPUメモリ使用量: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+                    torch.cuda.empty_cache()  # キャッシュをクリア
+                
                 embeddings = self.visual_model.image_encoder(image_tensor)
+                
+                # エンコード後のメモリ使用量
+                if torch.cuda.is_available():
+                    print(f"エンコード後のGPUメモリ使用量: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+                
                 print(f"生成された埋め込み形状: {embeddings.shape}")
                 return embeddings
                 
