@@ -740,6 +740,17 @@ class Llama32LISAForCausalLM(nn.Module):
             if 'output_hidden_states' not in kwargs:
                 kwargs['output_hidden_states'] = True
             
+            # temperatureの処理
+            if 'temperature' in kwargs:
+                temp = kwargs['temperature']
+                if temp <= 0 or temp < 0.05:
+                    print(f"警告: temperature値({temp})が小さすぎるため、グリーディー検索に切り替えます")
+                    kwargs['do_sample'] = False
+                    kwargs.pop('temperature', None)
+                elif temp > 1.5:
+                    print(f"警告: temperature値({temp})が大きすぎるため、1.0に調整します")
+                    kwargs['temperature'] = 1.0
+            
             # BFloat16データ型の問題を解決するためのパッチ
             orig_dtype = None
             if hasattr(self.model, 'dtype') and self.model.dtype == torch.bfloat16:
@@ -757,6 +768,12 @@ class Llama32LISAForCausalLM(nn.Module):
                     print("BFloat16エラーが発生したため、float32で再試行します")
                     # BFloat16エラーの場合、float32でもう一度試す
                     self.model = self.model.to(torch.float32)
+                    return self.model.generate(**kwargs)
+                elif "invalid multinomial distribution" in str(e):
+                    print("multinomial distributionエラーが発生したため、グリーディー検索に切り替えます")
+                    # サンプリングエラーの場合、グリーディー検索に切り替え
+                    kwargs['do_sample'] = False
+                    kwargs.pop('temperature', None)
                     return self.model.generate(**kwargs)
                 else:
                     # その他のエラーは再度発生させる
@@ -881,20 +898,31 @@ class Llama32LISAForCausalLM(nn.Module):
                     if k not in ['image', 'pixel_values']:
                         gen_kwargs[k] = v
                 
-                # do_sampleパラメータに基づいて生成メソッドを呼び出す
-                do_sample = kwargs.get('do_sample', False)
-                if do_sample:
-                    temperature = kwargs.get('temperature', 0.7)
-                    if temperature <= 0:
-                        # 温度が0以下の場合はグリーディー生成に切り替え
-                        print(f"警告: temperature({temperature})が無効です。グリーディー生成に切り替えます。")
+                # temperatureパラメータを確認して調整
+                if 'temperature' in gen_kwargs:
+                    temp = gen_kwargs['temperature']
+                    if temp <= 0 or temp < 0.05:
+                        print(f"警告: temperature値({temp})が小さすぎるため、グリーディー検索に切り替えます")
                         gen_kwargs['do_sample'] = False
+                        gen_kwargs.pop('temperature', None)
+                    elif temp > 1.5:
+                        print(f"警告: temperature値({temp})が大きすぎるため、1.0に調整します")
+                        gen_kwargs['temperature'] = 1.0
                 
                 # デバッグ用に生成パラメータを表示
                 print(f"生成パラメータ: {[k for k in gen_kwargs.keys()]}")
-                
-                # 実際の生成呼び出し
-                output_tokens = self.generate(**gen_kwargs)
+                try:
+                    # 実際の生成呼び出し
+                    output_tokens = self.generate(**gen_kwargs)
+                except RuntimeError as e:
+                    if "invalid multinomial distribution" in str(e):
+                        print("multinomial distributionエラーが発生したため、グリーディー検索に切り替えます")
+                        # サンプリングエラーの場合、グリーディー検索に切り替え
+                        gen_kwargs['do_sample'] = False
+                        gen_kwargs.pop('temperature', None)
+                        output_tokens = self.generate(**gen_kwargs)
+                    else:
+                        raise
                 
                 # SEGトークンのインデックスを検索
                 seg_token_indices = self._find_seg_token_indices(output_tokens)
