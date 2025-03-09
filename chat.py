@@ -53,6 +53,28 @@ def parse_args(args):
         help="SAM model version",
     )
     parser.add_argument(
+        "--authenticate",
+        action="store_true",
+        help="Authenticate with Hugging Face",
+    )
+    parser.add_argument(
+        "--offload_folder",
+        type=str,
+        default=None,
+        help="Path to folder for model offloading",
+    )
+    parser.add_argument(
+        "--trust_remote_code",
+        action="store_true",
+        default=True,
+        help="Trust remote code from Hugging Face",
+    )
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Force CPU usage even if GPU is available",
+    )
+    parser.add_argument(
         "--test_image",
         type=str,
         default=None,
@@ -495,6 +517,11 @@ def main(args):
     if args.authenticate:
         authenticate_huggingface()
     
+    # 出力ディレクトリの作成
+    if not os.path.exists(args.vis_save_path):
+        os.makedirs(args.vis_save_path)
+        print(f"可視化結果の保存ディレクトリを作成しました: {args.vis_save_path}")
+    
     # 一時フォルダの設定
     offload_folder = None
     if args.offload_folder:
@@ -559,7 +586,7 @@ def main(args):
         )
         
         # SAMチェックポイントの設定
-        sam_checkpoint = args.sam_checkpoint
+        sam_checkpoint = args.sam_version
         if not sam_checkpoint or not os.path.exists(sam_checkpoint):
             print(f"警告: SAMチェックポイントが見つかりません: {sam_checkpoint}")
             print("デフォルトのSAMモデルを使用します")
