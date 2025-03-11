@@ -24,7 +24,9 @@ class Llama3VisionArchModel:
             self.vision_tower = build_vision_tower(config, delay_load=True)
             # Llama3.2 visionではプロジェクターは内部で処理されるため、
             # このプロジェクターは主にSAMとの統合時に使用されます
-            self.mm_projector = nn.Linear(config.mm_hidden_size, config.hidden_size)
+            # MllamaConfigの場合はtext_config.hidden_sizeにアクセス
+            hidden_size = getattr(config.text_config, 'hidden_size', 4096) if hasattr(config, 'text_config') else getattr(config, 'hidden_size', 4096)
+            self.mm_projector = nn.Linear(config.mm_hidden_size, hidden_size)
     
     def get_vision_tower(self):
         """
@@ -69,7 +71,8 @@ class Llama3VisionArchModel:
         
         # Llama3.2 Visionでは画像プロジェクターは内部で処理されるため、
         # このプロジェクターはSAMとの統合時に使用されます
-        hidden_size = self.config.hidden_size
+        # MllamaConfigの場合はtext_config.hidden_sizeにアクセス
+        hidden_size = getattr(self.config.text_config, 'hidden_size', 4096) if hasattr(self.config, 'text_config') else getattr(self.config, 'hidden_size', 4096)
         mm_hidden_size = getattr(self.config, "mm_hidden_size", vision_tower.hidden_size)
         
         if pretrain_mm_mlp_adapter is not None:

@@ -87,7 +87,13 @@ class LisaMetaModel:
                 param.requires_grad = True
 
         # Projection layer
-        in_dim = config.hidden_size
+        # MllamaConfigの場合はtext_config.hidden_sizeにアクセス
+        if hasattr(config, 'text_config') and hasattr(config.text_config, 'hidden_size'):
+            in_dim = config.text_config.hidden_size
+        else:
+            # 互換性のために元の参照方法もフォールバックとして保持
+            in_dim = getattr(config, 'hidden_size', 4096)  # デフォルト値として4096を使用
+            
         out_dim = config.out_dim
         text_fc = [
             nn.Linear(in_dim, in_dim),
