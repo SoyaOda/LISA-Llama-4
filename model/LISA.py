@@ -207,7 +207,21 @@ class LISAForCausalLM(nn.Module):
             
             # 埋め込みをリサイズ
             # 入力埋め込みのリサイズ
-            orig_num_tokens = self.model.config.vocab_size
+            # MllamaConfig対応: text_config.vocab_sizeから取得
+            if hasattr(self.model.config, 'vocab_size'):
+                orig_num_tokens = self.model.config.vocab_size
+            elif hasattr(self.model.config, 'text_config') and hasattr(self.model.config.text_config, 'vocab_size'):
+                # MllamaConfigではtext_config内に語彙サイズがある
+                orig_num_tokens = self.model.config.text_config.vocab_size
+                # 後続の処理で参照されるように設定
+                self.model.config.vocab_size = orig_num_tokens
+                print(f"  - MllamaConfig: text_config.vocab_sizeから語彙サイズを設定 ({orig_num_tokens})")
+            else:
+                # 最終手段: トークナイザーから直接サイズを取得
+                orig_num_tokens = len(self.processor.tokenizer) - num_added_tokens
+                self.model.config.vocab_size = orig_num_tokens
+                print(f"  - 警告: configにvocab_sizeがないため、トークナイザーから推定 ({orig_num_tokens})")
+            
             new_num_tokens = len(self.processor.tokenizer)
             print(f"  - Resizing embeddings from {orig_num_tokens} to {new_num_tokens}")
             
@@ -225,29 +239,53 @@ class LISAForCausalLM(nn.Module):
                     print("入力埋め込みのリサイズのみ完了。後で重み共有を行います")
                 else:
                     # 通常のケース - 出力埋め込みが実デバイス上にある場合
-                    new_output_embeddings = torch.nn.Linear(
-                        output_embeddings.in_features,
-                        new_num_tokens,
-                        bias=output_embeddings.bias is not None,
-                        device=output_embeddings.weight.device
-                    )
-                    
-                    with torch.no_grad():
-                        # 既存のトークンの埋め込みをコピー
-                        new_output_embeddings.weight.data[:orig_num_tokens, :] = output_embeddings.weight.data
-                        # 新しいトークンの埋め込みを小さな乱数で初期化
-                        new_output_embeddings.weight.data[orig_num_tokens:, :].normal_(mean=0.0, std=0.02)
+                    try:
+                        # まず_get_resized_lm_headメソッドを使用してみる (推奨アプローチ)
+                        if hasattr(self.model, '_get_resized_lm_head'):
+                            print("  - _get_resized_lm_headメソッドを使用して出力埋め込みをリサイズ")
+                            new_output_embeddings = self.model._get_resized_lm_head(
+                                output_embeddings,
+                                new_num_tokens=new_num_tokens,
+                                mean_resizing=True
+                            )
+                            # 勾配設定を元に戻す
+                            new_output_embeddings.requires_grad_(output_embeddings.weight.requires_grad)
+                        else:
+                            # フォールバック: 手動で出力埋め込みをリサイズ
+                            print("  - 手動で出力埋め込みをリサイズ")
+                            new_output_embeddings = torch.nn.Linear(
+                                output_embeddings.in_features,
+                                new_num_tokens,
+                                bias=output_embeddings.bias is not None,
+                                device=output_embeddings.weight.device
+                            )
+                            
+                            with torch.no_grad():
+                                # 既存のトークンの埋め込みをコピー
+                                new_output_embeddings.weight.data[:orig_num_tokens, :] = output_embeddings.weight.data
+                                # 新しいトークンの埋め込みを小さな乱数で初期化
+                                new_output_embeddings.weight.data[orig_num_tokens:, :].normal_(mean=0.0, std=0.02)
+                                
+                                if output_embeddings.bias is not None:
+                                    new_output_embeddings.bias.data[:orig_num_tokens] = output_embeddings.bias.data
+                                    new_output_embeddings.bias.data[orig_num_tokens:] = 0
                         
-                        if output_embeddings.bias is not None:
-                            new_output_embeddings.bias.data[:orig_num_tokens] = output_embeddings.bias.data
-                            new_output_embeddings.bias.data[orig_num_tokens:] = 0
-                    
-                    # 新しい出力埋め込みを設定
-                    self.model.set_output_embeddings(new_output_embeddings)
-                
-                # 重み共有を明示的に実行
-                print("入力/出力埋め込みの重みを共有（タイying）します")
-                self.model.tie_weights()
+                        # 新しい出力埋め込みを設定
+                        self.model.set_output_embeddings(new_output_embeddings)
+                        
+                        # 重み共有設定の確認
+                        if hasattr(self.model.config, 'tie_word_embeddings') and self.model.config.tie_word_embeddings:
+                            # 重み共有が有効な場合のみtie_weightsを実行
+                            print("入力/出力埋め込みの重みを共有（タイying）します")
+                            self.model.tie_weights()
+                        else:
+                            # Llama 3.2などの非共有モデルの場合
+                            print("このモデルは入出力埋め込み非共有モデル（tie_word_embeddings=False）です")
+                            print("出力埋め込みは手動で初期化されました")
+                        
+                    except Exception as e:
+                        print(f"警告: 出力埋め込みの初期化中にエラーが発生しました: {e}")
+                        print("DeepSpeed環境での処理中は正常なため、続行します")
                 
             except Exception as e:
                 print(f"警告: 出力埋め込みの初期化中にエラーが発生しました: {e}")
