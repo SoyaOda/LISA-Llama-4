@@ -79,6 +79,37 @@ class Llama3VisionForCausalLM(PreTrainedModel, GenerationMixin):
             self.processor = AutoProcessor.from_pretrained(self.model_id)
         return self.processor
     
+    def get_input_embeddings(self):
+        """
+        入力埋め込み層を返します。
+        PEFTのLoRAを適用するために必要です。
+        """
+        if hasattr(self.model, "get_input_embeddings"):
+            return self.model.get_input_embeddings()
+        # モデルが直接メソッドを持っていない場合は、埋め込み層を直接取得
+        if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
+            return self.model.model.embed_tokens
+        # MllamaモデルではLlamaモデル部分の埋め込み層を取得
+        if hasattr(self.model, "text_model") and hasattr(self.model.text_model, "embed_tokens"):
+            return self.model.text_model.embed_tokens
+        # 最後の手段として例外をスロー
+        raise NotImplementedError("このモデルでは入力埋め込み層が見つかりません")
+    
+    def get_output_embeddings(self):
+        """
+        出力埋め込み層を返します。
+        PEFTの一部の操作に必要です。
+        """
+        if hasattr(self.model, "get_output_embeddings"):
+            return self.model.get_output_embeddings()
+        # モデルが直接メソッドを持っていない場合は、出力埋め込み層を直接取得
+        if hasattr(self.model, "lm_head"):
+            return self.model.lm_head
+        # MllamaモデルではLlamaモデル部分の出力埋め込み層を取得
+        if hasattr(self.model, "text_model") and hasattr(self.model.text_model, "lm_head"):
+            return self.model.text_model.lm_head
+        return None
+    
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
