@@ -107,7 +107,9 @@ class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
         config,
         **kwargs,
     ):
-        super(LisaModel, self).__init__(config, **kwargs)
+        # vision_towerをmodel_nameとして渡す
+        model_name = kwargs.get("vision_tower") or config.vision_tower
+        super(LisaModel, self).__init__(config, model_name=model_name, **kwargs)
 
         self.config.use_cache = False
         self.config.vision_tower = self.config.mm_vision_tower
@@ -137,12 +139,6 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
         self.dice_loss_weight = kwargs.pop("dice_loss_weight", None)
         self.bce_loss_weight = kwargs.pop("bce_loss_weight", None)
         
-        # 親クラスの初期化
-        super().__init__(model_id=model_id, **kwargs)
-        
-        # Llama3.2モデルへの参照を確保
-        self.language_model = self.model
-        
         if not hasattr(config, "train_mask_decoder"):
             config.mm_use_im_start_end = kwargs.pop("use_mm_start_end", True)
             config.mm_use_im_patch_token = kwargs.pop("use_mm_use_im_patch_token", False)
@@ -160,7 +156,34 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
             config.vision_pretrained = kwargs.pop("vision_pretrained", None)
             config.device_map = kwargs.pop("device_map", None)
             config.query_len = kwargs.pop("query_len", 1)
-            
+        
+        # 親クラスの初期化 - ここでPreTrainedModelを初期化
+        super().__init__(config, model_id=model_id)
+        
+        # torch_dtype設定
+        torch_dtype = kwargs.get("torch_dtype", torch.bfloat16)
+        device_map = kwargs.get("device_map", "auto")
+        
+        # デバッグ情報
+        print(f"Loading Llama3.2 Vision model: {model_id}")
+        print(f"  - torch_dtype: {torch_dtype}")
+        print(f"  - device_map: {device_map}")
+        
+        try:
+            # Llama3.2 Vision用のモデルを直接設定
+            self.model = AutoModelForVision2Seq.from_pretrained(
+                model_id, 
+                torch_dtype=torch_dtype,
+                device_map=device_map
+            )
+            print(f"  - Model loaded successfully: {type(self.model)}")
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            raise
+        
+        # モデルIDを保存
+        self.model_id = model_id
+        
         # プロセッサを初期化
         self.processor = None
 
@@ -169,8 +192,6 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
         
         # LISAモデルの視覚モデルを共有
         self.visual_model = self.lisa_model.visual_model
-        
-        # すでに存在しないLlavaのlm_headは使用しない
 
     def get_processor(self):
         """
@@ -196,7 +217,7 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
     def forward(self, **kwargs):
         if "past_key_values" in kwargs:
             # Llama3.2 visionモデルの標準forward
-            return self.language_model(**kwargs)
+            return self.model(**kwargs)
         return self.model_forward(**kwargs)
 
     def model_forward(
@@ -258,10 +279,10 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
                 )
                 
                 # デバイスを合わせる
-                batch_inputs = {k: v.to(self.language_model.device) for k, v in batch_inputs.items()}
+                batch_inputs = {k: v.to(self.model.device) for k, v in batch_inputs.items()}
                 
                 # モデルを実行
-                output_i = self.language_model(**batch_inputs, output_hidden_states=True)
+                output_i = self.model(**batch_inputs, output_hidden_states=True)
                 output_hidden_states.append(output_i.hidden_states)
                 torch.cuda.empty_cache()
 
@@ -300,10 +321,10 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
                 batch_inputs["labels"] = labels
                 
             # デバイスを合わせる
-            batch_inputs = {k: v.to(self.language_model.device) for k, v in batch_inputs.items()}
+            batch_inputs = {k: v.to(self.model.device) for k, v in batch_inputs.items()}
             
             # モデルを実行
-            output = self.language_model(**batch_inputs, output_hidden_states=True)
+            output = self.model(**batch_inputs, output_hidden_states=True)
             output_hidden_states = output.hidden_states
 
         # 以下はオリジナルのLISAと同様の処理
@@ -427,7 +448,7 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
             )
             
             # デバイスを合わせる
-            batch_inputs = {k: v.to(self.language_model.device) for k, v in batch_inputs.items()}
+            batch_inputs = {k: v.to(self.model.device) for k, v in batch_inputs.items()}
             
             # 生成パラメータを設定
             generation_config = {
@@ -438,7 +459,7 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
             }
             
             # 生成を実行
-            outputs = self.language_model.generate(**batch_inputs, **generation_config)
+            outputs = self.model.generate(**batch_inputs, **generation_config)
             
             # 出力を取得
             output_hidden_states = outputs.hidden_states[-1]
@@ -506,3 +527,33 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
                 pred_masks.append(pred_mask[:, 0])
 
         return output_ids, pred_masks
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        images=None,
+        **kwargs
+    ):
+        """
+        Llama3.2 Visionを使用して生成するための入力を準備します。
+        """
+        if past_key_values is not None:
+            input_ids = input_ids[:, -1:]
+
+        # 生成のための画像入力を準備
+        batch_inputs = {}
+        if input_ids is not None:
+            batch_inputs["input_ids"] = input_ids
+        if past_key_values is not None:
+            batch_inputs["past_key_values"] = past_key_values
+        if attention_mask is not None:
+            batch_inputs["attention_mask"] = attention_mask
+        if inputs_embeds is not None:
+            batch_inputs["inputs_embeds"] = inputs_embeds
+        if images is not None:
+            batch_inputs["images"] = images
+            
+        return batch_inputs

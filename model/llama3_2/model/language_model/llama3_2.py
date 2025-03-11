@@ -9,7 +9,8 @@ from transformers import (
     AutoModelForVision2Seq, 
     MllamaForConditionalGeneration,
     PreTrainedModel,
-    PreTrainedTokenizer
+    PreTrainedTokenizer,
+    GenerationMixin
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -23,11 +24,14 @@ class Llama3VisionMetaModel(nn.Module):
     This class serves as a wrapper around the AutoModelForVision2Seq model.
     """
     
-    def __init__(self, model_id="meta-llama/Llama-3.2-11B-Vision-Instruct", **kwargs):
+    def __init__(self, config, model_name=None, **kwargs):
         super().__init__()
         # モデルの設定
-        self.model_id = model_id
-        self.dtype = kwargs.get("torch_dtype", torch.bfloat16)
+        self.config = config
+        # モデル名を設定
+        self.model_name = model_name or "meta-llama/Llama-3.2-11B-Vision-Instruct"
+        # Note: torch_dtypeは一時変数として使用し、インスタンス変数として保存しない
+        self._torch_dtype = kwargs.get("torch_dtype", torch.bfloat16)
         
         # プロセッサーとモデルの読み込み
         self.processor = None  # プロセッサーは別途初期化
@@ -38,30 +42,27 @@ class Llama3VisionMetaModel(nn.Module):
         プロセッサーを取得します。初期化されていない場合は初期化します。
         """
         if self.processor is None:
-            self.processor = AutoProcessor.from_pretrained(self.model_id)
+            self.processor = AutoProcessor.from_pretrained(self.model_name)
         return self.processor
 
 
-class Llama3VisionForCausalLM(PreTrainedModel):
+class Llama3VisionForCausalLM(PreTrainedModel, GenerationMixin):
     """
     Llama3.2 Vision Model for causal language modeling with LISA integration.
     This class serves as a wrapper around MllamaForConditionalGeneration for LISA.
     """
     
-    def __init__(self, model_id="meta-llama/Llama-3.2-11B-Vision-Instruct", **kwargs):
+    def __init__(self, config, model_id=None, **kwargs):
         # 設定を取得して親クラスを初期化
-        config = AutoConfig.from_pretrained(model_id)
         super().__init__(config)
         
-        # モデルとプロセッサの設定
-        self.model_id = model_id
-        self.dtype = kwargs.get("torch_dtype", torch.bfloat16)
-        self.model = AutoModelForVision2Seq.from_pretrained(
-            model_id, 
-            torch_dtype=self.dtype,
-            device_map=kwargs.get("device_map", "auto")
-        )
-        self.processor = None  # 必要なときに初期化
+        # モデルIDを設定（configから取得するか、引数から取得）
+        self.model_id = model_id or "meta-llama/Llama-3.2-11B-Vision-Instruct"
+        
+        # Note: 実際のモデルの初期化はLISAForCausalLMで行います
+        # ここでは、スケルトンだけを提供します
+        self.model = None
+        self.processor = None
         
         # LISAモデルでの統合に必要な属性を初期化
         self.vision_tower = None  # LISAで別途扱う
