@@ -118,8 +118,19 @@ class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
         super(LisaModel, self).__init__(config, model_name=model_name, **kwargs)
 
         self.config.use_cache = False
-        self.config.vision_tower = self.config.mm_vision_tower
-        self.config.mm_vision_select_feature = "patch"
+        
+        # MllamaConfigではmm_接頭辞がない可能性がある属性の対応
+        # vision_tower
+        if hasattr(self.config, "mm_vision_tower"):
+            self.config.vision_tower = self.config.mm_vision_tower
+        # 既にvision_towerが設定されている場合は何もしない（MllamaConfigの場合）
+        
+        # vision_select_feature
+        if not hasattr(self.config, "mm_vision_select_feature"):
+            # MllamaConfig用に新しく属性を追加
+            self.config.mm_vision_select_feature = "patch"
+        
+        # 他の設定属性を確実に設定
         self.config.image_aspect_ratio = "square"
         self.config.image_grid_pinpoints = None
         self.config.tune_mm_mlp_adapter = False
