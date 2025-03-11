@@ -96,10 +96,13 @@ def get_default_conv_template():
     )
 
 
-# 特定のテンプレート名に基づいて会話を取得
-def conv_templates(template_name):
-    """指定されたテンプレート名から会話オブジェクトを取得"""
-    if template_name == "llama_3":
-        return get_default_conv_template()
-    else:
-        raise ValueError(f"Template not found: {template_name}") 
+# 会話テンプレートを辞書として定義
+llama_3_template = get_default_conv_template()
+
+# テンプレート辞書
+conv_templates = {
+    "llama_3": llama_3_template,
+}
+
+# デフォルトの会話テンプレート
+default_conversation = llama_3_template 
