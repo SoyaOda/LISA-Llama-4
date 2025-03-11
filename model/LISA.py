@@ -291,15 +291,24 @@ class LISAForCausalLM(nn.Module):
                 print(f"警告: 出力埋め込みの初期化中にエラーが発生しました: {e}")
                 print("DeepSpeed環境での処理中は正常なため、続行します")
             
-            # LISAモデルの初期化
-            self.lisa_model = LisaModel(config, **kwargs)
-            
-            # LISAモデルの視覚モデルを共有
-            self.visual_model = self.lisa_model.visual_model
-            
         except Exception as e:
             print(f"Error initializing model: {e}")
             raise
+            
+        # tryブロックの外でLISAモデルを初期化
+        # 必要なパラメータを準備
+        lisa_kwargs = {
+            'train_mask_decoder': train_mask_decoder,
+            'out_dim': out_dim,
+            'vision_pretrained': vision_pretrained,
+            'vision_tower': vision_tower
+        }
+        
+        # LISAモデルの初期化
+        self.lisa_model = LisaModel(config, **lisa_kwargs)
+        
+        # LISAモデルの視覚モデルを共有
+        self.visual_model = self.lisa_model.visual_model
 
     def get_processor(self):
         """
