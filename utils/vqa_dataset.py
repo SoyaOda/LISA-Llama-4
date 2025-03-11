@@ -45,6 +45,7 @@ class VQADataset(torch.utils.data.Dataset):
         num_classes_per_sample: int = 3,
         exclude_val=False,
         vqa_data="llava_instruct_150k",
+        processor=None,
     ):
         self.exclude_val = exclude_val
         self.samples_per_epoch = samples_per_epoch
@@ -56,6 +57,7 @@ class VQADataset(torch.utils.data.Dataset):
         self.precision = precision
         self.transform = ResizeLongestSide(image_size)
         self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
+        self.processor = processor
 
         DATA_DIR = os.path.join(base_image_dir, "llava_dataset")
         self.vqa_image_root = os.path.join(base_image_dir, "coco/train2017")

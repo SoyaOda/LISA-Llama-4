@@ -36,6 +36,7 @@ class ReasonSegDataset(torch.utils.data.Dataset):
         exclude_val=False,
         reason_seg_data="ReasonSeg|train",
         explanatory=0.1,
+        processor=None,
     ):
         self.exclude_val = exclude_val
         self.reason_seg_data = reason_seg_data
@@ -49,6 +50,7 @@ class ReasonSegDataset(torch.utils.data.Dataset):
         self.precision = precision
         self.transform = ResizeLongestSide(image_size)
         self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
+        self.processor = processor
 
         self.short_question_list = SHORT_QUESTION_LIST
         self.long_question_list = LONG_QUESTION_LIST

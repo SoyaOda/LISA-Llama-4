@@ -33,6 +33,7 @@ class ReferSegDataset(torch.utils.data.Dataset):
         num_classes_per_sample: int = 3,
         exclude_val=False,
         refer_seg_data="refclef||refcoco||refcoco+||refcocog",
+        processor=None,
     ):
         self.exclude_val = exclude_val
         self.samples_per_epoch = samples_per_epoch
