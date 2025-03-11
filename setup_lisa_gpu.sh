@@ -52,10 +52,10 @@ echo "🧠 SAMモデルをダウンロード中..."
 run_remote_cmd "cd ~/LISA-Llama-4 && source lisa_env/bin/activate && mkdir -p checkpoints && cd checkpoints && wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
 
 # CUDAの設定
-echo "🖥️ CUDAを設定中..."
-run_remote_cmd 'echo "export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:/usr/local/cuda-11.7/lib64" >> ~/.bashrc'
-run_remote_cmd 'echo "export PATH=\$PATH:/usr/local/cuda-11.7/bin" >> ~/.bashrc'
-run_remote_cmd "source ~/.bashrc"
+# echo "🖥️ CUDAを設定中..."
+# run_remote_cmd 'echo "export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:/usr/local/cuda-11.7/lib64" >> ~/.bashrc'
+# run_remote_cmd 'echo "export PATH=\$PATH:/usr/local/cuda-11.7/bin" >> ~/.bashrc'
+# run_remote_cmd "source ~/.bashrc"
 
 # 完了メッセージ
 echo "✅ セットアップが完了しました！"

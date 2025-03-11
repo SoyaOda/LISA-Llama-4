@@ -146,114 +146,114 @@ class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
         self.config.mm_use_im_patch_token = False
 
 
-class LISAForCausalLM(Llama3VisionForCausalLM):
+class LISAForCausalLM(nn.Module):
     def __init__(
         self,
-        model_id="meta-llama/Llama-3.2-11B-Vision-Instruct",
-        **kwargs,
+        model_id=None,
+        model=None,
+        config=None,
+        cache_dir=None,
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=False,
+        train_mask_decoder=True,
+        out_dim=256,
+        ce_loss_weight=1.0,
+        dice_loss_weight=0.5,
+        bce_loss_weight=2.0,
+        seg_token_idx=0,
+        vision_pretrained="PATH/TO/SAM/CHECKPOINT",
+        vision_tower="openai/clip-vit-large-patch14",
+        use_mm_start_end=True,
     ):
-        # モデルIDからconfigを生成
-        config = kwargs.pop("config", None)
-        if config is None:
-            config = AutoConfig.from_pretrained(model_id)
+        super().__init__()
         
-        # セグメンテーショントークンIDを保存
-        self.seg_token_idx = kwargs.pop("seg_token_idx", None)
-        self.ce_loss_weight = kwargs.pop("ce_loss_weight", None)
-        self.dice_loss_weight = kwargs.pop("dice_loss_weight", None)
-        self.bce_loss_weight = kwargs.pop("bce_loss_weight", None)
-        
-        if not hasattr(config, "train_mask_decoder"):
-            config.mm_use_im_start_end = kwargs.pop("use_mm_start_end", True)
-            config.mm_use_im_patch_token = kwargs.pop("use_mm_use_im_patch_token", False)
-            config.tune_mm_mlp_adapter = kwargs.pop("tune_mm_mlp_adapter", False)
-            config.freeze_backbone = kwargs.pop("freeze_backbone", True)
-            config.vision_tower = kwargs.pop("vision_tower", None)
-            config.mm_vision_select_layer = kwargs.pop("mm_vision_select_layer", -1)
-            config.pretrain_mm_mlp_adapter = kwargs.pop("pretrain_mm_mlp_adapter", None)
-            config.mm_vision_select_feature = kwargs.pop("mm_vision_select_feature", "patch")
-            config.vision_select_layer = kwargs.pop("vision_select_layer", -1)
-            config.image_size = kwargs.pop("image_size", 1024)
-            config.train_mask_decoder = kwargs.pop("train_mask_decoder", True)
-            config.out_dim = kwargs.pop("out_dim", 256)
-            config.select_layer = kwargs.pop("select_layer", -1)
-            config.vision_pretrained = kwargs.pop("vision_pretrained", None)
-            config.device_map = kwargs.pop("device_map", None)
-            config.query_len = kwargs.pop("query_len", 1)
-        
-        # 親クラスの初期化 - ここでPreTrainedModelを初期化
-        super().__init__(config, model_id=model_id)
-        
-        # torch_dtype設定
-        torch_dtype = kwargs.get("torch_dtype", torch.bfloat16)
-        device_map = kwargs.get("device_map", "auto")
-        
-        # デバッグ情報
-        print(f"Loading Llama3.2 Vision model: {model_id}")
-        print(f"  - torch_dtype: {torch_dtype}")
-        print(f"  - device_map: {device_map}")
+        # LISA構成設定
+        self.ce_loss_weight = ce_loss_weight
+        self.dice_loss_weight = dice_loss_weight
+        self.bce_loss_weight = bce_loss_weight
+        self.train_mask_decoder = train_mask_decoder
         
         try:
-            # Llama3.2 Vision用のモデルをMllamaForConditionalGenerationを使用して直接設定
+            # モデルの初期化
+            print(f"Loading Llama3.2 Vision model: {model_id}")
+            print(f"  - torch_dtype: {torch_dtype}")
+            print(f"  - device_map: auto")
+            
+            # Llama3.2 Visionモデルのロード
             self.model = MllamaForConditionalGeneration.from_pretrained(
-                model_id, 
+                model_id,
                 torch_dtype=torch_dtype,
-                device_map=device_map
+                low_cpu_mem_usage=low_cpu_mem_usage,
+                device_map="auto"
             )
-            print(f"  - Model loaded successfully: {type(self.model)}")
+            
+            # Llama3.2 Vision用のプロセッサを初期化
+            self.processor = AutoProcessor.from_pretrained(model_id)
+            
+            # <SEG>トークンを追加
+            special_tokens = {"additional_special_tokens": ["<SEG>"]}
+            num_added_tokens = self.processor.tokenizer.add_special_tokens(special_tokens)
+            print(f"  - Added {num_added_tokens} special tokens: <SEG>")
+            
+            # トークナイザでSEGトークンのインデックスを保存
+            self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids("<SEG>")
+            print(f"  - <SEG> token index: {self.seg_token_idx}")
+            
+            # 埋め込みをリサイズ
+            # 入力埋め込みのリサイズ
+            orig_num_tokens = self.model.config.vocab_size
+            new_num_tokens = len(self.processor.tokenizer)
+            print(f"  - Resizing embeddings from {orig_num_tokens} to {new_num_tokens}")
+            
+            # 入力埋め込みをリサイズ
+            self.model.resize_token_embeddings(new_num_tokens)
+            
+            # 出力埋め込みのリサイズ（手動）
+            try:
+                output_embeddings = self.model.get_output_embeddings()
+                
+                # メタデバイスチェック
+                if hasattr(output_embeddings, 'weight') and output_embeddings.weight.device.type == 'meta':
+                    print("警告: メタデバイス上の出力埋め込みを検出しました")
+                    print("DeepSpeed環境では通常の方法でリサイズできません")
+                    print("入力埋め込みのリサイズのみ完了。後で重み共有を行います")
+                else:
+                    # 通常のケース - 出力埋め込みが実デバイス上にある場合
+                    new_output_embeddings = torch.nn.Linear(
+                        output_embeddings.in_features,
+                        new_num_tokens,
+                        bias=output_embeddings.bias is not None,
+                        device=output_embeddings.weight.device
+                    )
+                    
+                    with torch.no_grad():
+                        # 既存のトークンの埋め込みをコピー
+                        new_output_embeddings.weight.data[:orig_num_tokens, :] = output_embeddings.weight.data
+                        # 新しいトークンの埋め込みを小さな乱数で初期化
+                        new_output_embeddings.weight.data[orig_num_tokens:, :].normal_(mean=0.0, std=0.02)
+                        
+                        if output_embeddings.bias is not None:
+                            new_output_embeddings.bias.data[:orig_num_tokens] = output_embeddings.bias.data
+                            new_output_embeddings.bias.data[orig_num_tokens:] = 0
+                    
+                    # 新しい出力埋め込みを設定
+                    self.model.set_output_embeddings(new_output_embeddings)
+                
+                # 重み共有を明示的に実行
+                print("入力/出力埋め込みの重みを共有（タイying）します")
+                self.model.tie_weights()
+                
+            except Exception as e:
+                print(f"警告: 出力埋め込みの初期化中にエラーが発生しました: {e}")
+                print("DeepSpeed環境での処理中は正常なため、続行します")
+            
+            # LLMとは別にSAMのビジョンエンコーダも初期化
+            self.model.initialize_vision_modules(self.model.config)
+            
         except Exception as e:
-            print(f"Error loading model: {e}")
+            print(f"Error initializing model: {e}")
             raise
         
-        # モデルIDを保存
-        self.model_id = model_id
-        
-        # プロセッサを明示的に初期化
-        self.processor = AutoProcessor.from_pretrained(model_id)
-        
-        # <SEG>トークンを追加
-        special_tokens = {"additional_special_tokens": ["<SEG>"]}
-        num_added_tokens = self.processor.tokenizer.add_special_tokens(special_tokens)
-        print(f"  - Added {num_added_tokens} special tokens: <SEG>")
-        
-        # トークナイザでSEGトークンのインデックスを保存
-        self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids("<SEG>")
-        print(f"  - <SEG> token index: {self.seg_token_idx}")
-        
-        # 埋め込みをリサイズ
-        # 入力埋め込みのリサイズ
-        self.model.resize_token_embeddings(len(self.processor.tokenizer))
-        
-        # 出力埋め込みのリサイズ（手動）
-        # Llama3.2は入力と出力の埋め込みが分離されているため、出力埋め込みも明示的にリサイズする
-        output_embeddings = self.model.get_output_embeddings()
-        if output_embeddings is not None:
-            orig_num_tokens = output_embeddings.out_features
-            new_num_tokens = len(self.processor.tokenizer)
-            
-            if orig_num_tokens != new_num_tokens:
-                print(f"  - Resizing output embeddings from {orig_num_tokens} to {new_num_tokens}")
-                new_output_embeddings = torch.nn.Linear(
-                    output_embeddings.in_features, 
-                    new_num_tokens, 
-                    bias=output_embeddings.bias is not None
-                )
-                
-                # 既存の重みをコピー
-                with torch.no_grad():
-                    # 既存のトークンの埋め込みをコピー
-                    new_output_embeddings.weight.data[:orig_num_tokens, :] = output_embeddings.weight.data
-                    # 新しいトークンの埋め込みを小さな乱数で初期化
-                    new_output_embeddings.weight.data[orig_num_tokens:, :].normal_(mean=0.0, std=0.02)
-                    
-                    # バイアスがある場合はそのコピーも行う
-                    if output_embeddings.bias is not None:
-                        new_output_embeddings.bias.data[:orig_num_tokens] = output_embeddings.bias.data
-                        new_output_embeddings.bias.data[orig_num_tokens:] = 0
-                
-                # 新しい出力埋め込みを設定
-                self.model.set_output_embeddings(new_output_embeddings)
-
         # LISAモデルの初期化
         self.lisa_model = LisaModel(config, **kwargs)
         
