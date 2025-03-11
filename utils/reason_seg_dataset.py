@@ -61,6 +61,7 @@ class ReasonSegDataset(torch.utils.data.Dataset):
         self.tokenizer = tokenizer
         self.explanatory = explanatory
         self.img_size = 1024  # SAM用の画像サイズ
+        self.val = val
 
         # Llama3.2 Vision用のプロセッサーが必要
         if processor is None:
@@ -329,3 +330,36 @@ class ReasonSegDataset(torch.utils.data.Dataset):
             "resize": resize,
             "original_size": ori_size,
         }
+
+    def get_all_annos(self):
+        """
+        検証用のすべてのアノテーションを取得します
+        Returns:
+            list: 画像パスのリスト
+        """
+        if self.val:
+            # 検証用の場合は画像パスのリストを返す
+            return self.image_paths
+        else:
+            # 訓練用の場合は空のリストを返す
+            return []
+            
+    def get_anno_by_idx(self, idx, inference=False):
+        """
+        指定されたインデックスのアノテーションを取得します
+        Args:
+            idx: インデックス
+            inference: 推論モードかどうか
+        Returns:
+            tuple: データセットの項目
+        """
+        # 通常の__getitem__と同じ処理を行うが、inferenceフラグを追加
+        result = self.__getitem__(idx)
+        
+        # 推論モードの場合、結果のタプルに推論フラグを追加
+        if inference and isinstance(result, tuple):
+            # 結果がタプルの場合、最後に推論フラグを追加
+            # 元のタプルの内容を展開し、最後にinference=Trueを追加
+            return result + (True,)
+        
+        return result
