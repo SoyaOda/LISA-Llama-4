@@ -164,6 +164,7 @@ class LISAForCausalLM(nn.Module):
         vision_pretrained="PATH/TO/SAM/CHECKPOINT",
         vision_tower="openai/clip-vit-large-patch14",
         use_mm_start_end=True,
+        device_map=None,
     ):
         super().__init__()
         
@@ -177,14 +178,14 @@ class LISAForCausalLM(nn.Module):
             # モデルの初期化
             print(f"Loading Llama3.2 Vision model: {model_id}")
             print(f"  - torch_dtype: {torch_dtype}")
-            print(f"  - device_map: auto")
+            print(f"  - device_map: {device_map}")
             
             # Llama3.2 Visionモデルのロード
             self.model = MllamaForConditionalGeneration.from_pretrained(
                 model_id,
                 torch_dtype=torch_dtype,
                 low_cpu_mem_usage=low_cpu_mem_usage,
-                device_map="auto"
+                device_map=device_map
             )
             
             # Llama3.2 Vision用のプロセッサを初期化
