@@ -9,8 +9,8 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, BitsAndBytesConfig, CLIPImageProcessor
 
 from model.LISA import LISAForCausalLM
-from model.llava import conversation as conversation_lib
-from model.llava.mm_utils import tokenizer_image_token
+from model.llama3_2 import conversation as conversation_lib
+from model.llama3_2.mm_utils import tokenizer_image_token
 from model.segment_anything.utils.transforms import ResizeLongestSide
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX)

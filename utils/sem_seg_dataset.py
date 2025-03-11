@@ -11,7 +11,7 @@ from PIL import Image
 from pycocotools.coco import COCO
 from transformers import CLIPImageProcessor
 
-from model.llava import conversation as conversation_lib
+from model.llama3_2 import conversation as conversation_lib
 from model.segment_anything.utils.transforms import ResizeLongestSide
 
 from .utils import ANSWER_LIST, SHORT_QUESTION_LIST
