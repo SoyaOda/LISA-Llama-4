@@ -37,6 +37,7 @@ class ReasonSegDataset(torch.utils.data.Dataset):
         reason_seg_data=None,
         explanatory=0.0,
         processor=None,
+        val=False,
     ):
         """
         ReasonSegDatasetの初期化
@@ -52,6 +53,7 @@ class ReasonSegDataset(torch.utils.data.Dataset):
             reason_seg_data: ReasonSegデータへのパス（ディレクトリまたはデータリスト）
             explanatory: 説明付きデータの割合
             processor: Llama3.2 Visionモデル用のプロセッサー
+            val: 検証データとして使用するかどうか
         """
         self.samples_per_epoch = samples_per_epoch
         self.num_classes_per_sample = num_classes_per_sample

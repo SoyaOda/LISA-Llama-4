@@ -495,14 +495,17 @@ class ValDataset(torch.utils.data.Dataset):
             if val_dataset_name == "ReasonSeg":
                 self.dataset = ReasonSegDataset(
                     base_image_dir,
-                    val_dataset_name,
-                    val_split,
-                    tokenizer,
-                    self.transform,
-                    self.transform_sam,
-                    0,
-                    val=True,
-                    processor=processor,
+                    tokenizer, 
+                    vision_tower=vision_tower,  # vision_towerを渡す
+                    samples_per_epoch=100,      # 少数に設定（検証用）
+                    precision="fp32",           # 精度
+                    image_size=self.image_size, # 画像サイズ
+                    num_classes_per_sample=1,   # クラス数
+                    exclude_val=False,          # 検証データを除外しない
+                    reason_seg_data=f"{val_dataset_name}|{val_split}", # データ指定
+                    explanatory=0.0,            # 説明データの割合
+                    processor=processor,        # プロセッサ
+                    val=True,                   # 検証用フラグ
                 )
             else:
                 print(f"Val dataset {val_dataset_name} not supported!")
