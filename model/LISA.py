@@ -180,6 +180,11 @@ class LISAForCausalLM(nn.Module):
             print(f"  - torch_dtype: {torch_dtype}")
             print(f"  - device_map: {device_map}")
             
+            # device_mapが指定されている場合は、low_cpu_mem_usage=Trueを強制的に設定
+            if device_map is not None:
+                low_cpu_mem_usage = True
+                print(f"  - Setting low_cpu_mem_usage=True (required for device_map)")
+            
             # Llama3.2 Visionモデルのロード
             self.model = MllamaForConditionalGeneration.from_pretrained(
                 model_id,
