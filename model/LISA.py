@@ -123,35 +123,44 @@ class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
 class LISAForCausalLM(Llama3VisionForCausalLM):
     def __init__(
         self,
-        config,
+        model_id="meta-llama/Llama-3.2-11B-Vision-Instruct",
         **kwargs,
     ):
+        # モデルIDからconfigを生成
+        config = kwargs.pop("config", None)
+        if config is None:
+            config = AutoConfig.from_pretrained(model_id)
+        
+        # セグメンテーショントークンIDを保存
+        self.seg_token_idx = kwargs.pop("seg_token_idx", None)
+        self.ce_loss_weight = kwargs.pop("ce_loss_weight", None)
+        self.dice_loss_weight = kwargs.pop("dice_loss_weight", None)
+        self.bce_loss_weight = kwargs.pop("bce_loss_weight", None)
+        
+        # 親クラスの初期化
+        super().__init__(model_id=model_id, **kwargs)
+        
+        # Llama3.2モデルへの参照を確保
+        self.language_model = self.model
+        
         if not hasattr(config, "train_mask_decoder"):
             config.mm_use_im_start_end = kwargs.pop("use_mm_start_end", True)
-            config.mm_vision_tower = kwargs.get(
-                "vision_tower", "meta-llama/Llama-3.2-11B-Vision-Instruct"
-            )
-            self.ce_loss_weight = kwargs.pop("ce_loss_weight", None)
-            self.dice_loss_weight = kwargs.pop("dice_loss_weight", None)
-            self.bce_loss_weight = kwargs.pop("bce_loss_weight", None)
-        else:
-            config.mm_vision_tower = config.vision_tower
+            config.mm_use_im_patch_token = kwargs.pop("use_mm_use_im_patch_token", False)
+            config.tune_mm_mlp_adapter = kwargs.pop("tune_mm_mlp_adapter", False)
+            config.freeze_backbone = kwargs.pop("freeze_backbone", True)
+            config.vision_tower = kwargs.pop("vision_tower", None)
+            config.mm_vision_select_layer = kwargs.pop("mm_vision_select_layer", -1)
+            config.pretrain_mm_mlp_adapter = kwargs.pop("pretrain_mm_mlp_adapter", None)
+            config.mm_vision_select_feature = kwargs.pop("mm_vision_select_feature", "patch")
+            config.vision_select_layer = kwargs.pop("vision_select_layer", -1)
+            config.image_size = kwargs.pop("image_size", 1024)
+            config.train_mask_decoder = kwargs.pop("train_mask_decoder", True)
+            config.out_dim = kwargs.pop("out_dim", 256)
+            config.select_layer = kwargs.pop("select_layer", -1)
+            config.vision_pretrained = kwargs.pop("vision_pretrained", None)
+            config.device_map = kwargs.pop("device_map", None)
+            config.query_len = kwargs.pop("query_len", 1)
             
-        self.seg_token_idx = kwargs.pop("seg_token_idx")
-
-        # Llama3.2 vision用の初期化
-        config = AutoConfig.from_pretrained(config.mm_vision_tower)
-        super(Llama3VisionForCausalLM, self).__init__(config)
-        
-        # モデルIDを設定
-        self.model_id = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-        self.dtype = kwargs.get("torch_dtype", torch.bfloat16)
-        self.model = AutoModelForVision2Seq.from_pretrained(
-            self.model_id, 
-            torch_dtype=self.dtype,
-            device_map=kwargs.get("device_map", "auto")
-        )
-        
         # プロセッサを初期化
         self.processor = None
 
@@ -187,7 +196,7 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
     def forward(self, **kwargs):
         if "past_key_values" in kwargs:
             # Llama3.2 visionモデルの標準forward
-            return self.model(**kwargs)
+            return self.language_model(**kwargs)
         return self.model_forward(**kwargs)
 
     def model_forward(
@@ -249,10 +258,10 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
                 )
                 
                 # デバイスを合わせる
-                batch_inputs = {k: v.to(self.model.device) for k, v in batch_inputs.items()}
+                batch_inputs = {k: v.to(self.language_model.device) for k, v in batch_inputs.items()}
                 
                 # モデルを実行
-                output_i = self.model(**batch_inputs, output_hidden_states=True)
+                output_i = self.language_model(**batch_inputs, output_hidden_states=True)
                 output_hidden_states.append(output_i.hidden_states)
                 torch.cuda.empty_cache()
 
@@ -291,10 +300,10 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
                 batch_inputs["labels"] = labels
                 
             # デバイスを合わせる
-            batch_inputs = {k: v.to(self.model.device) for k, v in batch_inputs.items()}
+            batch_inputs = {k: v.to(self.language_model.device) for k, v in batch_inputs.items()}
             
             # モデルを実行
-            output = self.model(**batch_inputs, output_hidden_states=True)
+            output = self.language_model(**batch_inputs, output_hidden_states=True)
             output_hidden_states = output.hidden_states
 
         # 以下はオリジナルのLISAと同様の処理
@@ -418,7 +427,7 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
             )
             
             # デバイスを合わせる
-            batch_inputs = {k: v.to(self.model.device) for k, v in batch_inputs.items()}
+            batch_inputs = {k: v.to(self.language_model.device) for k, v in batch_inputs.items()}
             
             # 生成パラメータを設定
             generation_config = {
@@ -429,7 +438,7 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
             }
             
             # 生成を実行
-            outputs = self.model.generate(**batch_inputs, **generation_config)
+            outputs = self.language_model.generate(**batch_inputs, **generation_config)
             
             # 出力を取得
             output_hidden_states = outputs.hidden_states[-1]
