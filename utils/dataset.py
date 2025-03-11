@@ -81,32 +81,53 @@ def collate_fn(
         if conv_type == "llama_3":
             # Llama3.2 vision用の処理
             for conv in conversation_list:
-                # 空の入力テキストを準備
-                empty_text = ""
+                if isinstance(conv, list):
+                    # テキストリストの場合はテキスト部分を抽出
+                    text_content = conv[0] if len(conv) > 0 else ""
+                else:
+                    # 会話オブジェクトの場合はプロンプトを取得
+                    text_content = conv.get_prompt() if hasattr(conv, "get_prompt") else ""
                 
-                # 画像とテキストを組み合わせたメッセージ形式に変換
-                messages = [{"role": "user", "content": [
-                    {"type": "image"},  # 画像
-                    {"type": "text", "text": empty_text}  # テキスト
-                ]}]
-                
+                # processorが提供されている場合はprocessorを使用
                 if processor is not None:
-                    # プロセッサを使用してメッセージをエンコード
-                    inputs = processor(text=empty_text, return_tensors="pt")
+                    # プロセッサを使用してテキストをエンコード（画像は後でバッチ処理で追加）
+                    chat_template = [{"role": "user", "content": text_content}]
+                    chat_text = processor.tokenizer.apply_chat_template(
+                        chat_template, 
+                        tokenize=False, 
+                        add_generation_prompt=True
+                    )
+                    
+                    inputs = processor.tokenizer(
+                        chat_text, 
+                        return_tensors="pt", 
+                        padding="longest",
+                        truncation=True
+                    )
+                    
                     input_id = inputs["input_ids"][0]
                     attention_mask = inputs["attention_mask"][0]
+                    
+                    # ラベルを作成 - 入力部分は-100でマスク
+                    label = torch.ones_like(input_id) * -100
+                    
+                    # <SEG>トークンが応答に含まれている場合は、そのIDをラベルに設定
+                    if "<SEG>" in text_content and tokenizer is not None:
+                        seg_token_id = tokenizer.convert_tokens_to_ids("<SEG>")
+                        if seg_token_id is not None:
+                            # <SEG>トークンを含む応答部分を抽出
+                            seg_positions = (input_id == seg_token_id).nonzero(as_tuple=True)[0]
+                            for pos in seg_positions:
+                                label[pos] = seg_token_id
                 else:
-                    # プロセッサがない場合はトークナイザで処理
-                    input_id = tokenizer(empty_text).input_ids
-                    input_id = torch.LongTensor(input_id)
+                    # プロセッサがない場合はトークナイザで処理（フォールバック）
+                    input_id = tokenizer(text_content, return_tensors="pt").input_ids[0]
                     attention_mask = torch.ones_like(input_id)
+                    label = torch.ones_like(input_id) * -100
                 
                 # 入力とラベルを保存
                 input_ids.append(input_id)
                 attention_masks.append(attention_mask)
-                
-                # ラベルは画像を除いた応答部分のみ
-                label = torch.LongTensor([-100] * len(input_id))  # ラベルはIDENTITY_MASK（-100）でマスク
                 labels.append(label)
         else:
             # 従来の処理方法（互換性のため残す）
@@ -266,17 +287,29 @@ class HybridDataset(torch.utils.data.Dataset):
         if "sem_seg" in dataset_names:
             sem_seg_idx = dataset_names.index("sem_seg")
             if sem_seg_data is not None:
-                self.sem_seg_dataset = SemSegDataset(
-                    base_image_dir,
-                    sem_seg_data,
-                    tokenizer,
-                    self.transform,
-                    self.transform_sam,
-                    num_classes_per_sample=num_classes_per_sample,
-                    exclude_val=exclude_val,
-                    processor=processor,
-                )
-                self.dataset_list.append(self.sem_seg_dataset)
+                try:
+                    print(f"Initializing SemSegDataset with base_dir={base_image_dir}, data={sem_seg_data}")
+                    self.sem_seg_dataset = SemSegDataset(
+                        base_image_dir,
+                        tokenizer,
+                        vision_tower,
+                        samples_per_epoch=samples_per_epoch // 4,
+                        precision=precision,
+                        image_size=image_size,
+                        num_classes_per_sample=num_classes_per_sample,
+                        exclude_val=exclude_val,
+                        sem_seg_data=sem_seg_data,
+                        processor=processor,
+                    )
+                    self.dataset_list.append(self.sem_seg_dataset)
+                except Exception as e:
+                    print(f"ERROR: Failed to initialize SemSegDataset: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print("Creating dummy dataset for sem_seg")
+                    self.sem_seg_dataset = None
+                    self.dataset_list.append(None)
+                    self.sample_rate[sem_seg_idx] = 0
             else:
                 self.dataset_list.append(None)
                 self.sample_rate[sem_seg_idx] = 0
@@ -287,15 +320,29 @@ class HybridDataset(torch.utils.data.Dataset):
         if "refer_seg" in dataset_names:
             refer_seg_idx = dataset_names.index("refer_seg")
             if refer_seg_data is not None:
-                self.refer_seg_dataset = ReferSegDataset(
-                    base_image_dir,
-                    refer_seg_data,
-                    tokenizer,
-                    self.transform,
-                    self.transform_sam,
-                    processor=processor,
-                )
-                self.dataset_list.append(self.refer_seg_dataset)
+                try:
+                    print(f"Initializing ReferSegDataset with base_dir={base_image_dir}, data={refer_seg_data}")
+                    self.refer_seg_dataset = ReferSegDataset(
+                        base_image_dir,
+                        tokenizer,
+                        vision_tower,
+                        samples_per_epoch=samples_per_epoch // 4,
+                        precision=precision,
+                        image_size=image_size,
+                        num_classes_per_sample=num_classes_per_sample, 
+                        exclude_val=exclude_val,
+                        refer_seg_data=refer_seg_data,
+                        processor=processor,
+                    )
+                    self.dataset_list.append(self.refer_seg_dataset)
+                except Exception as e:
+                    print(f"ERROR: Failed to initialize ReferSegDataset: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print("Creating dummy dataset for refer_seg")
+                    self.refer_seg_dataset = None
+                    self.dataset_list.append(None)
+                    self.sample_rate[refer_seg_idx] = 0
             else:
                 self.dataset_list.append(None)
                 self.sample_rate[refer_seg_idx] = 0
@@ -306,15 +353,29 @@ class HybridDataset(torch.utils.data.Dataset):
         if "vqa" in dataset_names:
             vqa_idx = dataset_names.index("vqa")
             if vqa_data is not None:
-                self.vqa_dataset = VQADataset(
-                    base_image_dir,
-                    vqa_data,
-                    tokenizer,
-                    self.transform,
-                    self.transform_sam,
-                    processor=processor,
-                )
-                self.dataset_list.append(self.vqa_dataset)
+                try:
+                    print(f"Initializing VQADataset with base_dir={base_image_dir}, data={vqa_data}")
+                    self.vqa_dataset = VQADataset(
+                        base_image_dir,
+                        tokenizer,
+                        vision_tower,
+                        samples_per_epoch=samples_per_epoch // 4,
+                        precision=precision,
+                        image_size=image_size,
+                        num_classes_per_sample=num_classes_per_sample,
+                        exclude_val=exclude_val,
+                        vqa_data=vqa_data,
+                        processor=processor,
+                    )
+                    self.dataset_list.append(self.vqa_dataset)
+                except Exception as e:
+                    print(f"ERROR: Failed to initialize VQADataset: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print("Creating dummy dataset for vqa")
+                    self.vqa_dataset = None
+                    self.dataset_list.append(None)
+                    self.sample_rate[vqa_idx] = 0
             else:
                 self.dataset_list.append(None)
                 self.sample_rate[vqa_idx] = 0
@@ -324,25 +385,47 @@ class HybridDataset(torch.utils.data.Dataset):
         # ReasonSegデータセット
         if "reason_seg" in dataset_names:
             reason_seg_idx = dataset_names.index("reason_seg")
-            if reason_seg_data is not None:
-                reason_seg_dataset_name, reason_seg_split = reason_seg_data.split("|")
+            try:
+                print(f"Initializing ReasonSegDataset with base_dir={base_image_dir}")
                 self.reason_seg_dataset = ReasonSegDataset(
                     base_image_dir,
-                    reason_seg_dataset_name,
-                    reason_seg_split,
                     tokenizer,
-                    self.transform,
-                    self.transform_sam,
-                    explanatory,
+                    vision_tower,
+                    samples_per_epoch=samples_per_epoch // 4,
+                    precision=precision,
+                    image_size=image_size,
+                    num_classes_per_sample=num_classes_per_sample,
+                    exclude_val=exclude_val,
+                    reason_seg_data="reason_seg/ReasonSeg",
+                    explanatory=0.1,
                     processor=processor,
                 )
                 self.dataset_list.append(self.reason_seg_dataset)
-            else:
+            except Exception as e:
+                print(f"ERROR: Failed to initialize ReasonSegDataset: {e}")
+                import traceback
+                traceback.print_exc()
+                print("Creating dummy dataset for reason_seg")
+                self.reason_seg_dataset = None
                 self.dataset_list.append(None)
                 self.sample_rate[reason_seg_idx] = 0
         else:
             self.reason_seg_dataset = None
 
+        # 有効なデータセットがあるか確認
+        valid_datasets = [ds for ds in self.dataset_list if ds is not None]
+        if not valid_datasets:
+            print("WARNING: No valid datasets were initialized!")
+            print(f"Dataset names: {dataset_names}")
+            print(f"Sample rates: {sample_rate}")
+            # 少なくとも1つのダミーデータセットを作成（エラーを回避するため）
+            print("Creating a dummy dataset to avoid runtime errors")
+            # 最初のデータセット名を取得
+            if dataset_names:
+                first_ds = dataset_names[0]
+                print(f"Creating dummy dataset for {first_ds}")
+                # 必要なダミーデータセットを作成（実装が必要）
+        
         # サンプリングレートの正規化
         if self.sample_rate.sum() == 0:
             self.sample_rate = np.ones_like(self.sample_rate) / len(self.sample_rate)

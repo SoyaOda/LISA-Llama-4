@@ -129,13 +129,27 @@ def main(args):
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
         
-    num_added_tokens = tokenizer.add_tokens("[SEG]")
-    args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
+    # <SEG>トークンを追加
+    special_tokens = {"additional_special_tokens": ["<SEG>"]}
+    num_added_tokens = tokenizer.add_special_tokens(special_tokens)
+    
+    # プロセッサのトークナイザにも同じトークンを追加
+    if processor is not None and hasattr(processor, "tokenizer"):
+        processor.tokenizer.add_special_tokens(special_tokens)
+    
+    # <SEG>トークンのIDを保存
+    args.seg_token_idx = tokenizer.convert_tokens_to_ids("<SEG>")
+    print(f"Added <SEG> token with ID: {args.seg_token_idx}")
 
     if args.use_mm_start_end:
         tokenizer.add_tokens(
             [DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True
         )
+        # プロセッサのトークナイザにも追加
+        if processor is not None and hasattr(processor, "tokenizer"):
+            processor.tokenizer.add_tokens(
+                [DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True
+            )
 
     model_args = {
         "train_mask_decoder": args.train_mask_decoder,
@@ -160,7 +174,11 @@ def main(args):
         **model_args
     )
     
-    # モデルの入力埋め込みと出力埋め込みを結合
+    # 埋め込みの調整 - LISAForCausalLMでは既に行われているが、念のためここでも行う
+    # トークン埋め込みのサイズ変更（入力と出力の両方）
+    model.resize_token_embeddings(len(tokenizer))
+    
+    # 入力埋め込みと出力埋め込みを結合
     model.tie_weights()
     if hasattr(model, "model") and hasattr(model.model, "tie_weights"):
         model.model.tie_weights()
@@ -229,9 +247,6 @@ def main(args):
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
 
-    # トークン埋め込みのサイズ変更を直接モデルに対して行う
-    model.resize_token_embeddings(len(tokenizer))
-
     for n, p in model.named_parameters():
         if any(
             [
@@ -273,6 +288,7 @@ def main(args):
             args.vision_tower,
             args.val_dataset,
             args.image_size,
+            processor=processor,
         )
         print(
             f"Training with {len(train_dataset)} examples and validating with {len(val_dataset)} examples."
@@ -328,6 +344,7 @@ def main(args):
             conv_type=args.conv_type,
             use_mm_start_end=args.use_mm_start_end,
             local_rank=args.local_rank,
+            processor=processor,
         ),
         config=ds_config,
     )
@@ -368,6 +385,7 @@ def main(args):
                 conv_type=args.conv_type,
                 use_mm_start_end=args.use_mm_start_end,
                 local_rank=args.local_rank,
+                processor=processor,
             ),
         )
 

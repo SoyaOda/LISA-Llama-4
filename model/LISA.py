@@ -187,8 +187,8 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
         print(f"  - device_map: {device_map}")
         
         try:
-            # Llama3.2 Vision用のモデルを直接設定
-            self.model = AutoModelForVision2Seq.from_pretrained(
+            # Llama3.2 Vision用のモデルをMllamaForConditionalGenerationを使用して直接設定
+            self.model = MllamaForConditionalGeneration.from_pretrained(
                 model_id, 
                 torch_dtype=torch_dtype,
                 device_map=device_map
@@ -201,8 +201,51 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
         # モデルIDを保存
         self.model_id = model_id
         
-        # プロセッサを初期化
-        self.processor = None
+        # プロセッサを明示的に初期化
+        self.processor = AutoProcessor.from_pretrained(model_id)
+        
+        # <SEG>トークンを追加
+        special_tokens = {"additional_special_tokens": ["<SEG>"]}
+        num_added_tokens = self.processor.tokenizer.add_special_tokens(special_tokens)
+        print(f"  - Added {num_added_tokens} special tokens: <SEG>")
+        
+        # トークナイザでSEGトークンのインデックスを保存
+        self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids("<SEG>")
+        print(f"  - <SEG> token index: {self.seg_token_idx}")
+        
+        # 埋め込みをリサイズ
+        # 入力埋め込みのリサイズ
+        self.model.resize_token_embeddings(len(self.processor.tokenizer))
+        
+        # 出力埋め込みのリサイズ（手動）
+        # Llama3.2は入力と出力の埋め込みが分離されているため、出力埋め込みも明示的にリサイズする
+        output_embeddings = self.model.get_output_embeddings()
+        if output_embeddings is not None:
+            orig_num_tokens = output_embeddings.out_features
+            new_num_tokens = len(self.processor.tokenizer)
+            
+            if orig_num_tokens != new_num_tokens:
+                print(f"  - Resizing output embeddings from {orig_num_tokens} to {new_num_tokens}")
+                new_output_embeddings = torch.nn.Linear(
+                    output_embeddings.in_features, 
+                    new_num_tokens, 
+                    bias=output_embeddings.bias is not None
+                )
+                
+                # 既存の重みをコピー
+                with torch.no_grad():
+                    # 既存のトークンの埋め込みをコピー
+                    new_output_embeddings.weight.data[:orig_num_tokens, :] = output_embeddings.weight.data
+                    # 新しいトークンの埋め込みを小さな乱数で初期化
+                    new_output_embeddings.weight.data[orig_num_tokens:, :].normal_(mean=0.0, std=0.02)
+                    
+                    # バイアスがある場合はそのコピーも行う
+                    if output_embeddings.bias is not None:
+                        new_output_embeddings.bias.data[:orig_num_tokens] = output_embeddings.bias.data
+                        new_output_embeddings.bias.data[orig_num_tokens:] = 0
+                
+                # 新しい出力埋め込みを設定
+                self.model.set_output_embeddings(new_output_embeddings)
 
         # LISAモデルの初期化
         self.lisa_model = LisaModel(config, **kwargs)
@@ -388,20 +431,11 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
         assert batch_size == len(offset) - 1
 
         # セグメンテーショントークンのマスクを作成
-        seg_token_mask = input_ids[:, 1:] == self.seg_token_idx
-        seg_token_mask = torch.cat(
-            [
-                seg_token_mask,
-                torch.zeros((seg_token_mask.shape[0], 1)).bool().cuda(),
-            ],
-            dim=1,
-        )
-        # Llama3.2 visionでは入力形式が異なるため、マスクを調整
-        seg_token_mask = torch.cat(
-            [torch.zeros((seg_token_mask.shape[0], 255)).bool().cuda(), seg_token_mask],
-            dim=1,
-        )
-
+        # 入力IDsの<SEG>トークンの位置を特定
+        seg_token_mask = labels == self.seg_token_idx
+        
+        # Llama3.2 Visionモデルでは入力と出力の形式が異なるため、
+        # <SEG>トークンの位置を特定するために適切なマスクを作成
         # プロセッサーを取得
         processor = self.get_processor()
 
@@ -421,7 +455,6 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
                 batch_inputs = processor(
                     text=input_ids[start_i:end_i],
                     images=images_clip_extend[: end_i - start_i],
-                    attention_mask=attention_masks[start_i:end_i],
                     return_tensors="pt",
                     padding=True,
                 )
@@ -431,14 +464,11 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
                 
                 # モデルを実行
                 output_i = self.model(**batch_inputs, output_hidden_states=True)
-                output_hidden_states.append(output_i.hidden_states)
+                output_hidden_states.append(output_i.hidden_states[-1])
                 torch.cuda.empty_cache()
 
             # 出力を結合
-            output_hidden_states_list = []
-            output_hidden_states_level = torch.cat(output_hidden_states, dim=0)
-            output_hidden_states_list.append(output_hidden_states_level)
-            output_hidden_states = output_hidden_states_list
+            output_hidden_states = torch.cat(output_hidden_states, dim=0)
             output = None
 
         else:
@@ -459,7 +489,6 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
             batch_inputs = processor(
                 text=input_ids,
                 images=images_clip,
-                attention_mask=attention_masks,
                 return_tensors="pt",
                 padding=True,
             )
@@ -473,15 +502,20 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
             
             # モデルを実行
             output = self.model(**batch_inputs, output_hidden_states=True)
-            output_hidden_states = output.hidden_states
+            output_hidden_states = output.hidden_states[-1]
 
         # 以下はオリジナルのLISAと同様の処理
         hidden_states = []
 
         assert len(self.lisa_model.text_hidden_fcs) == 1
-        hidden_states.append(self.lisa_model.text_hidden_fcs[0](output_hidden_states[-1]))
+        hidden_states.append(self.lisa_model.text_hidden_fcs[0](output_hidden_states))
 
         last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+        
+        # <SEG>トークンの位置を特定
+        seg_token_mask = labels == self.seg_token_idx
+        
+        # <SEG>トークンのembeddingを抽出
         pred_embeddings = last_hidden_state[seg_token_mask]
         seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
 
@@ -610,26 +644,37 @@ class LISAForCausalLM(Llama3VisionForCausalLM):
             outputs = self.model.generate(**batch_inputs, **generation_config)
             
             # 出力を取得
-            output_hidden_states = outputs.hidden_states[-1]
+            # 最後のレイヤーの隠れ状態を取得
+            # Llama3.2では生成中に全レイヤーの隠れ状態を保存するが、
+            # 必要なのは最終デコーダレイヤーの隠れ状態のみ
+            output_hidden_states = outputs.hidden_states[-1][-1]  # 最後のトークンの最後のレイヤー
             output_ids = outputs.sequences
+            
+            # 生成されたテキストを表示（デバッグ用）
+            if tokenizer:
+                print("生成されたテキスト:", tokenizer.batch_decode(output_ids, skip_special_tokens=False))
+
+            # <SEG>トークンの位置を特定
+            # 生成された出力の中から<SEG>トークンの位置を検出
+            seg_token_mask = output_ids == self.seg_token_idx
 
             # 以下はオリジナルのLISAと同様の処理
-            seg_token_mask = output_ids[:, 1:] == self.seg_token_idx
-            # Llama3.2 vision用にマスクを調整
-            seg_token_mask = torch.cat(
-                [
-                    torch.zeros((seg_token_mask.shape[0], 255)).bool().cuda(),
-                    seg_token_mask,
-                ],
-                dim=1,
-            )
-
             hidden_states = []
 
             assert len(self.lisa_model.text_hidden_fcs) == 1
             hidden_states.append(self.lisa_model.text_hidden_fcs[0](output_hidden_states))
 
             last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+            
+            # <SEG>トークンの位置が見つからない場合の処理
+            if not seg_token_mask.any():
+                print("警告: 生成されたテキストに<SEG>トークンが見つかりません。空のマスクを返します。")
+                return {
+                    "pred_masks": [torch.zeros_like(image[0]) for image in images],
+                    "output_text": processor.tokenizer.batch_decode(output_ids, skip_special_tokens=False),
+                }
+                
+            # <SEG>トークンのembeddingを抽出
             pred_embeddings = last_hidden_state[seg_token_mask]
 
             seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
