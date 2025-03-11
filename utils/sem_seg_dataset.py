@@ -17,50 +17,102 @@ from .utils import ANSWER_LIST, SHORT_QUESTION_LIST
 
 
 def init_mapillary(base_image_dir):
-    mapillary_data_root = os.path.join(base_image_dir, "mapillary")
-    with open(os.path.join(mapillary_data_root, "config_v2.0.json")) as f:
-        mapillary_classes = json.load(f)["labels"]
-    mapillary_classes = [x["readable"].lower() for x in mapillary_classes]
-    mapillary_classes = np.array(mapillary_classes)
-    mapillary_labels = sorted(
-        glob.glob(
-            os.path.join(mapillary_data_root, "training", "v2.0", "labels", "*.png")
-        )
-    )
-    mapillary_images = [
-        x.replace(".png", ".jpg").replace("v2.0/labels", "images")
-        for x in mapillary_labels
-    ]
-    print("mapillary: ", len(mapillary_images))
-    return mapillary_classes, mapillary_images, mapillary_labels
+    try:
+        mapillary_data_root = os.path.join(base_image_dir, "mapillary")
+        config_path = os.path.join(mapillary_data_root, "config_v2.0.json")
+        
+        print(f"DEBUG: Checking mapillary config path: {config_path}")
+        print(f"DEBUG: Path exists: {os.path.exists(config_path)}")
+        
+        if not os.path.exists(config_path):
+            print("WARNING: mapillary config file not found, returning empty dataset")
+            return np.array([]), [], []
+        
+        with open(config_path) as f:
+            mapillary_classes = json.load(f)["labels"]
+        mapillary_classes = [x["readable"].lower() for x in mapillary_classes]
+        mapillary_classes = np.array(mapillary_classes)
+        
+        # 小規模データセットの構造では、v2.0/labelsディレクトリが存在しない可能性があります
+        # 代わりに直接imagesディレクトリから画像を取得します
+        training_images_dir = os.path.join(mapillary_data_root, "training", "images")
+        
+        print(f"DEBUG: Checking training images directory: {training_images_dir}")
+        print(f"DEBUG: Directory exists: {os.path.exists(training_images_dir)}")
+        
+        if not os.path.exists(training_images_dir):
+            print("WARNING: mapillary training images directory not found, returning empty dataset")
+            return mapillary_classes, [], []
+        
+        # 直接JPG画像を取得
+        mapillary_images = sorted(glob.glob(os.path.join(training_images_dir, "*.jpg")))
+        
+        if not mapillary_images:
+            print(f"WARNING: No JPG files found in {training_images_dir}")
+            print(f"Directory contents: {os.listdir(training_images_dir)}")
+            return mapillary_classes, [], []
+        
+        print(f"DEBUG: Found {len(mapillary_images)} training images")
+        
+        # 小規模データセットではラベルが含まれていない可能性があるため、空のラベルリストを返します
+        # ラベルの代わりにダミー値（None）を使用します
+        mapillary_labels = [None] * len(mapillary_images)
+        
+        print("mapillary: ", len(mapillary_images))
+        return mapillary_classes, mapillary_images, mapillary_labels
+        
+    except Exception as e:
+        print(f"ERROR: Failed to initialize mapillary dataset: {e}")
+        import traceback
+        traceback.print_exc()
+        # エラーが発生した場合は空のデータセットを返す
+        return np.array([]), [], []
 
 
 def init_ade20k(base_image_dir):
     with open("utils/ade20k_classes.json", "r") as f:
         ade20k_classes = json.load(f)
     ade20k_classes = np.array(ade20k_classes)
-    image_ids = sorted(
-        os.listdir(os.path.join(base_image_dir, "ade20k/images", "training"))
-    )
-    ade20k_image_ids = []
-    for x in image_ids:
-        if x.endswith(".jpg"):
-            ade20k_image_ids.append(x[:-4])
+    
+    # より堅牢なパス処理
+    ade20k_dir = os.path.join(base_image_dir, "ade20k")
+    images_dir = os.path.join(ade20k_dir, "images")
+    training_dir = os.path.join(images_dir, "training")
+    
+    print(f"DEBUG: ADE20K training directory: {training_dir}")
+    print(f"DEBUG: Directory exists: {os.path.exists(training_dir)}")
+    
+    try:
+        image_ids = [f for f in os.listdir(training_dir) if f.endswith('.jpg')]
+        image_ids = sorted(image_ids)
+        print(f"DEBUG: Found {len(image_ids)} jpg files")
+    except Exception as e:
+        print(f"DEBUG: Error accessing directory: {e}")
+        # エラーの詳細情報を追加
+        import traceback
+        traceback.print_exc()
+        raise
+
+    ade20k_image_ids = [x[:-4] for x in image_ids]  # .jpg拡張子を削除
+    
     ade20k_images = []
-    for image_id in ade20k_image_ids:  # self.descriptions:
-        ade20k_images.append(
-            os.path.join(
-                base_image_dir,
-                "ade20k",
-                "images",
-                "training",
-                "{}.jpg".format(image_id),
-            )
-        )
-    ade20k_labels = [
-        x.replace(".jpg", ".png").replace("images", "annotations")
-        for x in ade20k_images
-    ]
+    for image_id in ade20k_image_ids:
+        image_path = os.path.join(training_dir, f"{image_id}.jpg")
+        ade20k_images.append(image_path)
+        # 画像ファイルの存在を確認
+        if not os.path.exists(image_path):
+            print(f"WARNING: Image file does not exist: {image_path}")
+    
+    # アノテーションパスの構築
+    ade20k_labels = []
+    for image_path in ade20k_images:
+        # images/trainingをannotations/trainingに置換
+        label_path = image_path.replace("images", "annotations").replace(".jpg", ".png")
+        ade20k_labels.append(label_path)
+        # アノテーションファイルの存在を確認
+        if not os.path.exists(label_path):
+            print(f"WARNING: Annotation file does not exist: {label_path}")
+    
     print("ade20k: ", len(ade20k_images))
     return ade20k_classes, ade20k_images, ade20k_labels
 
@@ -71,56 +123,133 @@ def init_cocostuff(base_image_dir):
         for line in f.readlines()[1:]:
             cocostuff_classes.append(line.strip().split(": ")[-1])
     cocostuff_classes = np.array(cocostuff_classes)
-    cocostuff_images = []
-
-    cocostuff_labels = glob.glob(
-        os.path.join(base_image_dir, "cocostuff", "train2017", "*.png")
-    )
-    cocostuff_images = [
-        x.replace(".png", ".jpg").replace("cocostuff", "coco") for x in cocostuff_labels
-    ]
-
-    print("cocostuff: ", len(cocostuff_images))
-    return cocostuff_classes, cocostuff_images, cocostuff_labels
+    
+    # パスの構築
+    cocostuff_dir = os.path.join(base_image_dir, "cocostuff")
+    cocostuff_train_dir = os.path.join(cocostuff_dir, "train2017")
+    coco_dir = os.path.join(base_image_dir, "coco")
+    coco_train_dir = os.path.join(coco_dir, "train2017")
+    
+    print(f"DEBUG: Cocostuff directory: {cocostuff_dir}")
+    print(f"DEBUG: Cocostuff train directory exists: {os.path.exists(cocostuff_train_dir)}")
+    print(f"DEBUG: Coco directory: {coco_dir}")
+    print(f"DEBUG: Coco train directory exists: {os.path.exists(coco_train_dir)}")
+    
+    try:
+        # ラベルファイル（PNG）を取得
+        cocostuff_labels = glob.glob(os.path.join(cocostuff_train_dir, "*.png"))
+        if not cocostuff_labels:
+            print(f"WARNING: No PNG files found in {cocostuff_train_dir}")
+            print(f"Directory contents: {os.listdir(cocostuff_train_dir)}")
+        
+        cocostuff_labels = sorted(cocostuff_labels)
+        print(f"DEBUG: Found {len(cocostuff_labels)} label files")
+        
+        # 対応する画像ファイル（JPG）のパスを構築
+        cocostuff_images = []
+        for label_path in cocostuff_labels:
+            # ファイル名のみを取得
+            filename = os.path.basename(label_path)
+            image_filename = filename.replace(".png", ".jpg")
+            image_path = os.path.join(coco_train_dir, image_filename)
+            cocostuff_images.append(image_path)
+            
+            # 画像ファイルの存在を確認
+            if not os.path.exists(image_path):
+                print(f"WARNING: Image file does not exist: {image_path}")
+        
+        print("cocostuff: ", len(cocostuff_images))
+        return cocostuff_classes, cocostuff_images, cocostuff_labels
+    
+    except Exception as e:
+        print(f"ERROR: Failed to initialize cocostuff dataset: {e}")
+        import traceback
+        traceback.print_exc()
+        # 例外を再発生させる代わりに空のリストを返す
+        print("Returning empty lists for cocostuff")
+        return cocostuff_classes, [], []
 
 
 def init_paco_lvis(base_image_dir):
-    coco_api_paco_lvis = COCO(
-        os.path.join(
+    try:
+        paco_annotation_path = os.path.join(
             base_image_dir, "vlpart", "paco", "annotations", "paco_lvis_v1_train.json"
         )
-    )
-    all_classes = coco_api_paco_lvis.loadCats(coco_api_paco_lvis.getCatIds())
-    class_map_paco_lvis = {}
-    for cat in all_classes:
-        cat_split = cat["name"].strip().split(":")
-        if len(cat_split) == 1:
-            name = cat_split[0].split("_(")[0]
-        else:
-            assert len(cat_split) == 2
-            obj, part = cat_split
-            obj = obj.split("_(")[0]
-            part = part.split("_(")[0]
-            name = (obj, part)
-        class_map_paco_lvis[cat["id"]] = name
-    img_ids = coco_api_paco_lvis.getImgIds()
-    print("paco_lvis: ", len(img_ids))
-    return class_map_paco_lvis, img_ids, coco_api_paco_lvis
+        
+        print(f"DEBUG: Checking paco_lvis annotation path: {paco_annotation_path}")
+        print(f"DEBUG: Path exists: {os.path.exists(paco_annotation_path)}")
+        
+        # パスが存在しない場合、親ディレクトリの内容をチェック
+        if not os.path.exists(paco_annotation_path):
+            paco_dir = os.path.join(base_image_dir, "vlpart", "paco")
+            if os.path.exists(paco_dir):
+                annotations_dir = os.path.join(paco_dir, "annotations")
+                if os.path.exists(annotations_dir):
+                    print(f"DEBUG: Annotations directory contents: {os.listdir(annotations_dir)}")
+                else:
+                    print(f"DEBUG: Annotations directory does not exist: {annotations_dir}")
+                    print(f"DEBUG: paco directory contents: {os.listdir(paco_dir)}")
+            else:
+                print(f"DEBUG: paco directory does not exist: {paco_dir}")
+            
+            # データセットの小規模版では存在しない可能性があるため、空の結果を返す
+            print("WARNING: paco_lvis annotation file not found, returning empty dataset")
+            return {}, [], None
+            
+        coco_api_paco_lvis = COCO(paco_annotation_path)
+        all_classes = coco_api_paco_lvis.loadCats(coco_api_paco_lvis.getCatIds())
+        class_map_paco_lvis = {}
+        for cat in all_classes:
+            cat_split = cat["name"].strip().split(":")
+            if len(cat_split) == 1:
+                name = cat_split[0].split("_(")[0]
+            else:
+                assert len(cat_split) == 2
+                obj, part = cat_split
+                obj = obj.split("_(")[0]
+                part = part.split("_(")[0]
+                name = (obj, part)
+            class_map_paco_lvis[cat["id"]] = name
+        img_ids = coco_api_paco_lvis.getImgIds()
+        print("paco_lvis: ", len(img_ids))
+        return class_map_paco_lvis, img_ids, coco_api_paco_lvis
+    
+    except Exception as e:
+        print(f"ERROR: Failed to initialize paco_lvis dataset: {e}")
+        import traceback
+        traceback.print_exc()
+        # エラーが発生した場合は空のデータセットを返す
+        return {}, [], None
 
 
 def init_pascal_part(base_image_dir):
-    coco_api_pascal_part = COCO(
-        os.path.join(base_image_dir, "vlpart", "pascal_part", "train.json")
-    )
-    all_classes = coco_api_pascal_part.loadCats(coco_api_pascal_part.getCatIds())
-    class_map_pascal_part = {}
-    for cat in all_classes:
-        cat_main, cat_part = cat["name"].strip().split(":")
-        name = (cat_main, cat_part)
-        class_map_pascal_part[cat["id"]] = name
-    img_ids = coco_api_pascal_part.getImgIds()
-    print("pascal_part: ", len(img_ids))
-    return class_map_pascal_part, img_ids, coco_api_pascal_part
+    try:
+        pascal_part_path = os.path.join(base_image_dir, "vlpart", "pascal_part", "train.json")
+        
+        print(f"DEBUG: Checking pascal_part annotation path: {pascal_part_path}")
+        print(f"DEBUG: Path exists: {os.path.exists(pascal_part_path)}")
+        
+        if not os.path.exists(pascal_part_path):
+            print("WARNING: pascal_part annotation file not found, returning empty dataset")
+            return {}, [], None
+        
+        coco_api_pascal_part = COCO(pascal_part_path)
+        all_classes = coco_api_pascal_part.loadCats(coco_api_pascal_part.getCatIds())
+        class_map_pascal_part = {}
+        for cat in all_classes:
+            cat_main, cat_part = cat["name"].strip().split(":")
+            name = (cat_main, cat_part)
+            class_map_pascal_part[cat["id"]] = name
+        img_ids = coco_api_pascal_part.getImgIds()
+        print("pascal_part: ", len(img_ids))
+        return class_map_pascal_part, img_ids, coco_api_pascal_part
+    
+    except Exception as e:
+        print(f"ERROR: Failed to initialize pascal_part dataset: {e}")
+        import traceback
+        traceback.print_exc()
+        # エラーが発生した場合は空のデータセットを返す
+        return {}, [], None
 
 
 class SemSegDataset(torch.utils.data.Dataset):
@@ -163,12 +292,41 @@ class SemSegDataset(torch.utils.data.Dataset):
         self.data2classes = {}
 
         self.sem_seg_datas = sem_seg_data.split("||")
+        valid_datasets = []
+        
+        # 各データセットを初期化し、エラーハンドリングを追加
         for ds in self.sem_seg_datas:
-            classes, images, labels = eval("init_{}".format(ds))(base_image_dir)
-            self.data2list[ds] = (images, labels)
-            self.data2classes[ds] = classes
-
-        if "cocostuff" in self.sem_seg_datas:
+            try:
+                print(f"Initializing dataset: {ds}")
+                init_func = globals().get(f"init_{ds}")
+                if init_func is None:
+                    print(f"WARNING: Initialization function 'init_{ds}' not found, skipping")
+                    continue
+                
+                classes, images, labels = init_func(base_image_dir)
+                
+                # 画像リストが空かどうかチェック
+                if not images:
+                    print(f"WARNING: No images found for dataset {ds}, skipping")
+                    continue
+                
+                self.data2list[ds] = (images, labels)
+                self.data2classes[ds] = classes
+                valid_datasets.append(ds)
+                print(f"Successfully initialized dataset {ds} with {len(images)} images")
+            except Exception as e:
+                print(f"ERROR: Failed to initialize dataset {ds}: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # 有効なデータセットがない場合は警告
+        if not valid_datasets:
+            print("WARNING: No valid datasets were initialized. Training may fail.")
+        else:
+            print(f"Successfully initialized {len(valid_datasets)} datasets: {', '.join(valid_datasets)}")
+        
+        # cocoとcocostuffのデータチェック
+        if "cocostuff" in self.data2list:
             self.cocostuff_class2index = {
                 c: i for i, c in enumerate(self.data2classes["cocostuff"])
             }
