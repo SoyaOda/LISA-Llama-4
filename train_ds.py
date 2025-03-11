@@ -160,6 +160,11 @@ def main(args):
         **model_args
     )
     
+    # モデルの入力埋め込みと出力埋め込みを結合
+    model.tie_weights()
+    if hasattr(model, "model") and hasattr(model.model, "tie_weights"):
+        model.model.tie_weights()
+    
     if hasattr(model.model, "config"):
         model.model.config.eos_token_id = tokenizer.eos_token_id
         model.model.config.bos_token_id = tokenizer.bos_token_id
@@ -224,8 +229,8 @@ def main(args):
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
 
-    if hasattr(model.model, "resize_token_embeddings"):
-        model.model.resize_token_embeddings(len(tokenizer))
+    # トークン埋め込みのサイズ変更を直接モデルに対して行う
+    model.resize_token_embeddings(len(tokenizer))
 
     for n, p in model.named_parameters():
         if any(

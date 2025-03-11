@@ -108,7 +108,107 @@ class Llama3VisionForCausalLM(PreTrainedModel, GenerationMixin):
         # MllamaモデルではLlamaモデル部分の出力埋め込み層を取得
         if hasattr(self.model, "text_model") and hasattr(self.model.text_model, "lm_head"):
             return self.model.text_model.lm_head
-        return None
+        # 最後の手段として例外をスロー
+        raise NotImplementedError("このモデルでは出力埋め込み層が見つかりません")
+    
+    def set_input_embeddings(self, value):
+        """
+        入力埋め込み層を設定します。
+        resize_token_embeddingsで必要です。
+        """
+        if hasattr(self.model, "set_input_embeddings"):
+            return self.model.set_input_embeddings(value)
+        # モデルが直接メソッドを持っていない場合は、埋め込み層を直接設定
+        if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
+            self.model.model.embed_tokens = value
+            return
+        # MllamaモデルではLlamaモデル部分の埋め込み層を設定
+        if hasattr(self.model, "text_model") and hasattr(self.model.text_model, "embed_tokens"):
+            self.model.text_model.embed_tokens = value
+            return
+        # 最後の手段として例外をスロー
+        raise NotImplementedError("このモデルでは入力埋め込み層を設定できません")
+    
+    def set_output_embeddings(self, value):
+        """
+        出力埋め込み層を設定します。
+        resize_token_embeddingsで必要です。
+        """
+        if hasattr(self.model, "set_output_embeddings"):
+            return self.model.set_output_embeddings(value)
+        # モデルが直接メソッドを持っていない場合は、出力埋め込み層を直接設定
+        if hasattr(self.model, "lm_head"):
+            self.model.lm_head = value
+            return
+        # MllamaモデルではLlamaモデル部分の出力埋め込み層を設定
+        if hasattr(self.model, "text_model") and hasattr(self.model.text_model, "lm_head"):
+            self.model.text_model.lm_head = value
+            return
+        # 最後の手段として例外をスロー
+        raise NotImplementedError("このモデルでは出力埋め込み層を設定できません")
+    
+    def tie_weights(self):
+        """
+        入力埋め込みと出力埋め込みを結合します（同じパラメータを共有）。
+        """
+        output_embeddings = self.get_output_embeddings()
+        if output_embeddings is not None:
+            self.set_output_embeddings(self.get_input_embeddings())
+        
+    def resize_token_embeddings(self, new_num_tokens=None):
+        """
+        モデルのトークン埋め込みのサイズを変更します。
+        
+        Args:
+            new_num_tokens (int, optional): 新しいトークン数
+            
+        Returns:
+            torch.nn.Embedding: 新しいトークン埋め込み層
+        """
+        # まず、モデルが直接resize_token_embeddingsを持っているか確認
+        if hasattr(self.model, "resize_token_embeddings"):
+            return self.model.resize_token_embeddings(new_num_tokens)
+        
+        # 内部実装：
+        old_embeddings = self.get_input_embeddings()
+        old_num_tokens = old_embeddings.num_embeddings
+        
+        if new_num_tokens == old_num_tokens:
+            return old_embeddings
+            
+        # 新しい埋め込み層を作成
+        new_embeddings = self._get_resized_embeddings(old_embeddings, new_num_tokens)
+        
+        # モデルに新しい埋め込み層を設定
+        self.set_input_embeddings(new_embeddings)
+        
+        # もし入力と出力の埋め込みが同じなら、出力も更新
+        if self.get_output_embeddings() is not None:
+            self.set_output_embeddings(new_embeddings)
+            
+        return new_embeddings
+    
+    def _get_resized_embeddings(self, old_embeddings, new_num_tokens=None):
+        """
+        リサイズされた埋め込み層を取得します。
+        """
+        if new_num_tokens is None:
+            return old_embeddings
+            
+        old_num_tokens = old_embeddings.num_embeddings
+        old_embedding_dim = old_embeddings.embedding_dim
+        
+        # 新しい埋め込み層を作成
+        new_embeddings = nn.Embedding(new_num_tokens, old_embedding_dim)
+        new_embeddings.to(old_embeddings.weight.device, 
+                        dtype=old_embeddings.weight.dtype)
+        
+        # 既存の埋め込みをコピー
+        with torch.no_grad():
+            num_tokens_to_copy = min(old_num_tokens, new_num_tokens)
+            new_embeddings.weight.data[:num_tokens_to_copy, :] = old_embeddings.weight.data[:num_tokens_to_copy, :]
+            
+        return new_embeddings
     
     def forward(
         self,
