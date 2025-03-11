@@ -12,9 +12,10 @@ import tqdm
 import transformers
 from peft import LoraConfig, get_peft_model
 from torch.utils.tensorboard import SummaryWriter
+from transformers import AutoProcessor
 
 from model.LISA import LISAForCausalLM
-from model.llava import conversation as conversation_lib
+from model.llama3_2 import conversation as conversation_lib
 from utils.dataset import HybridDataset, ValDataset, collate_fn
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          AverageMeter, ProgressMeter, Summary, dict_to_cuda,
@@ -25,7 +26,7 @@ def parse_args(args):
     parser = argparse.ArgumentParser(description="LISA Model Training")
     parser.add_argument("--local_rank", default=0, type=int, help="node rank")
     parser.add_argument(
-        "--version", default="liuhaotian/llava-llama-2-13b-chat-lightning-preview"
+        "--version", default="meta-llama/Llama-3.2-11B-Vision-Instruct"
     )
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument(
@@ -39,7 +40,7 @@ def parse_args(args):
     parser.add_argument("--model_max_length", default=512, type=int)
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument(
-        "--vision-tower", default="openai/clip-vit-large-patch14", type=str
+        "--vision-tower", default="meta-llama/Llama-3.2-11B-Vision-Instruct", type=str
     )
     parser.add_argument("--load_in_8bit", action="store_true", default=False)
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
@@ -88,7 +89,7 @@ def parse_args(args):
     parser.add_argument("--exclude_val", action="store_true", default=False)
     parser.add_argument("--no_eval", action="store_true", default=False)
     parser.add_argument("--eval_only", action="store_true", default=False)
-    parser.add_argument("--vision_pretrained", default="PATH_TO_SAM_ViT-H", type=str)
+    parser.add_argument("--vision_pretrained", default="./checkpoints/sam_vit_h_4b8939.pth", type=str)
     parser.add_argument("--out_dim", default=256, type=int)
     parser.add_argument("--resume", default="", type=str)
     parser.add_argument("--print_freq", default=1, type=int)
@@ -99,9 +100,9 @@ def parse_args(args):
     parser.add_argument("--auto_resume", action="store_true", default=True)
     parser.add_argument(
         "--conv_type",
-        default="llava_v1",
+        default="llama_3",
         type=str,
-        choices=["llava_v1", "llava_llama_2"],
+        choices=["llava_v1", "llava_llama_2", "llama_3"],
     )
     return parser.parse_args(args)
 
@@ -123,7 +124,11 @@ def main(args):
         padding_side="right",
         use_fast=False,
     )
-    tokenizer.pad_token = tokenizer.unk_token
+    processor = AutoProcessor.from_pretrained(args.version)
+
+    if not tokenizer.pad_token:
+        tokenizer.pad_token = tokenizer.eos_token
+        
     num_added_tokens = tokenizer.add_tokens("[SEG]")
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
 
@@ -148,30 +153,35 @@ def main(args):
         torch_dtype = torch.bfloat16
     elif args.precision == "fp16":
         torch_dtype = torch.half
-    model = LISAForCausalLM.from_pretrained(
-        args.version, torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
+    model = LISAForCausalLM(
+        model_id=args.version,
+        torch_dtype=torch_dtype,
+        device_map="auto",
+        **model_args
     )
-    model.config.eos_token_id = tokenizer.eos_token_id
-    model.config.bos_token_id = tokenizer.bos_token_id
-    model.config.pad_token_id = tokenizer.pad_token_id
+    
+    if hasattr(model.model, "config"):
+        model.model.config.eos_token_id = tokenizer.eos_token_id
+        model.model.config.bos_token_id = tokenizer.bos_token_id
+        model.model.config.pad_token_id = tokenizer.pad_token_id
 
-    model.enable_input_require_grads()
-    model.gradient_checkpointing_enable()
+    if args.gradient_checkpointing:
+        model.model.gradient_checkpointing_enable()
 
-    model.get_model().initialize_vision_modules(model.get_model().config)
-    vision_tower = model.get_model().get_vision_tower()
-    vision_tower.to(dtype=torch_dtype, device=args.local_rank)
     if not args.eval_only:
-        model.get_model().initialize_lisa_modules(model.get_model().config)
+        model.lisa_model.initialize_lisa_modules(model.lisa_model.config)
 
-    for p in vision_tower.parameters():
-        p.requires_grad = False
-    for p in model.get_model().mm_projector.parameters():
-        p.requires_grad = False
+    if hasattr(model.lisa_model, "vision_tower") and model.lisa_model.vision_tower is not None:
+        for p in model.lisa_model.vision_tower.parameters():
+            p.requires_grad = False
+    
+    if hasattr(model.lisa_model, "mm_projector"):
+        for p in model.lisa_model.mm_projector.parameters():
+            p.requires_grad = False
 
-    conversation_lib.default_conversation = conversation_lib.conv_templates[
-        args.conv_type
-    ]
+    conversation_lib.default_conversation = conversation_lib.conv_templates.get(
+        args.conv_type, conversation_lib.conv_templates["llama_3"]
+    )
 
     lora_r = args.lora_r
     if lora_r > 0:
@@ -214,14 +224,14 @@ def main(args):
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
 
-    model.resize_token_embeddings(len(tokenizer))
+    if hasattr(model.model, "resize_token_embeddings"):
+        model.model.resize_token_embeddings(len(tokenizer))
 
-    # make text_hidden_fcs, mask_decoder, lm_head, embed_tokens trainable
     for n, p in model.named_parameters():
         if any(
             [
                 x in n
-                for x in ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
+                for x in ["mask_decoder", "text_hidden_fcs"]
             ]
         ):
             print("n: ", n, "p.shape: ", p.shape)
@@ -248,6 +258,7 @@ def main(args):
         vqa_data=args.vqa_data,
         reason_seg_data=args.reason_seg_data,
         explanatory=args.explanatory,
+        processor=processor,
     )
 
     if args.no_eval == False:
@@ -316,7 +327,6 @@ def main(args):
         config=ds_config,
     )
 
-    # resume deepspeed checkpoint
     if args.auto_resume and len(args.resume) == 0:
         resume = os.path.join(args.log_dir, "ckpt_model")
         if os.path.exists(resume):
@@ -335,7 +345,6 @@ def main(args):
             )
         )
 
-    # validation dataset
     if val_dataset is not None:
         assert args.val_batch_size == 1
         val_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -365,7 +374,6 @@ def main(args):
         exit()
 
     for epoch in range(args.start_epoch, args.epochs):
-        # train for one epoch
         train_iter = train(
             train_loader,
             model_engine,

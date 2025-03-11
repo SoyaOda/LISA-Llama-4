@@ -3,13 +3,13 @@ from typing import List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import BitsAndBytesConfig, CLIPVisionModel
+from transformers import BitsAndBytesConfig, AutoProcessor, AutoModelForVision2Seq
 
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          DEFAULT_IMAGE_PATCH_TOKEN)
 
-from .llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM,
-                                                     LlavaLlamaModel)
+from .llama3_2.model.language_model.llama3_2 import (Llama3VisionForCausalLM,
+                                                  Llama3VisionMetaModel)
 from .segment_anything import build_sam_vit_h
 
 
@@ -101,7 +101,7 @@ class LisaMetaModel:
             param.requires_grad = True
 
 
-class LisaModel(LisaMetaModel, LlavaLlamaModel):
+class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
     def __init__(
         self,
         config,
@@ -120,7 +120,7 @@ class LisaModel(LisaMetaModel, LlavaLlamaModel):
         self.config.mm_use_im_patch_token = False
 
 
-class LISAForCausalLM(LlavaLlamaForCausalLM):
+class LISAForCausalLM(Llama3VisionForCausalLM):
     def __init__(
         self,
         config,
@@ -129,7 +129,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         if not hasattr(config, "train_mask_decoder"):
             config.mm_use_im_start_end = kwargs.pop("use_mm_start_end", True)
             config.mm_vision_tower = kwargs.get(
-                "vision_tower", "openai/clip-vit-large-patch14"
+                "vision_tower", "meta-llama/Llama-3.2-11B-Vision-Instruct"
             )
             self.ce_loss_weight = kwargs.pop("ce_loss_weight", None)
             self.dice_loss_weight = kwargs.pop("dice_loss_weight", None)
@@ -139,21 +139,44 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             
         self.seg_token_idx = kwargs.pop("seg_token_idx")
 
-        super().__init__(config)
+        # Llama3.2 vision用の初期化
+        config = AutoConfig.from_pretrained(config.mm_vision_tower)
+        super(Llama3VisionForCausalLM, self).__init__(config)
+        
+        # モデルIDを設定
+        self.model_id = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+        self.dtype = kwargs.get("torch_dtype", torch.bfloat16)
+        self.model = AutoModelForVision2Seq.from_pretrained(
+            self.model_id, 
+            torch_dtype=self.dtype,
+            device_map=kwargs.get("device_map", "auto")
+        )
+        
+        # プロセッサを初期化
+        self.processor = None
 
-        self.model = LisaModel(config, **kwargs)
+        # LISAモデルの初期化
+        self.lisa_model = LisaModel(config, **kwargs)
+        
+        # LISAモデルの視覚モデルを共有
+        self.visual_model = self.lisa_model.visual_model
+        
+        # すでに存在しないLlavaのlm_headは使用しない
 
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Initialize weights and apply final processing
-        self.post_init()
+    def get_processor(self):
+        """
+        Llama3.2 Vision用のプロセッサーを取得します。
+        """
+        if self.processor is None:
+            self.processor = AutoProcessor.from_pretrained(self.model_id)
+        return self.processor
 
     def get_visual_embs(self, pixel_values: torch.FloatTensor):
         with torch.no_grad():
             image_embeddings_list = []
             for i in range(pixel_values.shape[0]):
                 torch.cuda.empty_cache()
-                image_embeddings = self.model.visual_model.image_encoder(
+                image_embeddings = self.lisa_model.visual_model.image_encoder(
                     pixel_values[i].unsqueeze(0)
                 )
                 image_embeddings_list.append(image_embeddings)
@@ -163,7 +186,8 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
 
     def forward(self, **kwargs):
         if "past_key_values" in kwargs:
-            return super().forward(**kwargs)
+            # Llama3.2 visionモデルの標準forward
+            return self.model(**kwargs)
         return self.model_forward(**kwargs)
 
     def model_forward(
@@ -180,10 +204,12 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         inference: bool = False,
         **kwargs,
     ):
+        # SAM用の特徴抽出
         image_embeddings = self.get_visual_embs(images)
         batch_size = image_embeddings.shape[0]
         assert batch_size == len(offset) - 1
 
+        # セグメンテーショントークンのマスクを作成
         seg_token_mask = input_ids[:, 1:] == self.seg_token_idx
         seg_token_mask = torch.cat(
             [
@@ -192,30 +218,45 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             ],
             dim=1,
         )
-        # hack for IMAGE_TOKEN_INDEX (we suppose that there is only one image, and it is in the front)
+        # Llama3.2 visionでは入力形式が異なるため、マスクを調整
         seg_token_mask = torch.cat(
             [torch.zeros((seg_token_mask.shape[0], 255)).bool().cuda(), seg_token_mask],
             dim=1,
         )
 
+        # プロセッサーを取得
+        processor = self.get_processor()
+
         if inference:
             n_batch = 1
             length = input_ids.shape[0]
             assert images_clip.shape[0] == 1
+            
+            # 推論時は画像を拡張
             images_clip_extend = images_clip.expand(length, -1, -1, -1).contiguous()
 
             output_hidden_states = []
             for i in range(n_batch):
                 start_i, end_i = i * length, min((i + 1) * length, input_ids.shape[0])
-                output_i = super().forward(
+                
+                # Llama3.2 vision用に入力を準備
+                batch_inputs = processor(
+                    text=input_ids[start_i:end_i],
                     images=images_clip_extend[: end_i - start_i],
                     attention_mask=attention_masks[start_i:end_i],
-                    input_ids=input_ids[start_i:end_i],
-                    output_hidden_states=True,
+                    return_tensors="pt",
+                    padding=True,
                 )
+                
+                # デバイスを合わせる
+                batch_inputs = {k: v.to(self.model.device) for k, v in batch_inputs.items()}
+                
+                # モデルを実行
+                output_i = self.model(**batch_inputs, output_hidden_states=True)
                 output_hidden_states.append(output_i.hidden_states)
                 torch.cuda.empty_cache()
 
+            # 出力を結合
             output_hidden_states_list = []
             output_hidden_states_level = torch.cat(output_hidden_states, dim=0)
             output_hidden_states_list.append(output_hidden_states_level)
@@ -223,6 +264,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             output = None
 
         else:
+            # 訓練時は各バッチごとに画像を拡張
             images_clip_list = []
             for i in range(len(offset) - 1):
                 start_i, end_i = offset[i], offset[i + 1]
@@ -234,20 +276,32 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                 )
                 images_clip_list.append(images_clip_i)
             images_clip = torch.cat(images_clip_list, dim=0)
-
-            output = super().forward(
+            
+            # Llama3.2 vision用に入力を準備
+            batch_inputs = processor(
+                text=input_ids,
                 images=images_clip,
                 attention_mask=attention_masks,
-                input_ids=input_ids,
-                labels=labels,
-                output_hidden_states=True,
+                return_tensors="pt",
+                padding=True,
             )
+            
+            # ラベルを設定
+            if labels is not None:
+                batch_inputs["labels"] = labels
+                
+            # デバイスを合わせる
+            batch_inputs = {k: v.to(self.model.device) for k, v in batch_inputs.items()}
+            
+            # モデルを実行
+            output = self.model(**batch_inputs, output_hidden_states=True)
             output_hidden_states = output.hidden_states
 
+        # 以下はオリジナルのLISAと同様の処理
         hidden_states = []
 
-        assert len(self.model.text_hidden_fcs) == 1
-        hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states[-1]))
+        assert len(self.lisa_model.text_hidden_fcs) == 1
+        hidden_states.append(self.lisa_model.text_hidden_fcs[0](output_hidden_states[-1]))
 
         last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
         pred_embeddings = last_hidden_state[seg_token_mask]
@@ -272,21 +326,21 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             (
                 sparse_embeddings,
                 dense_embeddings,
-            ) = self.model.visual_model.prompt_encoder(
+            ) = self.lisa_model.visual_model.prompt_encoder(
                 points=None,
                 boxes=None,
                 masks=None,
                 text_embeds=pred_embeddings[i].unsqueeze(1),
             )
             sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
-            low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
+            low_res_masks, iou_predictions = self.lisa_model.visual_model.mask_decoder(
                 image_embeddings=image_embeddings[i].unsqueeze(0),
-                image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
+                image_pe=self.lisa_model.visual_model.prompt_encoder.get_dense_pe(),
                 sparse_prompt_embeddings=sparse_embeddings,
                 dense_prompt_embeddings=dense_embeddings,
                 multimask_output=multimask_output,
             )
-            pred_mask = self.model.visual_model.postprocess_masks(
+            pred_mask = self.lisa_model.visual_model.postprocess_masks(
                 low_res_masks,
                 input_size=resize_list[i],
                 original_size=label_list[i].shape,
@@ -302,10 +356,11 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                 "gt_masks": gt_masks,
             }
 
+        # ロス計算
         output = model_output.logits
-
         ce_loss = model_output.loss
         ce_loss = ce_loss * self.ce_loss_weight
+        
         mask_bce_loss = 0
         mask_dice_loss = 0
         num_masks = 0
@@ -353,19 +408,36 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         tokenizer=None,
     ):
         with torch.no_grad():
-            outputs = self.generate(
+            # Llama3.2 vision用に入力を準備
+            processor = self.get_processor()
+            batch_inputs = processor(
+                text=input_ids,
                 images=images_clip,
-                input_ids=input_ids,
-                max_new_tokens=max_new_tokens,
-                num_beams=1,
-                output_hidden_states=True,
-                return_dict_in_generate=True,
+                return_tensors="pt",
+                padding=True,
             )
+            
+            # デバイスを合わせる
+            batch_inputs = {k: v.to(self.model.device) for k, v in batch_inputs.items()}
+            
+            # 生成パラメータを設定
+            generation_config = {
+                "max_new_tokens": max_new_tokens,
+                "num_beams": 1,
+                "output_hidden_states": True,
+                "return_dict_in_generate": True,
+            }
+            
+            # 生成を実行
+            outputs = self.model.generate(**batch_inputs, **generation_config)
+            
+            # 出力を取得
             output_hidden_states = outputs.hidden_states[-1]
             output_ids = outputs.sequences
 
+            # 以下はオリジナルのLISAと同様の処理
             seg_token_mask = output_ids[:, 1:] == self.seg_token_idx
-            # hack for IMAGE_TOKEN_INDEX (we suppose that there is only one image, and it is in the front)
+            # Llama3.2 vision用にマスクを調整
             seg_token_mask = torch.cat(
                 [
                     torch.zeros((seg_token_mask.shape[0], 255)).bool().cuda(),
@@ -376,8 +448,8 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
 
             hidden_states = []
 
-            assert len(self.model.text_hidden_fcs) == 1
-            hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states))
+            assert len(self.lisa_model.text_hidden_fcs) == 1
+            hidden_states.append(self.lisa_model.text_hidden_fcs[0](output_hidden_states))
 
             last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
             pred_embeddings = last_hidden_state[seg_token_mask]
@@ -402,7 +474,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                 (
                     sparse_embeddings,
                     dense_embeddings,
-                ) = self.model.visual_model.prompt_encoder(
+                ) = self.lisa_model.visual_model.prompt_encoder(
                     points=None,
                     boxes=None,
                     masks=None,
@@ -410,14 +482,14 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                 )
 
                 sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
-                low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
+                low_res_masks, iou_predictions = self.lisa_model.visual_model.mask_decoder(
                     image_embeddings=image_embeddings[i].unsqueeze(0),
-                    image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
+                    image_pe=self.lisa_model.visual_model.prompt_encoder.get_dense_pe(),
                     sparse_prompt_embeddings=sparse_embeddings,
                     dense_prompt_embeddings=dense_embeddings,
                     multimask_output=multimask_output,
                 )
-                pred_mask = self.model.visual_model.postprocess_masks(
+                pred_mask = self.lisa_model.visual_model.postprocess_masks(
                     low_res_masks,
                     input_size=resize_list[i],
                     original_size=original_size_list[i],
