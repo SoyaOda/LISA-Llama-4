@@ -5,7 +5,7 @@ import random
 import cv2
 import torch
 import torch.nn.functional as F
-from transformers import CLIPImageProcessor
+from PIL import Image
 
 from model.llama3_2 import conversation as conversation_lib
 from model.segment_anything.utils.transforms import ResizeLongestSide
@@ -56,8 +56,10 @@ class VQADataset(torch.utils.data.Dataset):
         self.tokenizer = tokenizer
         self.precision = precision
         self.transform = ResizeLongestSide(image_size)
-        self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
+        
         self.processor = processor
+        if self.processor is None:
+            raise ValueError("processorが指定されていません。Llama3.2 VisionモデルではAutoProcessorが必須です。");
 
         DATA_DIR = os.path.join(base_image_dir, "llava_dataset")
         self.vqa_image_root = os.path.join(base_image_dir, "coco/train2017")
@@ -89,11 +91,11 @@ class VQADataset(torch.utils.data.Dataset):
         image = cv2.imread(image_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         ori_size = image.shape[:2]
-        image_clip = self.clip_image_processor.preprocess(image, return_tensors="pt")[
-            "pixel_values"
-        ][
-            0
-        ]  # preprocess image for clip
+        
+        # 画像のプリプロセス
+        image_pil = Image.fromarray(image)
+        processed = self.processor(images=image_pil, return_tensors="pt")
+        image_clip = processed.pixel_values[0]
 
         image = self.transform.apply_image(image)  # preprocess image for sam
         resize = image.shape[:2]

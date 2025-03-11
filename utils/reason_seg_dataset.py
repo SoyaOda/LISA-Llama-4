@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import CLIPImageProcessor
+from PIL import Image
 
 from model.llama3_2 import conversation as conversation_lib
 from model.segment_anything.utils.transforms import ResizeLongestSide
@@ -41,16 +41,18 @@ class ReasonSegDataset(torch.utils.data.Dataset):
         self.exclude_val = exclude_val
         self.reason_seg_data = reason_seg_data
         self.samples_per_epoch = samples_per_epoch
-        self.explanatory = explanatory
         self.num_classes_per_sample = num_classes_per_sample
+        self.explanatory = explanatory
 
         self.base_image_dir = base_image_dir
         self.image_size = image_size
         self.tokenizer = tokenizer
         self.precision = precision
         self.transform = ResizeLongestSide(image_size)
-        self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
+        
         self.processor = processor
+        if self.processor is None:
+            raise ValueError("processorが指定されていません。Llama3.2 VisionモデルではAutoProcessorが必須です。");
 
         self.short_question_list = SHORT_QUESTION_LIST
         self.long_question_list = LONG_QUESTION_LIST
@@ -117,10 +119,11 @@ class ReasonSegDataset(torch.utils.data.Dataset):
         image = cv2.imread(image_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         ori_size = image.shape[:2]
-        # preprocess image for clip
-        image_clip = self.clip_image_processor.preprocess(image, return_tensors="pt")[
-            "pixel_values"
-        ][0]
+        
+        # 画像のプリプロセス
+        image_pil = Image.fromarray(image)
+        processed = self.processor(images=image_pil, return_tensors="pt")
+        image_clip = processed.pixel_values[0]
 
         mask, sents, is_sentence = get_mask_from_json(json_path, image)
         if len(sents) >= self.num_classes_per_sample:
