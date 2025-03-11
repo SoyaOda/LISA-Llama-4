@@ -438,9 +438,8 @@ class HybridDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         dataset_idx = np.random.choice(len(self.dataset_list), p=self.sample_rate)
         # 選択されたデータセットからサンプルを取得
-        image_path, image, image_clip, conversations, masks, label, resize, question, sampled_classes, inference = self.dataset_list[
-            dataset_idx
-        ].get_data()
+        data = self.dataset_list[dataset_idx][0]  # __getitem__を使ってデータを取得
+        image_path, image, image_clip, conversations, masks, label, resize, question, sampled_classes, inference = data
         
         return (
             image_path,
