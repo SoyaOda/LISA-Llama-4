@@ -341,7 +341,6 @@ def main(args):
             "reduce_scatter": True,
             "reduce_bucket_size": 5e8,
             "allgather_bucket_size": 5e8,
-            "zero_allow_untested_optimizer": True,  # metaデバイスのテンソル対応
         },
     }
     
