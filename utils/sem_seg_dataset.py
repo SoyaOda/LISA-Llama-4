@@ -72,10 +72,8 @@ def init_mapillary(base_image_dir):
 def init_ade20k(base_image_dir):
     try:
         # ADE20Kデータセットのクラス情報を読み込む
-        ade20k_classes = []
-        with open("utils/ade20k_classes.txt") as f:
-            for line in f.readlines():
-                ade20k_classes.append(line.strip())
+        with open("utils/ade20k_classes.json", "r") as f:
+            ade20k_classes = json.load(f)
         ade20k_classes = np.array(ade20k_classes)
         
         # パスの構築方法を改善
@@ -361,22 +359,36 @@ def init_pascal_part(base_image_dir):
         print(f"DEBUG: Path exists: {os.path.exists(pascal_part_path)}")
         
         if not os.path.exists(pascal_part_path):
-            print("WARNING: pascal_part annotation file not found, returning empty dataset")
+            print("WARNING: [マスクNull原因] pascal_part annotation file not found, returning empty dataset")
             return {}, [], None
         
         coco_api_pascal_part = COCO(pascal_part_path)
         all_classes = coco_api_pascal_part.loadCats(coco_api_pascal_part.getCatIds())
         class_map_pascal_part = {}
+        
         for cat in all_classes:
-            cat_main, cat_part = cat["name"].strip().split(":")
-            name = (cat_main, cat_part)
+            cat_name = cat["name"].strip()
+            
+            # 名前に":"が含まれているかチェック
+            if ":" in cat_name:
+                # 元の処理：メイン部分とパーツ部分に分割
+                cat_main, cat_part = cat_name.split(":")
+                name = (cat_main, cat_part)
+            else:
+                # ":"がない場合は、名前全体をメイン部分とし、パーツ部分を"whole"とする
+                print(f"WARNING: Category name '{cat_name}' does not contain ':'. Using whole name as main category.")
+                cat_main = cat_name
+                cat_part = "whole"
+                name = (cat_main, cat_part)
+                
             class_map_pascal_part[cat["id"]] = name
+            
         img_ids = coco_api_pascal_part.getImgIds()
         print("pascal_part: ", len(img_ids))
         return class_map_pascal_part, img_ids, coco_api_pascal_part
     
     except Exception as e:
-        print(f"ERROR: Failed to initialize pascal_part dataset: {e}")
+        print(f"ERROR: [マスクNull原因] Failed to initialize pascal_part dataset: {e}")
         import traceback
         traceback.print_exc()
         # エラーが発生した場合は空のデータセットを返す

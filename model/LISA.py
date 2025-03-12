@@ -631,27 +631,50 @@ class LISAForCausalLM(nn.Module):
     def model_forward(
         self,
         input_ids,
-        attention_mask,
+        attention_mask=None,
+        attention_masks=None,
         labels=None,
         images=None,
         images_clip=None,
         masks_list=None,
-        label_masks_list=None
+        label_masks_list=None,
+        label_list=None,
+        inputs_embeds=None,
+        offset=None,
+        resize_list=None,
+        inference=False,
+        **kwargs
     ):
         """LISA/VLオブジェクトの前方伝播処理と損失計算を行う。
 
         Args:
             input_ids (torch.Tensor): 入力トークンのID
-            attention_mask (torch.Tensor): アテンションマスク
+            attention_mask (torch.Tensor, optional): アテンションマスク
+            attention_masks (torch.Tensor, optional): 互換性のためのアテンションマスク
             labels (torch.Tensor, optional): ラベルデータ。デフォルトはNone。
             images (list, optional): 画像のリスト。デフォルトはNone。
             images_clip (list, optional): CLIP形式の画像のリスト。デフォルトはNone。
             masks_list (list, optional): マスクのリスト。デフォルトはNone。
             label_masks_list (list, optional): ラベルのマスクのリスト。デフォルトはNone。
+            label_list (list, optional): 互換性のためのラベルマスクのリスト。
+            inputs_embeds (torch.Tensor, optional): 入力埋め込み。デフォルトはNone。
+            offset (torch.Tensor, optional): オフセット値。デフォルトはNone。
+            resize_list (list, optional): リサイズリスト。デフォルトはNone。
+            inference (bool, optional): 推論モードかどうか。デフォルトはFalse。
 
         Returns:
             dict: 計算された損失と出力値を含む辞書
         """
+        # パラメータの互換性処理
+        if attention_mask is None and attention_masks is not None:
+            attention_mask = attention_masks
+            
+        if label_masks_list is None and label_list is not None:
+            label_masks_list = label_list
+            
+        # オリジナルのLISAとの互換性のためにoffsetを処理
+        batch_size = len(input_ids) if isinstance(input_ids, list) else input_ids.shape[0]
+            
         # SEGトークンの埋め込みを取得
         with torch.no_grad():
             embedding_token_seg = self.get_input_embeddings()(torch.tensor([[self.seg_token_idx]], device=self.device))
@@ -663,12 +686,11 @@ class LISAForCausalLM(nn.Module):
             attention_mask=attention_mask,
             labels=labels,
             output_hidden_states=True,
-            images=images_clip
+            images=images_clip,
+            inputs_embeds=inputs_embeds
         )
         
-        # バッチサイズを取得
-        batch_size = len(input_ids)
-        
+        # embeddings処理
         embeddings = torch.stack(outputs.hidden_states).squeeze(1)[-1]
         segmasks = []
         seg_token_counts = []
