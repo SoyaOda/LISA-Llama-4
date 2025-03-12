@@ -301,15 +301,29 @@ def init_cocostuff(base_image_dir):
 
 def init_paco_lvis(base_image_dir):
     try:
+        # 元々期待されているパス
         paco_annotation_path = os.path.join(
             base_image_dir, "vlpart", "paco", "annotations", "paco_lvis_v1_train.json"
         )
         
-        print(f"DEBUG: Checking paco_lvis annotation path: {paco_annotation_path}")
-        print(f"DEBUG: Path exists: {os.path.exists(paco_annotation_path)}")
+        # 更新された可能性のあるパス (paco_lvis_v1サブディレクトリあり)
+        alt_paco_annotation_path = os.path.join(
+            base_image_dir, "vlpart", "paco", "annotations", "paco_lvis_v1", "paco_lvis_v1_train.json"
+        )
         
-        # パスが存在しない場合、親ディレクトリの内容をチェック
-        if not os.path.exists(paco_annotation_path):
+        print(f"DEBUG: Checking paco_lvis original annotation path: {paco_annotation_path}")
+        print(f"DEBUG: Original path exists: {os.path.exists(paco_annotation_path)}")
+        print(f"DEBUG: Checking paco_lvis alternative annotation path: {alt_paco_annotation_path}")
+        print(f"DEBUG: Alternative path exists: {os.path.exists(alt_paco_annotation_path)}")
+        
+        # どちらかのパスが存在する場合はそれを使用
+        if os.path.exists(paco_annotation_path):
+            final_path = paco_annotation_path
+        elif os.path.exists(alt_paco_annotation_path):
+            final_path = alt_paco_annotation_path
+            print("INFO: Using alternative path for paco_lvis annotations")
+        else:
+            # パスが存在しない場合、親ディレクトリの内容をチェック
             paco_dir = os.path.join(base_image_dir, "vlpart", "paco")
             if os.path.exists(paco_dir):
                 annotations_dir = os.path.join(paco_dir, "annotations")
@@ -325,7 +339,7 @@ def init_paco_lvis(base_image_dir):
             print("WARNING: paco_lvis annotation file not found, returning empty dataset")
             return {}, [], None
             
-        coco_api_paco_lvis = COCO(paco_annotation_path)
+        coco_api_paco_lvis = COCO(final_path)
         all_classes = coco_api_paco_lvis.loadCats(coco_api_paco_lvis.getCatIds())
         class_map_paco_lvis = {}
         for cat in all_classes:
