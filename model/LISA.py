@@ -643,6 +643,7 @@ class LISAForCausalLM(nn.Module):
         offset=None,
         resize_list=None,
         inference=False,
+        tokenizer=None,
         **kwargs
     ):
         """LISA/VLオブジェクトの前方伝播処理と損失計算を行う。
@@ -695,16 +696,37 @@ class LISAForCausalLM(nn.Module):
             embedding_token_seg = self.get_input_embeddings()(torch.tensor([[self.seg_token_idx]], device=device))
             embedding_token_seg = embedding_token_seg.squeeze(0)
         
-        # 必要なパラメータでモデルを呼び出す
-        # Llama 3.2 Visionは'images'ではなく'pixel_values'パラメータを期待する
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            output_hidden_states=True,
-            pixel_values=images_clip,  # 'images'ではなく'pixel_values'を使用
-            inputs_embeds=inputs_embeds
+        # Llama 3.2 Visionを使用するためにprocessorで入力を準備
+        # processorはpixel_valuesとaspect_ratio_idsを自動的に生成
+        processor = self.get_processor()
+        
+        # テキスト入力を準備（tokenizerが提供されている場合はデコード）
+        if isinstance(input_ids, torch.Tensor) and tokenizer is not None:
+            text_input = tokenizer.batch_decode(input_ids, skip_special_tokens=False)
+        else:
+            # tokenizerがない場合や、input_idsがすでにテキスト型の場合はそのまま使用
+            text_input = input_ids
+        
+        # processorで入力を準備
+        processor_inputs = processor(
+            text=text_input,
+            images=images_clip,
+            return_tensors="pt",
+            padding=True,
         )
+        
+        # デバイスを合わせる
+        processor_inputs = {k: v.to(device) for k, v in processor_inputs.items()}
+        
+        # ラベルを追加（存在する場合）
+        if labels is not None:
+            processor_inputs["labels"] = labels
+            
+        # 出力のhidden statesを要求
+        processor_inputs["output_hidden_states"] = True
+        
+        # 必要なパラメータでモデルを呼び出す
+        outputs = self.model(**processor_inputs)
         
         # embeddings処理
         embeddings = torch.stack(outputs.hidden_states).squeeze(1)[-1]
