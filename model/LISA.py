@@ -700,12 +700,28 @@ class LISAForCausalLM(nn.Module):
         # processorはpixel_valuesとaspect_ratio_idsを自動的に生成
         processor = self.get_processor()
         
-        # テキスト入力を準備（tokenizerが提供されている場合はデコード）
-        if isinstance(input_ids, torch.Tensor) and tokenizer is not None:
+        # テキスト入力の準備: Llama3.2 Vision processorは文字列または文字列のリストを期待する
+        if isinstance(input_ids, torch.Tensor):
+            if tokenizer is None:
+                # tokenizerが提供されていない場合はエラーメッセージを出力
+                raise ValueError(
+                    "テンソル形式のinput_idsが渡されましたが、tokenizerがNoneです。"
+                    "processorがテキストを処理するには、文字列データが必要です。"
+                    "tokenizerを提供するか、文字列または文字列のリスト形式のテキストを渡してください。"
+                )
+            # トークンIDをテキストにデコード
             text_input = tokenizer.batch_decode(input_ids, skip_special_tokens=False)
+            print(f"デコードされたテキスト（デバッグ用）: {text_input[:2]}")  # 最初の2つのみ表示
         else:
-            # tokenizerがない場合や、input_idsがすでにテキスト型の場合はそのまま使用
+            # すでに文字列または文字列のリストの場合はそのまま使用
             text_input = input_ids
+            
+        if not isinstance(text_input, (str, list)):
+            # 文字列または文字列のリストでない場合はエラー
+            raise ValueError(
+                f"text_inputの型が無効です: {type(text_input)}。"
+                "processorは文字列または文字列のリストを期待しています。"
+            )
         
         # processorで入力を準備
         processor_inputs = processor(
