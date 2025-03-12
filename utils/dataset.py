@@ -439,7 +439,42 @@ class HybridDataset(torch.utils.data.Dataset):
         dataset_idx = np.random.choice(len(self.dataset_list), p=self.sample_rate)
         # 選択されたデータセットからサンプルを取得
         data = self.dataset_list[dataset_idx][0]  # __getitem__を使ってデータを取得
-        image_path, image, image_clip, conversations, masks, label, resize, question, sampled_classes, inference = data
+        
+        # データの要素数をチェック
+        if isinstance(data, tuple) and len(data) == 9:
+            # 9要素のタプルの場合、inferenceをFalseとして追加
+            image_path, image, image_clip, conversations, masks, label, resize, question, sampled_classes = data
+            inference = False
+        elif isinstance(data, tuple) and len(data) == 10:
+            # すでに10要素ある場合はそのまま使用
+            image_path, image, image_clip, conversations, masks, label, resize, question, sampled_classes, inference = data
+        else:
+            # 辞書形式の場合（reason_seg_datasetなど）
+            try:
+                if isinstance(data, dict):
+                    # 辞書形式からタプル形式に変換
+                    image_path = data.get("image_path", "")
+                    image = data.get("image", None)
+                    image_clip = data.get("image_clip", None)
+                    conversations = data.get("conversations", [])
+                    masks = data.get("masks", [])
+                    label = data.get("label", None)
+                    resize = data.get("resize", None)
+                    question = data.get("class_names", None)  # reason_segではclass_namesを使用
+                    sampled_classes = data.get("class_names", None)
+                    inference = data.get("inference", False)
+                else:
+                    # 予期しない形式の場合はエラー
+                    print(f"警告: 予期しないデータ形式です: {type(data)}, 長さ: {len(data) if isinstance(data, (tuple, list)) else 'N/A'}")
+                    # 再帰的に試行
+                    return self.__getitem__(0)
+            except Exception as e:
+                print(f"エラー: データの処理中に例外が発生しました: {e}")
+                # トレースバックを表示
+                import traceback
+                traceback.print_exc()
+                # 再帰的に試行
+                return self.__getitem__(0)
         
         return (
             image_path,
