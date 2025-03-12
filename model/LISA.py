@@ -146,13 +146,48 @@ class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
         model_name = kwargs.get("vision_tower") or getattr(config, "vision_tower", None)
         if model_name is None:
             model_name = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-            
+        
+        print("LisaModel初期化: 継承順序デバッグ開始")
+        print(f"LisaModel初期化前 - クラスのMRO (Method Resolution Order): {[cls.__name__ for cls in self.__class__.__mro__]}")
+        
         # LisaMetaModelを先に初期化して必要なフィールドを設定
+        print("LisaMetaModel初期化前...")
         LisaMetaModel.__init__(self, config, **kwargs)
+        print("LisaMetaModel初期化後...")
+        
+        # visual_modelの存在を確認
+        if hasattr(self, 'visual_model'):
+            print("LisaMetaModel初期化後: visual_model属性が存在します")
+            print(f"  - visual_model type: {type(self.visual_model).__name__}")
+            # 念のため、visual_modelを一時変数に保存
+            original_visual_model = self.visual_model
+        else:
+            print("警告: LisaMetaModel初期化後、visual_model属性が見つかりません")
+            original_visual_model = None
         
         # 次にLlama3VisionMetaModelを初期化
+        print("Llama3VisionMetaModel初期化前...")
         Llama3VisionMetaModel.__init__(self, config, model_name=model_name, **kwargs)
-
+        print("Llama3VisionMetaModel初期化後...")
+        
+        # 継承後のvisual_modelの状態を確認
+        if hasattr(self, 'visual_model'):
+            print("継承完了後: visual_model属性が存在します")
+            print(f"  - visual_model type: {type(self.visual_model).__name__}")
+        else:
+            print("警告: 継承完了後、visual_model属性が失われています")
+            
+        # original_visual_modelがあり、現在のvisual_modelと異なる場合や存在しない場合は復元
+        if original_visual_model is not None:
+            if not hasattr(self, 'visual_model') or self.visual_model is not original_visual_model:
+                print("visual_model属性を復元します")
+                self.visual_model = original_visual_model
+        
+        # 属性のリストを出力
+        print("LisaModel初期化後の全属性リスト:")
+        obj_attrs = [attr for attr in dir(self) if not attr.startswith('__')]
+        print(f"  - 属性: {', '.join(obj_attrs[:20])}...")
+        
         # 重要: visual_modelが多重継承で上書きされている可能性があるため、
         # LisaMetaModelのvisual_modelを明示的に参照して保持する
         # これによりLISAForCausalLMからも正しく参照できるようになる
@@ -296,11 +331,30 @@ class LISAForCausalLM(nn.Module):
                         # まず_get_resized_lm_headメソッドを使用してみる (推奨アプローチ)
                         if hasattr(self.model, '_get_resized_lm_head'):
                             print("  - _get_resized_lm_headメソッドを使用して出力埋め込みをリサイズ")
-                            new_output_embeddings = self.model._get_resized_lm_head(
-                                output_embeddings,
-                                new_num_tokens=new_num_tokens,
-                                mean_resizing=True
-                            )
+                            
+                            # デバッグ: _get_resized_lm_headメソッドの引数を確認
+                            import inspect
+                            if hasattr(self.model, '_get_resized_lm_head'):
+                                print("  - _get_resized_lm_head メソッドの引数情報:")
+                                sig = inspect.signature(self.model._get_resized_lm_head)
+                                print(f"    引数リスト: {list(sig.parameters.keys())}")
+                                print(f"    デフォルト値: {[p.default for p in sig.parameters.values() if p.default is not inspect.Parameter.empty]}")
+                            
+                            # mean_resizingが引数に含まれているか確認して条件分岐
+                            if 'mean_resizing' in inspect.signature(self.model._get_resized_lm_head).parameters:
+                                new_output_embeddings = self.model._get_resized_lm_head(
+                                    output_embeddings,
+                                    new_num_tokens=new_num_tokens,
+                                    mean_resizing=True
+                                )
+                            else:
+                                # mean_resizingがない場合は引数なしで呼び出し
+                                print("  - mean_resizing引数なしで_get_resized_lm_headを呼び出します")
+                                new_output_embeddings = self.model._get_resized_lm_head(
+                                    output_embeddings,
+                                    new_num_tokens=new_num_tokens
+                                )
+                            
                             # 勾配設定を元に戻す
                             new_output_embeddings.requires_grad_(output_embeddings.weight.requires_grad)
                         else:
