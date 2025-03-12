@@ -257,6 +257,9 @@ class LISAForCausalLM(nn.Module):
                 device_map=device_map
             )
             
+            # config属性を追加（train_ds.pyでアクセスするため）
+            self.config = self.model.config
+            
             # PEFT互換性のために重要: model_typeがdictではなくConfigオブジェクトであることを確認
             # configが辞書の場合は、PretrainedConfigオブジェクトに変換
             if isinstance(self.model.config, dict):
@@ -457,6 +460,13 @@ class LISAForCausalLM(nn.Module):
         if not hasattr(self, "processor") or self.processor is None:
             self.processor = super().get_processor()
         return self.processor
+    
+    def get_model(self):
+        """
+        内部モデルを返します。
+        train_ds.py内でmodel.model.configにアクセスするために必要です。
+        """
+        return self.model
     
     def get_input_embeddings(self):
         """
