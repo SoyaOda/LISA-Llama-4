@@ -75,12 +75,23 @@ class LisaMetaModel:
         super(LisaMetaModel, self).__init__(config)
 
         self.config = config
+        # configがNoneの場合に対応
+        if self.config is None:
+            print("警告: LisaMetaModelの初期化時にconfigがNoneです")
+            # 最低限必要な属性を持つ簡易configオブジェクトを作成
+            from types import SimpleNamespace
+            self.config = SimpleNamespace()
+            
+        # 必要な属性を追加
         if not hasattr(self.config, "train_mask_decoder"):
-            self.config.train_mask_decoder = kwargs["train_mask_decoder"]
-            self.config.out_dim = kwargs["out_dim"]
-            self.vision_pretrained = kwargs.get("vision_pretrained", None)
-        else:
-            self.vision_pretrained = kwargs.get("vision_pretrained", None)
+            self.config.train_mask_decoder = kwargs.get("train_mask_decoder", True)
+        if not hasattr(self.config, "out_dim"):
+            self.config.out_dim = kwargs.get("out_dim", 256)
+            
+        self.vision_pretrained = kwargs.get("vision_pretrained", None)
+        
+        # SAMモデルの初期化は明示的に初期化する場合のみ行う
+        if kwargs.get("initialize_sam", False):
             self.initialize_lisa_modules(self.config)
 
     def initialize_lisa_modules(self, config):
@@ -120,10 +131,29 @@ class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
         config,
         **kwargs,
     ):
+        # 事前にconfigの存在を確認
+        if config is None:
+            print("警告: LisaModelの初期化時にconfigがNoneです")
+            from types import SimpleNamespace
+            config = SimpleNamespace()
+            
+            # 必要な設定を追加
+            config.train_mask_decoder = kwargs.get("train_mask_decoder", True)
+            config.out_dim = kwargs.get("out_dim", 256)
+            config.vision_tower = kwargs.get("vision_tower", "meta-llama/Llama-3.2-11B-Vision-Instruct")
+        
         # vision_towerをmodel_nameとして渡す
-        model_name = kwargs.get("vision_tower") or config.vision_tower
-        super(LisaModel, self).__init__(config, model_name=model_name, **kwargs)
+        model_name = kwargs.get("vision_tower") or getattr(config, "vision_tower", None)
+        if model_name is None:
+            model_name = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+            
+        # LisaMetaModelを先に初期化して必要なフィールドを設定
+        LisaMetaModel.__init__(self, config, **kwargs)
+        
+        # 次にLlama3VisionMetaModelを初期化
+        Llama3VisionMetaModel.__init__(self, config, model_name=model_name, **kwargs)
 
+        # 設定を構成
         self.config.use_cache = False
         
         # MllamaConfigではmm_接頭辞がない可能性がある属性の対応
@@ -301,8 +331,32 @@ class LISAForCausalLM(nn.Module):
             'train_mask_decoder': train_mask_decoder,
             'out_dim': out_dim,
             'vision_pretrained': vision_pretrained,
-            'vision_tower': vision_tower
+            'vision_tower': vision_tower,
+            'initialize_sam': True  # SAMの初期化を明示的に実行
         }
+        
+        # configがNoneの場合、モデルの設定を使用して新しいConfigオブジェクトを作成
+        if config is None:
+            if hasattr(self.model, 'config'):
+                # モデルの設定を基にconfigを作成
+                config = self.model.config
+                # 必要な属性を追加
+                if not hasattr(config, "train_mask_decoder"):
+                    config.train_mask_decoder = train_mask_decoder
+                if not hasattr(config, "out_dim"):
+                    config.out_dim = out_dim
+                print(f"モデル設定からconfigを生成: {type(config).__name__}")
+            else:
+                # 最低限必要な属性を持つ簡易configオブジェクトを作成
+                from types import SimpleNamespace
+                config = SimpleNamespace()
+                config.train_mask_decoder = train_mask_decoder
+                config.out_dim = out_dim
+                config.vision_tower = vision_tower
+                # MllamaConfigのように.text_configを持つ可能性を考慮
+                if hasattr(self.model, 'config') and hasattr(self.model.config, 'text_config'):
+                    config.text_config = self.model.config.text_config
+                print("警告: 簡易configオブジェクトを生成しました")
         
         # LISAモデルの初期化
         self.lisa_model = LisaModel(config, **lisa_kwargs)
