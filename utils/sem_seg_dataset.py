@@ -486,8 +486,9 @@ class SemSegDataset(torch.utils.data.Dataset):
         return x
 
     def __getitem__(self, idx):
-        ds = random.choice(self.sem_seg_datas)
-        ds = self.sem_seg_datas[ds]
+        # オリジナルLISAコードと同じ方法でデータセットを選択
+        ds_idx = random.randint(0, len(self.sem_seg_datas) - 1)
+        ds = self.sem_seg_datas[ds_idx]
 
         # デバッグ情報を出力
         print(f"DEBUG: Selected dataset: {ds}")
@@ -523,206 +524,217 @@ class SemSegDataset(torch.utils.data.Dataset):
             ds = random.choice(available_datasets)
             print(f"DEBUG: Selected alternative dataset: {ds}")
 
-        if ds in ["paco_lvis", "pascal_part"]:
-            try:
-                class_map = self.data2classes[ds]
-                img_ids, coco_api = self.data2list[ds]
-                idx = random.randint(0, len(img_ids) - 1)
-                img_id = img_ids[idx]
-                image_info = coco_api.loadImgs([img_id])[0]
-                file_name = image_info["file_name"]
-                if ds == "pascal_part":
-                    file_name = os.path.join(
-                        "VOCdevkit", "VOC2010", "JPEGImages", file_name
-                    )
-                    image_path = os.path.join(self.base_image_dir, "vlpart", ds, file_name)
-                elif ds == "paco_lvis":
-                    image_path = os.path.join(self.base_image_dir, "coco", file_name)
-                
-                # 画像ファイルの存在チェック
-                if not os.path.exists(image_path):
-                    print(f"WARNING: Image file not found: {image_path}")
-                    return self.__getitem__(0)
-                    
-                image = cv2.imread(image_path)
-                if image is None:
-                    print(f"WARNING: Failed to load image: {image_path}")
-                    return self.__getitem__(0)
-                    
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                
-                # 画像のプリプロセス
-                image_pil = Image.fromarray(image)
-                processed = self.processor(images=image_pil, return_tensors="pt")
-                image_clip = processed.pixel_values[0]
-
-                image = self.transform.apply_image(image)  # preprocess image for sam
-                resize = image.shape[:2]
-                annIds = coco_api.getAnnIds(imgIds=image_info["id"])
-                anns = coco_api.loadAnns(annIds)
-                if len(anns) == 0:
-                    return self.__getitem__(0)
-                if len(anns) >= self.num_classes_per_sample:
-                    sampled_anns = np.random.choice(
-                        anns, size=self.num_classes_per_sample, replace=False
-                    ).tolist()
-                else:
-                    sampled_anns = anns
-                sampled_classes = []
-                for ann in sampled_anns:
-                    sampled_cls = class_map[ann["category_id"]]
-                    if isinstance(sampled_cls, tuple):
-                        obj, part = sampled_cls
-                        if random.random() < 0.5:
-                            name = obj + " " + part
-                        else:
-                            name = "the {} of the {}".format(part, obj)
-                    else:
-                        name = sampled_cls
-                    sampled_classes.append(name)
-
-            except KeyError as e:
-                print(f"ERROR: KeyError in dataset {ds}: {e}")
-                return self.__getitem__(0)
-            except Exception as e:
-                print(f"ERROR: Unexpected error in dataset {ds}: {e}")
-                return self.__getitem__(0)
-
-        elif ds in ["ade20k", "cocostuff", "mapillary"]:
-            try:
-                image, labels = self.data2list[ds]
-                if len(image) == 0:
-                    print(f"WARNING: No images available for dataset {ds}")
-                    return self.__getitem__(0)
-                    
-                idx = random.randint(0, len(image) - 1)
-                image_path = image[idx]
-                label_path = labels[idx]
-                
-                # 画像とラベルの存在チェック
-                if not os.path.exists(image_path):
-                    print(f"WARNING: Image file not found: {image_path}")
-                    return self.__getitem__(0)
-                    
-                if not os.path.exists(label_path):
-                    print(f"WARNING: Label file not found: {label_path}")
-                    return self.__getitem__(0)
-                
-                # ラベルの読み込み
+        try:
+            if ds in ["paco_lvis", "pascal_part"]:
                 try:
-                    label = Image.open(label_path)
-                    label = np.array(label)
-                except Exception as e:
-                    print(f"WARNING: Failed to load label {label_path}: {e}")
-                    return self.__getitem__(0)
+                    class_map = self.data2classes[ds]
+                    img_ids, coco_api = self.data2list[ds]
+                    idx = random.randint(0, len(img_ids) - 1)
+                    img_id = img_ids[idx]
+                    image_info = coco_api.loadImgs([img_id])[0]
+                    file_name = image_info["file_name"]
+                    if ds == "pascal_part":
+                        file_name = os.path.join(
+                            "VOCdevkit", "VOC2010", "JPEGImages", file_name
+                        )
+                        image_path = os.path.join(self.base_image_dir, "vlpart", ds, file_name)
+                    elif ds == "paco_lvis":
+                        image_path = os.path.join(self.base_image_dir, "coco", file_name)
                     
-                if ds == "ade20k":
-                    label[label == 0] = 255
-                    label -= 1
-                    label[label == 254] = 255
-                elif ds == "cocostuff":
-                    for c, i in self.cocostuff_class2index.items():
-                        if "-" in c:
-                            label[label == i] = 255
-                
-                # 画像の読み込み
-                try:
-                    img = cv2.imread(image_path)
-                    if img is None:
-                        print(f"WARNING: Failed to load image {image_path}")
+                    # 画像ファイルの存在チェック
+                    if not os.path.exists(image_path):
+                        print(f"WARNING: Image file not found: {image_path}")
                         return self.__getitem__(0)
-                    image = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                except Exception as e:
-                    print(f"WARNING: Error loading image {image_path}: {e}")
-                    return self.__getitem__(0)
-
-                # 画像のプリプロセス
-                image_pil = Image.fromarray(image)
-                processed = self.processor(images=image_pil, return_tensors="pt")
-                image_clip = processed.pixel_values[0]
-
-                image = self.transform.apply_image(image)  # preprocess image for sam
-                resize = image.shape[:2]
-                unique_label = np.unique(label).tolist()
-                if 255 in unique_label:
-                    unique_label.remove(255)
-                if len(unique_label) == 0:
-                    print(f"WARNING: No valid labels in {label_path}")
-                    return self.__getitem__(0)
-
-                classes = [self.data2classes[ds][class_id] for class_id in unique_label]
-                if len(classes) >= self.num_classes_per_sample:
-                    sampled_classes = np.random.choice(
-                        classes, size=self.num_classes_per_sample, replace=False
-                    ).tolist()
-                else:
-                    sampled_classes = classes
+                        
+                    image = cv2.imread(image_path)
+                    if image is None:
+                        print(f"WARNING: Failed to load image: {image_path}")
+                        return self.__getitem__(0)
+                        
+                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                     
-            except KeyError as e:
-                print(f"ERROR: KeyError in dataset {ds}: {e}")
+                    # 画像のプリプロセス
+                    image_pil = Image.fromarray(image)
+                    processed = self.processor(images=image_pil, return_tensors="pt")
+                    image_clip = processed.pixel_values[0]
+
+                    image = self.transform.apply_image(image)  # preprocess image for sam
+                    resize = image.shape[:2]
+                    annIds = coco_api.getAnnIds(imgIds=image_info["id"])
+                    anns = coco_api.loadAnns(annIds)
+                    if len(anns) == 0:
+                        return self.__getitem__(0)
+                    if len(anns) >= self.num_classes_per_sample:
+                        sampled_anns = np.random.choice(
+                            anns, size=self.num_classes_per_sample, replace=False
+                        ).tolist()
+                    else:
+                        sampled_anns = anns
+                    sampled_classes = []
+                    for ann in sampled_anns:
+                        sampled_cls = class_map[ann["category_id"]]
+                        if isinstance(sampled_cls, tuple):
+                            obj, part = sampled_cls
+                            if random.random() < 0.5:
+                                name = obj + " " + part
+                            else:
+                                name = "the {} of the {}".format(part, obj)
+                        else:
+                            name = sampled_cls
+                        sampled_classes.append(name)
+
+                except KeyError as e:
+                    print(f"ERROR: KeyError in dataset {ds}: {e}")
+                    return self.__getitem__(0)
+                except Exception as e:
+                    print(f"ERROR: Unexpected error in dataset {ds}: {e}")
+                    return self.__getitem__(0)
+
+            elif ds in ["ade20k", "cocostuff", "mapillary"]:
+                try:
+                    image, labels = self.data2list[ds]
+                    if len(image) == 0:
+                        print(f"WARNING: No images available for dataset {ds}")
+                        return self.__getitem__(0)
+                        
+                    idx = random.randint(0, len(image) - 1)
+                    image_path = image[idx]
+                    label_path = labels[idx]
+                    
+                    # 画像とラベルの存在チェック
+                    if not os.path.exists(image_path):
+                        print(f"WARNING: Image file not found: {image_path}")
+                        return self.__getitem__(0)
+                        
+                    if not os.path.exists(label_path):
+                        print(f"WARNING: Label file not found: {label_path}")
+                        return self.__getitem__(0)
+                    
+                    # ラベルの読み込み
+                    try:
+                        label = Image.open(label_path)
+                        label = np.array(label)
+                    except Exception as e:
+                        print(f"WARNING: Failed to load label {label_path}: {e}")
+                        return self.__getitem__(0)
+                        
+                    if ds == "ade20k":
+                        label[label == 0] = 255
+                        label -= 1
+                        label[label == 254] = 255
+                    elif ds == "cocostuff":
+                        for c, i in self.cocostuff_class2index.items():
+                            if "-" in c:
+                                label[label == i] = 255
+                    
+                    # 画像の読み込み
+                    try:
+                        img = cv2.imread(image_path)
+                        if img is None:
+                            print(f"WARNING: Failed to load image {image_path}")
+                            return self.__getitem__(0)
+                        image = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    except Exception as e:
+                        print(f"WARNING: Error loading image {image_path}: {e}")
+                        return self.__getitem__(0)
+
+                    # 画像のプリプロセス
+                    image_pil = Image.fromarray(image)
+                    processed = self.processor(images=image_pil, return_tensors="pt")
+                    image_clip = processed.pixel_values[0]
+
+                    image = self.transform.apply_image(image)  # preprocess image for sam
+                    resize = image.shape[:2]
+                    unique_label = np.unique(label).tolist()
+                    if 255 in unique_label:
+                        unique_label.remove(255)
+                    if len(unique_label) == 0:
+                        print(f"WARNING: No valid labels in {label_path}")
+                        return self.__getitem__(0)
+
+                    classes = [self.data2classes[ds][class_id] for class_id in unique_label]
+                    if len(classes) >= self.num_classes_per_sample:
+                        sampled_classes = np.random.choice(
+                            classes, size=self.num_classes_per_sample, replace=False
+                        ).tolist()
+                    else:
+                        sampled_classes = classes
+                        
+                except KeyError as e:
+                    print(f"ERROR: KeyError in dataset {ds}: {e}")
+                    return self.__getitem__(0)
+                except Exception as e:
+                    print(f"ERROR: Unexpected error in dataset {ds}: {e}")
+                    return self.__getitem__(0)
+            else:
+                print(f"WARNING: Unknown dataset type: {ds}")
                 return self.__getitem__(0)
-            except Exception as e:
-                print(f"ERROR: Unexpected error in dataset {ds}: {e}")
-                return self.__getitem__(0)
 
-        questions = []
-        answers = []
-        class_ids = []
-        for sampled_cls in sampled_classes:
-            text = sampled_cls
+            questions = []
+            answers = []
+            class_ids = []
+            for sampled_cls in sampled_classes:
+                text = sampled_cls
 
-            assert len(text.split("||")) == 1
-            question_template = random.choice(self.short_question_list)
-            questions.append(question_template.format(class_name=text.lower()))
+                assert len(text.split("||")) == 1
+                question_template = random.choice(self.short_question_list)
+                questions.append(question_template.format(class_name=text.lower()))
 
-            answers.append(random.choice(self.answer_list))
+                answers.append(random.choice(self.answer_list))
+
+                if ds in ["paco_lvis", "pascal_part"]:
+                    continue
+
+                class_id = self.data2classes[ds].tolist().index(sampled_cls)
+                class_ids.append(class_id)
+
+            conversations = []
+            conv = conversation_lib.default_conversation.copy()
+
+            i = 0
+            while i < len(questions):
+                conv.messages = []
+                conv.append_message(conv.roles[0], questions[i])
+                conv.append_message(conv.roles[1], answers[i])
+                conversations.append(conv.get_prompt())
+                i += 1
+
+            image = self.preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
 
             if ds in ["paco_lvis", "pascal_part"]:
-                continue
+                masks = []
+                for ann in sampled_anns:
+                    try:
+                        masks.append(coco_api.annToMask(ann))
+                    except Exception as e:
+                        print(f"ERROR: Failed to generate mask: {e}")
+                        return self.__getitem__(0)
 
-            class_id = self.data2classes[ds].tolist().index(sampled_cls)
-            class_ids.append(class_id)
+                masks = np.stack(masks, axis=0)
+                masks = torch.from_numpy(masks)
+                label = torch.ones(masks.shape[1], masks.shape[2]) * self.ignore_label
 
-        conversations = []
-        conv = conversation_lib.default_conversation.copy()
-
-        i = 0
-        while i < len(questions):
-            conv.messages = []
-            conv.append_message(conv.roles[0], questions[i])
-            conv.append_message(conv.roles[1], answers[i])
-            conversations.append(conv.get_prompt())
-            i += 1
-
-        image = self.preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
-
-        if ds in ["paco_lvis", "pascal_part"]:
-            masks = []
-            for ann in sampled_anns:
-                try:
-                    masks.append(coco_api.annToMask(ann))
-                except Exception as e:
-                    print(e)
-                    return self.__getitem__(0)
-
-            masks = np.stack(masks, axis=0)
-            masks = torch.from_numpy(masks)
-            label = torch.ones(masks.shape[1], masks.shape[2]) * self.ignore_label
-
-        else:
-            label = torch.from_numpy(label).long()
-            masks = []
-            for class_id in class_ids:
-                masks.append(label == class_id)
-            masks = torch.stack(masks, dim=0)
-        return (
-            image_path,
-            image,
-            image_clip,
-            conversations,
-            masks,
-            label,
-            resize,
-            questions,
-            sampled_classes,
-        )
+            else:
+                label = torch.from_numpy(label).long()
+                masks = []
+                for class_id in class_ids:
+                    masks.append(label == class_id)
+                masks = torch.stack(masks, dim=0)
+            
+            return (
+                image_path,
+                image,
+                image_clip,
+                conversations,
+                masks,
+                label,
+                resize,
+                questions,
+                sampled_classes,
+            )
+            
+        except Exception as e:
+            print(f"ERROR: Unexpected exception in __getitem__: {e}")
+            import traceback
+            traceback.print_exc()
+            return self.__getitem__(0)

@@ -198,10 +198,23 @@ def collate_fn(
         # attention_masks = torch.ones_like(input_ids)
         labels = torch.cat(labels, dim=0)
 
+        # 画像をスタックする（すべての画像が同じ形状の場合のみ）
+        if all(x.shape == images_list[0].shape for x in images_list):
+            stacked_images = torch.stack(images_list, dim=0)
+        else:
+            print("WARNING: Images have different shapes, cannot stack them")
+            stacked_images = images_list
+            
+        if all(x.shape == images_clip_list[0].shape for x in images_clip_list):
+            stacked_images_clip = torch.stack(images_clip_list, dim=0)
+        else:
+            print("WARNING: CLIP images have different shapes, cannot stack them")
+            stacked_images_clip = images_clip_list
+
         return {
             "image_paths": image_path_list,
-            "images": images_list,
-            "images_clip": images_clip_list,
+            "images": stacked_images,
+            "images_clip": stacked_images_clip,
             "input_ids": input_ids,
             "attention_masks": attention_masks,
             "labels": labels,
@@ -216,10 +229,23 @@ def collate_fn(
             "inference": inferences[0],
         }
     else:
+        # 画像をスタックする（すべての画像が同じ形状の場合のみ）
+        if all(x.shape == images_list[0].shape for x in images_list):
+            stacked_images = torch.stack(images_list, dim=0)
+        else:
+            print("WARNING: Images have different shapes, cannot stack them")
+            stacked_images = images_list
+            
+        if all(x.shape == images_clip_list[0].shape for x in images_clip_list):
+            stacked_images_clip = torch.stack(images_clip_list, dim=0)
+        else:
+            print("WARNING: CLIP images have different shapes, cannot stack them")
+            stacked_images_clip = images_clip_list
+            
         return {
             "image_paths": image_path_list,
-            "images": images_list,
-            "images_clip": images_clip_list,
+            "images": stacked_images,
+            "images_clip": stacked_images_clip,
             "masks": masks_list,
             "label_list": label_list,
             "resize_list": resize_list,
@@ -464,9 +490,77 @@ class HybridDataset(torch.utils.data.Dataset):
             
         dataset_idx = np.random.choice(len(self.dataset_list), p=self.sample_rate)
         
+        # 選択されたデータセットがNoneの場合は別のデータセットを試みる
+        max_attempts = 5
+        attempts = 0
+        
+        while self.dataset_list[dataset_idx] is None and attempts < max_attempts:
+            print(f"警告: 選択されたデータセット {dataset_idx} は None です。別のデータセットを試みます。")
+            # サンプリングレートを一時的に更新（選択されたデータセットを除外）
+            temp_rates = self.sample_rate.copy()
+            temp_rates[dataset_idx] = 0
+            if np.sum(temp_rates) > 0:
+                temp_rates = temp_rates / np.sum(temp_rates)
+                dataset_idx = np.random.choice(len(self.dataset_list), p=temp_rates)
+            else:
+                # すべてのデータセットがNoneの場合
+                print("エラー: すべての有効なデータセットがNoneです。ダミーデータを返します。")
+                setattr(self, '_call_depth', 0)  # カウンタをリセット
+                dummy_image = torch.zeros(3, 224, 224)
+                dummy_image_clip = torch.zeros(3, 224, 224)
+                dummy_masks = torch.zeros(1, 224, 224)
+                dummy_label = torch.ones(224, 224) * self.ignore_label
+                dummy_conversations = ["すべてのデータセットが無効です"]
+                return (
+                    "dummy_path",
+                    dummy_image,
+                    dummy_image_clip,
+                    dummy_conversations,
+                    dummy_masks,
+                    dummy_label,
+                    (224, 224),
+                    None,
+                    None,
+                    False,
+                )
+            attempts += 1
+            
+        # すべての試行後もデータセットがNoneの場合
+        if self.dataset_list[dataset_idx] is None:
+            print("エラー: 有効なデータセットが見つかりませんでした。ダミーデータを返します。")
+            setattr(self, '_call_depth', 0)  # カウンタをリセット
+            dummy_image = torch.zeros(3, 224, 224)
+            dummy_image_clip = torch.zeros(3, 224, 224)
+            dummy_masks = torch.zeros(1, 224, 224)
+            dummy_label = torch.ones(224, 224) * self.ignore_label
+            dummy_conversations = ["有効なデータセットが見つかりません"]
+            return (
+                "dummy_path",
+                dummy_image,
+                dummy_image_clip,
+                dummy_conversations,
+                dummy_masks,
+                dummy_label,
+                (224, 224),
+                None,
+                None,
+                False,
+            )
+        
         try:
             # 選択されたデータセットからサンプルを取得
-            data = self.dataset_list[dataset_idx][0]  # __getitem__を使ってデータを取得
+            max_data_attempts = 3
+            data_attempts = 0
+            data = None
+            
+            while data is None and data_attempts < max_data_attempts:
+                try:
+                    data = self.dataset_list[dataset_idx][random.randint(0, 10)]  # データセットからランダムにサンプルを取得
+                    data_attempts += 1
+                except Exception as e:
+                    print(f"エラー: データセット[{dataset_idx}]からのサンプル取得に失敗しました（試行 {data_attempts+1}/{max_data_attempts}）: {e}")
+                    if data_attempts >= max_data_attempts - 1:
+                        raise  # 最後の試行でも失敗した場合は例外を再発生
             
             # データの要素数をチェック
             if isinstance(data, tuple) and len(data) == 9:
@@ -494,15 +588,13 @@ class HybridDataset(torch.utils.data.Dataset):
                     else:
                         # 予期しない形式の場合はエラー
                         print(f"警告: 予期しないデータ形式です: {type(data)}, 長さ: {len(data) if isinstance(data, (tuple, list)) else 'N/A'}")
-                        # 再帰的に試行
-                        return self.__getitem__(0)
+                        raise ValueError(f"予期しないデータ形式: {type(data)}")
                 except Exception as e:
                     print(f"エラー: データの処理中に例外が発生しました: {e}")
                     # トレースバックを表示
                     import traceback
                     traceback.print_exc()
-                    # 再帰的に試行
-                    return self.__getitem__(0)
+                    raise  # 例外を再発生させる
             
             # 最終呼び出し階層の場合はカウンタをリセット
             if call_depth == 1:
@@ -524,7 +616,32 @@ class HybridDataset(torch.utils.data.Dataset):
             print(f"エラー: データの取得中に例外が発生しました: {e}")
             import traceback
             traceback.print_exc()
-            return self.__getitem__(0)
+            
+            # 再帰呼び出しの代わりに、別のインデックスでもう一度試す
+            if call_depth < 5:  # 再帰の深さを制限
+                new_idx = random.randint(0, len(self.dataset_list) - 1)
+                return self.__getitem__(new_idx)
+            else:
+                # 再帰が深すぎる場合はダミーデータを返す
+                print("警告: データ取得の再試行回数が多すぎます。ダミーデータを返します。")
+                setattr(self, '_call_depth', 0)  # カウンタをリセット
+                dummy_image = torch.zeros(3, 224, 224)
+                dummy_image_clip = torch.zeros(3, 224, 224)
+                dummy_masks = torch.zeros(1, 224, 224)
+                dummy_label = torch.ones(224, 224) * self.ignore_label
+                dummy_conversations = ["データ取得エラー"]
+                return (
+                    "dummy_path",
+                    dummy_image,
+                    dummy_image_clip,
+                    dummy_conversations,
+                    dummy_masks,
+                    dummy_label,
+                    (224, 224),
+                    None,
+                    None,
+                    False,
+                )
 
 
 class ValDataset(torch.utils.data.Dataset):
