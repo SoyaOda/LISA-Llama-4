@@ -232,22 +232,24 @@ class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
 
 
 class LISAForCausalLM(nn.Module):
+    """
+    LISA model for Causal Language Modeling with Segment Anything
+    
+    Llama3.2 Vision (MllamaForConditionalGeneration) + SAM
+    """
     def __init__(
         self,
-        model_id=None,
-        model=None,
-        config=None,
-        cache_dir=None,
+        model_id="meta-llama/Llama-3.2-11B-Vision-Instruct",
         torch_dtype=torch.float16,
-        low_cpu_mem_usage=False,
+        low_cpu_mem_usage=True,
         train_mask_decoder=True,
         out_dim=256,
         ce_loss_weight=1.0,
-        dice_loss_weight=0.5,
-        bce_loss_weight=2.0,
-        seg_token_idx=0,
-        vision_pretrained="PATH/TO/SAM/CHECKPOINT",
-        vision_tower="openai/clip-vit-large-patch14",
+        dice_loss_weight=1.0,
+        bce_loss_weight=1.0,
+        seg_token_idx=None,
+        vision_pretrained=None,
+        vision_tower=None,
         use_mm_start_end=True,
         device_map=None,
     ):
@@ -280,6 +282,48 @@ class LISAForCausalLM(nn.Module):
                 low_cpu_mem_usage=low_cpu_mem_usage,
                 device_map=device_map
             )
+            
+            # PEFT互換性のために重要: model_typeがdictではなくConfigオブジェクトであることを確認
+            # configが辞書の場合は、PretrainedConfigオブジェクトに変換
+            if isinstance(self.model.config, dict):
+                print("警告: configが辞書型です。PretrainedConfigオブジェクトに変換します。")
+                from transformers import PretrainedConfig
+                config_dict = self.model.config.copy()
+                self.model.config = PretrainedConfig()
+                for key, value in config_dict.items():
+                    setattr(self.model.config, key, value)
+            
+            # text_configやvision_configなどのサブ設定も変換
+            # Llama3.2 Visionモデルではこれらのサブ設定がネストされていることがある
+            for config_name in ['text_config', 'vision_config']:
+                if hasattr(self.model.config, config_name):
+                    sub_config = getattr(self.model.config, config_name)
+                    if isinstance(sub_config, dict):
+                        print(f"警告: {config_name}が辞書型です。PretrainedConfigオブジェクトに変換します。")
+                        sub_config_obj = PretrainedConfig()
+                        for key, value in sub_config.items():
+                            setattr(sub_config_obj, key, value)
+                        setattr(self.model.config, config_name, sub_config_obj)
+            
+            # model_type属性が必要（PEFT用）
+            if not hasattr(self.model.config, 'model_type'):
+                print("configにmodel_type属性を追加します（PEFT用）")
+                self.model.config.model_type = "mllama"
+            
+            # サブ設定にもmodel_type属性を追加
+            for config_name in ['text_config', 'vision_config']:
+                if hasattr(self.model.config, config_name):
+                    sub_config = getattr(self.model.config, config_name)
+                    if hasattr(sub_config, 'model_type') and sub_config.model_type is None:
+                        if config_name == 'text_config':
+                            sub_config.model_type = "llama"
+                        elif config_name == 'vision_config':
+                            sub_config.model_type = "vision_encoder"
+                    elif not hasattr(sub_config, 'model_type'):
+                        if config_name == 'text_config':
+                            sub_config.model_type = "llama"
+                        elif config_name == 'vision_config':
+                            sub_config.model_type = "vision_encoder"
             
             # Llama3.2 Vision用のプロセッサを初期化
             self.processor = AutoProcessor.from_pretrained(model_id)

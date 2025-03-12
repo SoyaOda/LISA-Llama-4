@@ -263,7 +263,40 @@ def main(args):
             bias="none",
             task_type="CAUSAL_LM",
         )
+        
+        # PEFT適用前にconfigがPretrainedConfigオブジェクトであることを確認
+        # 辞書型の場合はPretrainedConfigに変換
+        if hasattr(model, 'model') and hasattr(model.model, 'config'):
+            if isinstance(model.model.config, dict):
+                print("警告: model.model.configが辞書型です。PretrainedConfigに変換します。")
+                from transformers import PretrainedConfig
+                config_dict = model.model.config.copy()
+                model.model.config = PretrainedConfig()
+                for key, value in config_dict.items():
+                    setattr(model.model.config, key, value)
+                
+                # model_type属性を追加
+                if not hasattr(model.model.config, 'model_type'):
+                    print("model.model.configにmodel_type属性を追加します")
+                    model.model.config.model_type = "mllama"
+        
+        # 元のconfigオブジェクトの保持を確認
+        print(f"PEFT適用前のモデル設定確認:")
+        print(f"  - model.config type: {type(model.config).__name__}")
+        if hasattr(model, 'model'):
+            print(f"  - model.model.config type: {type(model.model.config).__name__}")
+            if hasattr(model.model.config, 'model_type'):
+                print(f"  - model.model.config.model_type: {model.model.config.model_type}")
+        
+        # PEFTモデルの作成
         model = get_peft_model(model, lora_config)
+        
+        # PEFTモデル作成後、base_modelのconfigを検証
+        print(f"PEFT適用後のモデル設定確認:")
+        print(f"  - model.base_model.config type: {type(model.base_model.config).__name__}")
+        if hasattr(model.base_model.config, 'model_type'):
+            print(f"  - model.base_model.config.model_type: {model.base_model.config.model_type}")
+            
         model.print_trainable_parameters()
 
     world_size = torch.cuda.device_count()
