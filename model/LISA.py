@@ -646,6 +646,19 @@ class LISAForCausalLM(nn.Module):
         **kwargs
     ):
         """LISA/VLオブジェクトの前方伝播処理と損失計算を行う。
+        
+        注意: Llama 3.2 Visionモデル（MllamaForConditionalGeneration）では、
+        画像入力は'images'ではなく'pixel_values'パラメータとして渡す必要があります。
+        このメソッドでは内部的にimages_clipを'pixel_values'として渡します。
+        
+        理想的には以下の方法で入力を準備するとよいでしょう:
+        ```
+        processor = AutoProcessor.from_pretrained("meta-llama/Llama-3.2-11B-Vision-Instruct")
+        inputs = processor(text=text_prompt, images=image, return_tensors="pt")
+        outputs = model(**inputs)
+        ```
+        
+        processorは画像を適切な形式に変換し、<|image|>トークンを処理します。
 
         Args:
             input_ids (torch.Tensor): 入力トークンのID
@@ -683,12 +696,13 @@ class LISAForCausalLM(nn.Module):
             embedding_token_seg = embedding_token_seg.squeeze(0)
         
         # 必要なパラメータでモデルを呼び出す
+        # Llama 3.2 Visionは'images'ではなく'pixel_values'パラメータを期待する
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
             output_hidden_states=True,
-            images=images_clip,
+            pixel_values=images_clip,  # 'images'ではなく'pixel_values'を使用
             inputs_embeds=inputs_embeds
         )
         
@@ -888,6 +902,7 @@ class LISAForCausalLM(nn.Module):
         with torch.no_grad():
             # Llama3.2 vision用に入力を準備
             processor = self.get_processor()
+            # processorは'images'を'pixel_values'に内部的に変換してくれる
             batch_inputs = processor(
                 text=input_ids,
                 images=images_clip,
@@ -1013,7 +1028,8 @@ class LISAForCausalLM(nn.Module):
         if inputs_embeds is not None:
             batch_inputs["inputs_embeds"] = inputs_embeds
         if images is not None:
-            batch_inputs["images"] = images
+            # Llama 3.2 Visionでは'images'ではなく'pixel_values'を使用
+            batch_inputs["pixel_values"] = images
             
         return batch_inputs
 
