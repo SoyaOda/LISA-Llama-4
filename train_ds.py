@@ -170,17 +170,45 @@ def main(args):
     model = LISAForCausalLM(
         model_id=args.version,
         torch_dtype=torch_dtype,
-        device_map="auto",
-        **model_args
+        low_cpu_mem_usage=True,
+        train_mask_decoder=args.train_mask_decoder,
+        out_dim=args.out_dim,
+        ce_loss_weight=args.ce_loss_weight,
+        dice_loss_weight=args.dice_loss_weight,
+        bce_loss_weight=args.bce_loss_weight,
+        seg_token_idx=args.seg_token_idx,
+        vision_pretrained=args.vision_pretrained,
+        vision_tower=args.vision_tower,
+        use_mm_start_end=args.use_mm_start_end,
+        # DeepSpeed環境ではdevice_mapは使用しない
+        device_map=None
     )
+
+    # DeepSpeedの初期化前にモデルの一部をCPUに移動
+    # これにより、metaデバイスのテンソルのコピーエラーを回避
+    if hasattr(model.model, "to"):
+        try:
+            print("モデルをCPUに移動します（meta device回避）")
+            # まず主要なモデルをCPUに移動
+            model.model.to("cpu")
+        except Exception as e:
+            print(f"警告: モデルのCPU移動中にエラーが発生しました: {e}")
+            print("DeepSpeedが自動的に処理するため続行します")
     
+    # make text_hidden_fcs, mask_decoder trainable
+    for n, p in model.named_parameters():
+        if any([x in n for x in ["mask_decoder", "text_hidden_fcs"]]):
+            print("n: ", n, "p.shape: ", p.shape)
+            p.requires_grad = True
+            
     # 埋め込みの調整 - LISAForCausalLMでは既に行われているが、念のためここでも行う
     # トークン埋め込みのサイズ変更（入力と出力の両方）
     model.resize_token_embeddings(len(tokenizer))
     
     # 入力埋め込みと出力埋め込みを結合
-    model.tie_weights()
-    if hasattr(model, "model") and hasattr(model.model, "tie_weights"):
+    if hasattr(model, "tie_weights"):
+        model.tie_weights()
+    if hasattr(model.model, "tie_weights"):
         model.model.tie_weights()
     
     if hasattr(model.model, "config"):
@@ -189,18 +217,10 @@ def main(args):
         model.model.config.pad_token_id = tokenizer.pad_token_id
 
     if args.gradient_checkpointing:
-        model.model.gradient_checkpointing_enable()
-
-    if not args.eval_only:
-        model.lisa_model.initialize_lisa_modules(model.lisa_model.config)
-
-    if hasattr(model.lisa_model, "vision_tower") and model.lisa_model.vision_tower is not None:
-        for p in model.lisa_model.vision_tower.parameters():
-            p.requires_grad = False
-    
-    if hasattr(model.lisa_model, "mm_projector"):
-        for p in model.lisa_model.mm_projector.parameters():
-            p.requires_grad = False
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        elif hasattr(model.model, "gradient_checkpointing_enable"):
+            model.model.gradient_checkpointing_enable()
 
     conversation_lib.default_conversation = conversation_lib.conv_templates.get(
         args.conv_type, conversation_lib.conv_templates["llama_3"]
@@ -208,7 +228,6 @@ def main(args):
 
     lora_r = args.lora_r
     if lora_r > 0:
-
         def find_linear_layers(model, lora_target_modules):
             cls = torch.nn.Linear
             lora_module_names = set()
@@ -246,16 +265,6 @@ def main(args):
         )
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
-
-    for n, p in model.named_parameters():
-        if any(
-            [
-                x in n
-                for x in ["mask_decoder", "text_hidden_fcs"]
-            ]
-        ):
-            print("n: ", n, "p.shape: ", p.shape)
-            p.requires_grad = True
 
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1
@@ -332,8 +341,14 @@ def main(args):
             "reduce_scatter": True,
             "reduce_bucket_size": 5e8,
             "allgather_bucket_size": 5e8,
+            "zero_allow_untested_optimizer": True,  # metaデバイスのテンソル対応
         },
     }
+    
+    # DeepSpeedの初期化前に注意事項を表示
+    print("DeepSpeedの初期化を開始します（meta tensorがある場合にエラーが発生する可能性があります）")
+    print("問題が発生した場合は、モデルをCPUに完全に移動してからDeepSpeedを初期化してください")
+    
     model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
         model=model,
         model_parameters=model.parameters(),
@@ -344,7 +359,6 @@ def main(args):
             conv_type=args.conv_type,
             use_mm_start_end=args.use_mm_start_end,
             local_rank=args.local_rank,
-            processor=processor,
         ),
         config=ds_config,
     )

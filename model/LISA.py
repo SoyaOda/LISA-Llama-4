@@ -228,12 +228,15 @@ class LISAForCausalLM(nn.Module):
             # モデルの初期化
             print(f"Loading Llama3.2 Vision model: {model_id}")
             print(f"  - torch_dtype: {torch_dtype}")
-            print(f"  - device_map: {device_map}")
             
-            # device_mapが指定されている場合は、low_cpu_mem_usage=Trueを強制的に設定
+            # DeepSpeed環境ではdevice_mapをNoneに設定する必要がある
+            # 'meta'デバイスのテンソルはDeepSpeedの初期化時にエラーが発生するため
             if device_map is not None:
-                low_cpu_mem_usage = True
-                print(f"  - Setting low_cpu_mem_usage=True (required for device_map)")
+                print(f"  - 警告: DeepSpeed環境ではdevice_map={device_map}を使用できません")
+                print(f"  - device_map=Noneに設定します（DeepSpeedが自動的にデバイスを管理）")
+                device_map = None
+            
+            print(f"  - device_map: {device_map}")
             
             # Llama3.2 Visionモデルのロード
             self.model = MllamaForConditionalGeneration.from_pretrained(
