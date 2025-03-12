@@ -677,11 +677,13 @@ class LISAForCausalLM(nn.Module):
             
         # SEGトークンの埋め込みを取得
         with torch.no_grad():
-            embedding_token_seg = self.get_input_embeddings()(torch.tensor([[self.seg_token_idx]], device=self.device))
+            # self.deviceがないので、代わりにモデルの現在のデバイスを取得
+            device = next(self.parameters()).device
+            embedding_token_seg = self.get_input_embeddings()(torch.tensor([[self.seg_token_idx]], device=device))
             embedding_token_seg = embedding_token_seg.squeeze(0)
         
         # 必要なパラメータでモデルを呼び出す
-        outputs = self.language_model(
+        outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
@@ -750,8 +752,8 @@ class LISAForCausalLM(nn.Module):
         ce_loss = None if labels is None else outputs.loss
         
         # マスク損失の計算準備
-        mask_bce_loss = torch.tensor(0., device=self.device)
-        mask_dice_loss = torch.tensor(0., device=self.device)
+        mask_bce_loss = torch.tensor(0., device=device)
+        mask_dice_loss = torch.tensor(0., device=device)
         num_masks = 0
         
         # 有効なマスクの数をカウント
@@ -760,7 +762,7 @@ class LISAForCausalLM(nn.Module):
             if valid_masks_count == 0:
                 print(f"WARNING: [マスクNull原因] すべてのマスクがNoneです。バッチサイズ: {batch_size}")
                 # マスクがすべてNoneの場合はマスク損失を計算せずにテキスト生成損失のみ使用
-                loss = ce_loss if ce_loss is not None else torch.tensor(0., device=self.device)
+                loss = ce_loss if ce_loss is not None else torch.tensor(0., device=device)
                 return {"loss": loss, "ce_loss": ce_loss, "mask_dice_loss": mask_dice_loss, "mask_bce_loss": mask_bce_loss}
         
         # マスク損失の計算（マスクが存在する場合のみ）
@@ -822,7 +824,7 @@ class LISAForCausalLM(nn.Module):
                         continue
                     
                     # データ型とデバイスを確認
-                    gt_masks_tensor = torch.stack(gt_masks).to(self.device) if isinstance(gt_masks[0], torch.Tensor) else torch.tensor(gt_masks).to(self.device)
+                    gt_masks_tensor = torch.stack(gt_masks).to(device) if isinstance(gt_masks[0], torch.Tensor) else torch.tensor(gt_masks).to(device)
                     pred_masks_tensor = torch.stack(pred_masks)
                     
                     # サイズが一致することを確認
@@ -864,7 +866,7 @@ class LISAForCausalLM(nn.Module):
         else:
             print(f"WARNING: [マスクNull原因] 有効なマスクペアが見つかりませんでした")
             # マスクがない場合はテキスト生成損失のみを使用
-            loss = ce_loss if ce_loss is not None else torch.tensor(0., device=self.device)
+            loss = ce_loss if ce_loss is not None else torch.tensor(0., device=device)
         
         return {
             "loss": loss,

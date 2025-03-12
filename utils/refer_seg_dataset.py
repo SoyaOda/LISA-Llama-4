@@ -73,20 +73,32 @@ class ReferSegDataset(torch.utils.data.Dataset):
 
             refer_seg_ds = {}
             refer_seg_ds["images"] = []
-            loaded_images = refer_api.loadImgs(image_ids=images_ids_train)
-
-            for item in loaded_images:
-                item = item.copy()
-                if ds == "refclef":
-                    item["file_name"] = os.path.join(
-                        DATA_DIR, "images/saiapr_tc-12", item["file_name"]
-                    )
-                else:
-                    item["file_name"] = os.path.join(
-                        DATA_DIR, "images/mscoco/images/train2014", item["file_name"]
-                    )
-                refer_seg_ds["images"].append(item)
-            refer_seg_ds["annotations"] = refer_api.Anns  # anns_train
+            
+            try:
+                loaded_images = refer_api.loadImgs(image_ids=images_ids_train)
+                
+                # 画像がない場合の処理
+                if loaded_images is None or len(loaded_images) == 0:
+                    print(f"警告: データセット{ds}の画像が見つかりませんでした。このデータセットはスキップします。")
+                    continue
+                
+                for item in loaded_images:
+                    item = item.copy()
+                    if ds == "refclef":
+                        item["file_name"] = os.path.join(
+                            DATA_DIR, "images/saiapr_tc-12", item["file_name"]
+                        )
+                    else:
+                        item["file_name"] = os.path.join(
+                            DATA_DIR, "images/mscoco/images/train2014", item["file_name"]
+                        )
+                    refer_seg_ds["images"].append(item)
+                refer_seg_ds["annotations"] = refer_api.Anns  # anns_train
+            except Exception as e:
+                print(f"エラー: データセット{ds}の処理中にエラーが発生しました: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
 
             print(
                 "dataset {} (refs {}) (train split) has {} images and {} annotations.".format(
