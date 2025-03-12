@@ -88,11 +88,11 @@ class LisaMetaModel:
         if not hasattr(self.config, "out_dim"):
             self.config.out_dim = kwargs.get("out_dim", 256)
             
+        # vision_pretrained設定を取得
         self.vision_pretrained = kwargs.get("vision_pretrained", None)
         
-        # SAMモデルの初期化は明示的に初期化する場合のみ行う
-        if kwargs.get("initialize_sam", False):
-            self.initialize_lisa_modules(self.config)
+        # オリジナルLISAコードと同様に常にSAMを初期化
+        self.initialize_lisa_modules(self.config)
 
     def initialize_lisa_modules(self, config):
         # SAM
