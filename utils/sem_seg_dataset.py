@@ -71,8 +71,11 @@ def init_mapillary(base_image_dir):
 
 def init_ade20k(base_image_dir):
     try:
-        with open("utils/ade20k_classes.json", "r") as f:
-            ade20k_classes = json.load(f)
+        # ADE20Kデータセットのクラス情報を読み込む
+        ade20k_classes = []
+        with open("utils/ade20k_classes.txt") as f:
+            for line in f.readlines():
+                ade20k_classes.append(line.strip())
         ade20k_classes = np.array(ade20k_classes)
         
         # パスの構築方法を改善
@@ -83,73 +86,39 @@ def init_ade20k(base_image_dir):
         else:
             # 相対パスの場合は現在の作業ディレクトリからの相対パスを構築
             current_dir = os.getcwd()
+            print(f"DEBUG: Current working directory: {current_dir}")
             ade20k_dir = os.path.normpath(os.path.join(current_dir, base_image_dir, "ade20k"))
         
+        print(f"DEBUG: ADE20K base directory: {ade20k_dir}")
+        
+        # 画像ディレクトリを確認
         images_dir = os.path.join(ade20k_dir, "images")
         training_dir = os.path.join(images_dir, "training")
         
-        print(f"DEBUG: Current working directory: {os.getcwd()}")
-        print(f"DEBUG: ADE20K base directory: {ade20k_dir}")
         print(f"DEBUG: ADE20K images directory: {images_dir}")
         print(f"DEBUG: ADE20K training directory: {training_dir}")
         print(f"DEBUG: Directory exists: {os.path.exists(training_dir)}")
         
-        # ディレクトリの存在確認と内容表示
-        if not os.path.exists(training_dir):
-            print(f"ERROR: Training directory does not exist: {training_dir}")
-            
-            # ade20kディレクトリの内容を表示
-            if os.path.exists(ade20k_dir):
-                print(f"ade20k directory contents: {os.listdir(ade20k_dir)}")
-                # imagesディレクトリが存在するか確認
-                if os.path.exists(images_dir):
-                    print(f"images directory contents: {os.listdir(images_dir)}")
-            
-            # 別の可能性のあるパスを試す
-            possible_training_dirs = [
-                os.path.join(ade20k_dir, "training"),
-                os.path.join(base_image_dir, "ade20k", "training"),
-                os.path.join(base_image_dir, "ade20k/training"),
-            ]
-            
-            for alt_dir in possible_training_dirs:
-                if os.path.exists(alt_dir):
-                    print(f"Found alternative training directory: {alt_dir}")
-                    training_dir = alt_dir
-                    break
-            
-            # それでも見つからない場合は空のリストを返す
-            if not os.path.exists(training_dir):
-                print("WARNING: Could not find ADE20K training directory, returning empty dataset")
-                return ade20k_classes, [], []
-        
-        # JPG画像ファイルを検索
-        image_files = [f for f in os.listdir(training_dir) if f.endswith('.jpg')]
-        if not image_files:
-            print(f"WARNING: No JPG files found in {training_dir}")
-            if os.path.exists(training_dir):
-                print(f"Training directory contents: {os.listdir(training_dir)}")
-            return ade20k_classes, [], []
-        
-        image_files = sorted(image_files)
-        print(f"DEBUG: Found {len(image_files)} jpg files")
-        
-        # 画像IDを抽出
-        ade20k_image_ids = [x[:-4] for x in image_files]  # .jpg拡張子を削除
-        
-        # 画像パスのリストを作成
+        # 訓練用画像のリストを取得
         ade20k_images = []
-        for image_id in ade20k_image_ids:
-            image_path = os.path.join(training_dir, f"{image_id}.jpg")
-            ade20k_images.append(image_path)
-            # 画像ファイルの存在を確認
-            if not os.path.exists(image_path):
-                print(f"WARNING: Image file does not exist: {image_path}")
+        ade20k_image_ids = []
         
-        # アノテーションディレクトリを構築
+        if os.path.exists(training_dir):
+            # jpg形式のみを検索
+            image_files = glob.glob(os.path.join(training_dir, "*.jpg"))
+            print(f"DEBUG: Found {len(image_files)} jpg files")
+            
+            for image_file in image_files:
+                image_id = os.path.splitext(os.path.basename(image_file))[0]
+                ade20k_images.append(image_file)
+                ade20k_image_ids.append(image_id)
+        else:
+            print(f"WARNING: Training directory does not exist: {training_dir}")
+        
+        # アノテーションディレクトリを確認
         annotations_dir = os.path.join(ade20k_dir, "annotations", "training")
         if not os.path.exists(annotations_dir):
-            print(f"WARNING: Annotations directory does not exist: {annotations_dir}")
+            print(f"WARNING: [マスクNull原因] Annotations directory does not exist: {annotations_dir}")
             # アノテーションディレクトリが存在しない場合は、代わりにダミーのラベルを返す
             ade20k_labels = [None] * len(ade20k_images)
         else:
@@ -160,13 +129,13 @@ def init_ade20k(base_image_dir):
                 ade20k_labels.append(label_path)
                 # アノテーションファイルの存在を確認
                 if not os.path.exists(label_path):
-                    print(f"WARNING: Annotation file does not exist: {label_path}")
+                    print(f"WARNING: [マスクNull原因] Annotation file does not exist: {label_path}")
         
         print("ade20k: ", len(ade20k_images))
         return ade20k_classes, ade20k_images, ade20k_labels
     
     except Exception as e:
-        print(f"ERROR: Failed to initialize ade20k dataset: {e}")
+        print(f"ERROR: [マスクNull原因] Failed to initialize ade20k dataset: {e}")
         import traceback
         traceback.print_exc()
         # エラーが発生した場合は空のデータセットを返す
@@ -210,6 +179,7 @@ def init_cocostuff(base_image_dir):
         # 見つからない場合は最初のパスを使用
         if not cocostuff_train_dir:
             cocostuff_train_dir = possible_cocostuff_dirs[0]
+            print(f"WARNING: [マスクNull原因] Could not find cocostuff directory, using default: {cocostuff_train_dir}")
         
         # cocoのトレーニングディレクトリも同様に検索
         possible_coco_dirs = [
@@ -228,6 +198,7 @@ def init_cocostuff(base_image_dir):
         # 見つからない場合は最初のパスを使用
         if not coco_train_dir:
             coco_train_dir = possible_coco_dirs[0]
+            print(f"WARNING: [マスクNull原因] Could not find coco directory, using default: {coco_train_dir}")
         
         print(f"DEBUG: Current working directory: {os.getcwd()}")
         print(f"DEBUG: Cocostuff directory: {cocostuff_dir}")
@@ -238,8 +209,12 @@ def init_cocostuff(base_image_dir):
         print(f"DEBUG: Coco train directory exists: {os.path.exists(coco_train_dir)}")
         
         # ディレクトリが存在しない場合は空のリストを返す
-        if not os.path.exists(cocostuff_train_dir) or not os.path.exists(coco_train_dir):
-            print("WARNING: Cocostuff or coco train directory not found, returning empty dataset")
+        if not os.path.exists(cocostuff_train_dir):
+            print(f"WARNING: [マスクNull原因] Cocostuff train directory not found: {cocostuff_train_dir}")
+            return cocostuff_classes, [], []
+            
+        if not os.path.exists(coco_train_dir):
+            print(f"WARNING: [マスクNull原因] Coco train directory not found: {coco_train_dir}")
             return cocostuff_classes, [], []
         
         # ラベルファイル（PNG）を取得
@@ -250,8 +225,9 @@ def init_cocostuff(base_image_dir):
             png_files = glob.glob(os.path.join(cocostuff_train_dir, "*.png"))
             if png_files:
                 cocostuff_labels = png_files
+                print(f"DEBUG: Found {len(png_files)} PNG files in {cocostuff_train_dir}")
             else:
-                print(f"No PNG files found in {cocostuff_train_dir}")
+                print(f"WARNING: [マスクNull原因] No PNG files found in {cocostuff_train_dir}")
                 if os.path.exists(cocostuff_train_dir):
                     print(f"Directory contents: {os.listdir(cocostuff_train_dir)}")
                     
@@ -262,10 +238,12 @@ def init_cocostuff(base_image_dir):
                         cocostuff_labels = jpg_files
                 
         except Exception as e:
-            print(f"Error searching for PNG files: {e}")
+            print(f"ERROR: [マスクNull原因] Error searching for PNG files: {e}")
+            import traceback
+            traceback.print_exc()
         
         if not cocostuff_labels:
-            print("WARNING: No label files found for cocostuff, returning empty dataset")
+            print(f"WARNING: [マスクNull原因] No label files found for cocostuff in {cocostuff_train_dir}")
             return cocostuff_classes, [], []
         
         cocostuff_labels = sorted(cocostuff_labels)
@@ -273,6 +251,7 @@ def init_cocostuff(base_image_dir):
         
         # 対応する画像ファイル（JPG）のパスを構築
         cocostuff_images = []
+        valid_pairs = []
         for label_path in cocostuff_labels:
             # ファイル名のみを取得
             filename = os.path.basename(label_path)
@@ -281,7 +260,7 @@ def init_cocostuff(base_image_dir):
             
             # 画像ファイルの存在を確認
             if not os.path.exists(image_path):
-                print(f"WARNING: Image file does not exist: {image_path}")
+                print(f"WARNING: [マスクNull原因] Image file does not exist: {image_path}")
                 # 可能性のあるパスを試す
                 alternative_paths = [
                     os.path.join(cocostuff_dir, image_filename),
@@ -289,19 +268,32 @@ def init_cocostuff(base_image_dir):
                     os.path.join(base_image_dir, "coco", image_filename)
                 ]
                 
+                found_alternative = False
                 for alt_path in alternative_paths:
                     if os.path.exists(alt_path):
                         print(f"Found alternative path for image: {alt_path}")
                         image_path = alt_path
+                        found_alternative = True
                         break
+                
+                if not found_alternative:
+                    print(f"WARNING: [マスクNull原因] Could not find image for label: {label_path}")
+                    continue
             
             cocostuff_images.append(image_path)
+            valid_pairs.append(label_path)
+        
+        # 有効なラベルパスのみを保持
+        cocostuff_labels = valid_pairs
         
         print("cocostuff: ", len(cocostuff_images))
+        if len(cocostuff_images) != len(cocostuff_labels):
+            print(f"WARNING: [マスクNull原因] Mismatch between images ({len(cocostuff_images)}) and labels ({len(cocostuff_labels)})")
+        
         return cocostuff_classes, cocostuff_images, cocostuff_labels
     
     except Exception as e:
-        print(f"ERROR: Failed to initialize cocostuff dataset: {e}")
+        print(f"ERROR: [マスクNull原因] Failed to initialize cocostuff dataset: {e}")
         import traceback
         traceback.print_exc()
         # 例外を再発生させる代わりに空のリストを返す

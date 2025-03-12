@@ -104,6 +104,8 @@ def parse_args(args):
         type=str,
         choices=["llava_v1", "llava_llama_2", "llama_3"],
     )
+    parser.add_argument("--debug", action="store_true", default=False)
+    parser.add_argument("--debug_interval", default=10, type=int)
     return parser.parse_args(args)
 
 
@@ -532,7 +534,58 @@ def train(
                 input_dict["images"] = input_dict["images"].float()
                 input_dict["images_clip"] = input_dict["images_clip"].float()
 
-            output_dict = model(**input_dict)
+            # マスクデータのデバッグ情報を追加
+            if args.debug and global_step % args.debug_interval == 0 and i == 0:
+                print(f"\n[マスクデバッグ情報] エポック {epoch}, ステップ {global_step}")
+                if "masks_list" in input_dict:
+                    masks_list = input_dict["masks_list"]
+                    print(f"masks_list長さ: {len(masks_list)}")
+                    null_mask_indices = [idx for idx, m in enumerate(masks_list) if m is None]
+                    if null_mask_indices:
+                        print(f"[マスクNull原因] Noneマスクのインデックス: {null_mask_indices}")
+                        
+                        # 対応する画像情報も表示
+                        if "image_paths" in input_dict:
+                            print("対応する画像パス:")
+                            for idx in null_mask_indices:
+                                if idx < len(input_dict["image_paths"]):
+                                    print(f"  インデックス {idx}: {input_dict['image_paths'][idx]}")
+                
+                # 最初の数個のサンプルの詳細情報を表示
+                if "masks_list" in input_dict and len(input_dict["masks_list"]) > 0:
+                    for idx in range(min(3, len(input_dict["masks_list"]))):
+                        mask = input_dict["masks_list"][idx]
+                        if mask is not None:
+                            print(f"マスク {idx}: shape={mask.shape}, dtype={mask.dtype}, min={mask.min().item()}, max={mask.max().item()}")
+                        else:
+                            print(f"マスク {idx}: None")
+
+            try:
+                output_dict = model(**input_dict)
+            except Exception as e:
+                print(f"\n[エラー情報] モデル実行中にエラーが発生しました: {e}")
+                print("入力データの情報:")
+                for k, v in input_dict.items():
+                    try:
+                        if isinstance(v, torch.Tensor):
+                            print(f"  {k}: shape={v.shape}, dtype={v.dtype}")
+                        elif isinstance(v, list):
+                            print(f"  {k}: list of {len(v)} items")
+                            if len(v) > 0 and v[0] is not None:
+                                first_item = v[0]
+                                if isinstance(first_item, torch.Tensor):
+                                    print(f"    先頭アイテム: shape={first_item.shape}, dtype={first_item.dtype}")
+                                else:
+                                    print(f"    先頭アイテム: type={type(first_item)}")
+                    except:
+                        print(f"  {k}: 情報の取得に失敗")
+                
+                # エラー内容の詳細表示
+                import traceback
+                traceback.print_exc()
+                
+                # 致命的なエラーの場合は再発生
+                raise
 
             loss = output_dict["loss"]
             ce_loss = output_dict["ce_loss"]

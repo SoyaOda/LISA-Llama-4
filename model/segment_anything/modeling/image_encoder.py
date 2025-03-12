@@ -383,13 +383,39 @@ def add_decomposed_rel_pos(
     rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
     rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
 
-    attn = (
-        attn.view(B, q_h, q_w, k_h, k_w)
-        + rel_h[:, :, :, :, None]
-        + rel_w[:, :, :, None, :]
-    ).view(B, q_h * q_w, k_h * k_w)
-
-    return attn
+    # メモリ使用量を減らすためにチャンク処理を導入
+    # 大きなテンソルの一度にリシェイプする代わりに、小さなチャンクで処理
+    
+    # 各チャンクのサイズを定義
+    chunk_size = 4  # バッチサイズが大きい場合は小さな値を使用
+    
+    # 出力テンソルを初期化
+    attn_out = torch.zeros_like(attn)
+    
+    # チャンク処理
+    for i in range(0, B, chunk_size):
+        end_idx = min(i + chunk_size, B)
+        chunk_batch_size = end_idx - i
+        
+        # 現在のチャンクを処理
+        with torch.cuda.amp.autocast(enabled=True):  # 半精度計算でメモリ使用量を減らす
+            # 現在のバッチチャンクを取得
+            attn_chunk = attn[i:end_idx]
+            rel_h_chunk = rel_h[i:end_idx]
+            rel_w_chunk = rel_w[i:end_idx]
+            
+            # リシェイプとREPE計算を実行
+            attn_reshaped = attn_chunk.view(chunk_batch_size, q_h, q_w, k_h, k_w)
+            attn_with_rel_h = attn_reshaped + rel_h_chunk[:, :, :, :, None]
+            attn_with_rel_pos = attn_with_rel_h + rel_w_chunk[:, :, :, None, :]
+            
+            # 元の形状に戻す
+            attn_out[i:end_idx] = attn_with_rel_pos.view(chunk_batch_size, q_h * q_w, k_h * k_w)
+        
+        # 不要なキャッシュをクリア
+        torch.cuda.empty_cache()
+    
+    return attn_out
 
 
 class PatchEmbed(nn.Module):

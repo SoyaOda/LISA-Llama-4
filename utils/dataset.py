@@ -40,7 +40,7 @@ def collate_fn(
     offset_list = [0]
     cnt = 0
     inferences = []
-    for (
+    for batch_idx, (
         image_path,
         images,
         images_clip,
@@ -51,7 +51,7 @@ def collate_fn(
         question,
         sampled_classes,
         inference,
-    ) in batch:
+    ) in enumerate(batch):
         image_path_list.append(image_path)
         images_list.append(images)
         images_clip_list.append(images_clip)
@@ -59,10 +59,22 @@ def collate_fn(
         if masks is not None:
             masks_list.append(masks.float())
         else:
+            # マスクがNoneの場合、詳細なデバッグ情報をログに表示
+            print(f"[データ解析] バッチインデックス {batch_idx} でマスクがNoneです。")
+            print(f"[データ解析]   - 画像パス: {image_path}")
+            print(f"[データ解析]   - 会話数: {len(conversations)}")
+            print(f"[データ解析]   - リサイズ値: {resize}")
+            if question is not None:
+                print(f"[データ解析]   - 質問: {question}")
+            if sampled_classes is not None:
+                print(f"[データ解析]   - サンプルクラス: {sampled_classes}")
             masks_list.append(None)
         if label is not None:
             label_list.append(label)
         else:
+            # ラベルがNoneの場合、詳細なデバッグ情報をログに表示
+            print(f"[データ解析] バッチインデックス {batch_idx} でラベルがNoneです。")
+            print(f"[データ解析]   - 画像パス: {image_path}")
             label_list.append(None)
         resize_list.append(resize)
         if question is not None:

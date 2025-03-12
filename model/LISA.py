@@ -15,6 +15,16 @@ from transformers import (
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          DEFAULT_IMAGE_PATCH_TOKEN)
 
+import math
+import transformers
+import numpy as np
+from transformers import AutoConfig, CLIPVisionModel, AutoModelForCausalLM, AutoTokenizer, AutoProcessor, PretrainedConfig
+import os
+from safetensors import safe_open
+import collections.abc
+from transformers.utils import is_flash_attn_2_available
+import json
+
 # llama3_2モジュールからのインポートパスを修正
 try:
     from model.llama3_2.model.language_model.llama3_2 import Llama3VisionMetaModel
@@ -620,211 +630,225 @@ class LISAForCausalLM(nn.Module):
 
     def model_forward(
         self,
-        images: torch.FloatTensor,
-        images_clip: torch.FloatTensor,
-        input_ids: torch.LongTensor,
-        labels: torch.LongTensor,
-        attention_masks: torch.LongTensor,
-        offset: torch.LongTensor,
-        masks_list: List[torch.FloatTensor],
-        label_list: List[torch.Tensor],
-        resize_list: List[tuple],
-        inference: bool = False,
-        processor=None,  # プロセッサを明示的に受け取るパラメータを追加
-        **kwargs,
+        input_ids,
+        attention_mask,
+        labels=None,
+        images=None,
+        images_clip=None,
+        masks_list=None,
+        label_masks_list=None
     ):
-        # プロセッサが指定されていない場合はself.processorを使用
-        if processor is None:
-            if hasattr(self, 'processor') and self.processor is not None:
-                processor = self.processor
-            else:
-                # 最終的な対策として、その場でプロセッサを作成
-                print("警告: プロセッサが指定されていないため、新しく作成します")
-                from transformers import AutoProcessor
-                processor = AutoProcessor.from_pretrained("meta-llama/Llama-3.2-11B-Vision-Instruct")
+        """LISA/VLオブジェクトの前方伝播処理と損失計算を行う。
+
+        Args:
+            input_ids (torch.Tensor): 入力トークンのID
+            attention_mask (torch.Tensor): アテンションマスク
+            labels (torch.Tensor, optional): ラベルデータ。デフォルトはNone。
+            images (list, optional): 画像のリスト。デフォルトはNone。
+            images_clip (list, optional): CLIP形式の画像のリスト。デフォルトはNone。
+            masks_list (list, optional): マスクのリスト。デフォルトはNone。
+            label_masks_list (list, optional): ラベルのマスクのリスト。デフォルトはNone。
+
+        Returns:
+            dict: 計算された損失と出力値を含む辞書
+        """
+        # SEGトークンの埋め込みを取得
+        with torch.no_grad():
+            embedding_token_seg = self.get_input_embeddings()(torch.tensor([[self.seg_token_idx]], device=self.device))
+            embedding_token_seg = embedding_token_seg.squeeze(0)
         
-        # SAM用の特徴抽出
-        image_embeddings = self.get_visual_embs(images)
-        batch_size = image_embeddings.shape[0]
-        assert batch_size == len(offset) - 1
-
-        # セグメンテーショントークンのマスクを作成
-        # 入力IDsの<SEG>トークンの位置を特定
-        seg_token_mask = labels == self.seg_token_idx
-        
-        # Llama3.2 Visionモデルでは入力と出力の形式が異なるため、
-        # <SEG>トークンの位置を特定するために適切なマスクを作成
-        # プロセッサーを取得
-        processor = self.get_processor()
-
-        if inference:
-            n_batch = 1
-            length = input_ids.shape[0]
-            assert images_clip.shape[0] == 1
-            
-            # 推論時は画像を拡張
-            images_clip_extend = images_clip.expand(length, -1, -1, -1).contiguous()
-
-            output_hidden_states = []
-            for i in range(n_batch):
-                start_i, end_i = i * length, min((i + 1) * length, input_ids.shape[0])
-                
-                # Llama3.2 vision用に入力を準備
-                batch_inputs = processor(
-                    text=input_ids[start_i:end_i],
-                    images=images_clip_extend[: end_i - start_i],
-                    return_tensors="pt",
-                    padding=True,
-                )
-                
-                # デバイスを合わせる
-                batch_inputs = {k: v.to(self.model.device) for k, v in batch_inputs.items()}
-                
-                # モデルを実行
-                output_i = self.model(**batch_inputs, output_hidden_states=True)
-                output_hidden_states.append(output_i.hidden_states[-1])
-                torch.cuda.empty_cache()
-
-            # 出力を結合
-            output_hidden_states = torch.cat(output_hidden_states, dim=0)
-            output = None
-
-        else:
-            # 訓練時は各バッチごとに画像を拡張
-            images_clip_list = []
-            for i in range(len(offset) - 1):
-                start_i, end_i = offset[i], offset[i + 1]
-                images_clip_i = (
-                    images_clip[i]
-                    .unsqueeze(0)
-                    .expand(end_i - start_i, -1, -1, -1)
-                    .contiguous()
-                )
-                images_clip_list.append(images_clip_i)
-            images_clip = torch.cat(images_clip_list, dim=0)
-            
-            # Llama3.2 vision用に入力を準備
-            batch_inputs = processor(
-                text=input_ids,
-                images=images_clip,
-                return_tensors="pt",
-                padding=True,
-            )
-            
-            # ラベルを設定
-            if labels is not None:
-                batch_inputs["labels"] = labels
-                
-            # デバイスを合わせる
-            batch_inputs = {k: v.to(self.model.device) for k, v in batch_inputs.items()}
-            
-            # モデルを実行
-            output = self.model(**batch_inputs, output_hidden_states=True)
-            output_hidden_states = output.hidden_states[-1]
-
-        # 以下はオリジナルのLISAと同様の処理
-        hidden_states = []
-
-        assert len(self.lisa_model.text_hidden_fcs) == 1
-        hidden_states.append(self.lisa_model.text_hidden_fcs[0](output_hidden_states))
-
-        last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
-        
-        # <SEG>トークンの位置を特定
-        seg_token_mask = labels == self.seg_token_idx
-        
-        # <SEG>トークンのembeddingを抽出
-        pred_embeddings = last_hidden_state[seg_token_mask]
-        seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
-
-        seg_token_offset = seg_token_counts.cumsum(-1)
-        seg_token_offset = torch.cat(
-            [torch.zeros(1).long().cuda(), seg_token_offset], dim=0
+        # 必要なパラメータでモデルを呼び出す
+        outputs = self.language_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            output_hidden_states=True,
+            images=images_clip
         )
-
-        seg_token_offset = seg_token_offset[offset]
-
-        pred_embeddings_ = []
-        for i in range(len(seg_token_offset) - 1):
-            start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
-            pred_embeddings_.append(pred_embeddings[start_i:end_i])
-        pred_embeddings = pred_embeddings_
-
-        multimask_output = False
-        pred_masks = []
-        for i in range(len(pred_embeddings)):
-            (
-                sparse_embeddings,
-                dense_embeddings,
-            ) = self.lisa_model.visual_model.prompt_encoder(
-                points=None,
-                boxes=None,
-                masks=None,
-                text_embeds=pred_embeddings[i].unsqueeze(1),
-            )
-            sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
-            low_res_masks, iou_predictions = self.lisa_model.visual_model.mask_decoder(
-                image_embeddings=image_embeddings[i].unsqueeze(0),
-                image_pe=self.lisa_model.visual_model.prompt_encoder.get_dense_pe(),
-                sparse_prompt_embeddings=sparse_embeddings,
-                dense_prompt_embeddings=dense_embeddings,
-                multimask_output=multimask_output,
-            )
-            pred_mask = self.lisa_model.visual_model.postprocess_masks(
-                low_res_masks,
-                input_size=resize_list[i],
-                original_size=label_list[i].shape,
-            )
-            pred_masks.append(pred_mask[:, 0])
-
-        model_output = output
-        gt_masks = masks_list
-
-        if inference:
-            return {
-                "pred_masks": pred_masks,
-                "gt_masks": gt_masks,
-            }
-
-        # ロス計算
-        output = model_output.logits
-        ce_loss = model_output.loss
-        ce_loss = ce_loss * self.ce_loss_weight
         
-        mask_bce_loss = 0
-        mask_dice_loss = 0
+        # バッチサイズを取得
+        batch_size = len(input_ids)
+        
+        embeddings = torch.stack(outputs.hidden_states).squeeze(1)[-1]
+        segmasks = []
+        seg_token_counts = []
+        seg_token_offset = []
+        
+        # SEGトークンを見つけるためのマスクを作成
+        segment_token_mask = (input_ids == self.seg_token_idx)
+        
+        # 各サンプルでSEGトークンの位置と数を計算
+        for b_idx in range(batch_size):
+            seg_token_count = segment_token_mask[b_idx].sum().item()
+            seg_token_counts.append(seg_token_count)
+            seg_token_offset.append(len(segmasks))
+            segmasks.extend([None] * seg_token_count)
+        
+        # SEGトークンの埋め込みを抽出
+        segment_token_embedding_indices = segment_token_mask.nonzero().tolist()
+        segment_token_embeddings = [embeddings[b_idx, s_idx, :].squeeze(0) for b_idx, s_idx in segment_token_embedding_indices]
+        
+        # 各SEGトークンの埋め込みから予測マスクを生成
+        if len(segment_token_embedding_indices) > 0:
+            # MLP投影
+            segment_token_embeddings = torch.stack(segment_token_embeddings)
+            segment_token_embeddings = self.token_embedding_projection(segment_token_embeddings)
+            if self.vision_model is not None:
+                # SAMのような視覚モデルを使用する場合
+                for idx, (embedding, (b_idx, s_idx)) in enumerate(zip(segment_token_embeddings, segment_token_embedding_indices)):
+                    if images is not None and b_idx < len(images):
+                        image = images[b_idx]
+                        predicted_mask = self.vision_model.predict_masks(
+                            embedding.squeeze().unsqueeze(0),
+                            input_images=image
+                        ).squeeze()
+                        # 低解像度マスクを処理（必要に応じて）
+                        if predicted_mask.ndim == 3:
+                            predicted_mask = predicted_mask.squeeze(0)
+                            
+                        # マスクを画像の元のサイズにリサイズ
+                        if isinstance(image, torch.Tensor):
+                            orig_size = image.shape[-2:]  # (H, W)
+                        else:
+                            orig_size = image.size[::-1]  # (W, H) -> (H, W)
+                            
+                        # リサイズ処理
+                        if predicted_mask.shape != orig_size:
+                            predicted_mask = F.interpolate(
+                                predicted_mask.unsqueeze(0).unsqueeze(0), 
+                                size=orig_size, 
+                                mode='bilinear', 
+                                align_corners=False
+                            ).squeeze()
+                            
+                        # マスクを保存
+                        segmasks[seg_token_offset[b_idx] + idx] = predicted_mask
+        
+        # 損失の計算
+        ce_loss = None if labels is None else outputs.loss
+        
+        # マスク損失の計算準備
+        mask_bce_loss = torch.tensor(0., device=self.device)
+        mask_dice_loss = torch.tensor(0., device=self.device)
         num_masks = 0
-        for batch_idx in range(len(pred_masks)):
-            gt_mask = gt_masks[batch_idx]
-            pred_mask = pred_masks[batch_idx]
-
-            assert (
-                gt_mask.shape[0] == pred_mask.shape[0]
-            ), "gt_mask.shape: {}, pred_mask.shape: {}".format(
-                gt_mask.shape, pred_mask.shape
-            )
-            mask_bce_loss += (
-                sigmoid_ce_loss(pred_mask, gt_mask, num_masks=gt_mask.shape[0])
-                * gt_mask.shape[0]
-            )
-            mask_dice_loss += (
-                dice_loss(pred_mask, gt_mask, num_masks=gt_mask.shape[0])
-                * gt_mask.shape[0]
-            )
-            num_masks += gt_mask.shape[0]
-
-        mask_bce_loss = self.bce_loss_weight * mask_bce_loss / (num_masks + 1e-8)
-        mask_dice_loss = self.dice_loss_weight * mask_dice_loss / (num_masks + 1e-8)
-        mask_loss = mask_bce_loss + mask_dice_loss
-
-        loss = ce_loss + mask_loss
-
+        
+        # 有効なマスクの数をカウント
+        if masks_list is not None:
+            valid_masks_count = sum(1 for masks in masks_list if masks is not None)
+            if valid_masks_count == 0:
+                print(f"WARNING: [マスクNull原因] すべてのマスクがNoneです。バッチサイズ: {batch_size}")
+                # マスクがすべてNoneの場合はマスク損失を計算せずにテキスト生成損失のみ使用
+                loss = ce_loss if ce_loss is not None else torch.tensor(0., device=self.device)
+                return {"loss": loss, "ce_loss": ce_loss, "mask_dice_loss": mask_dice_loss, "mask_bce_loss": mask_bce_loss}
+        
+        # マスク損失の計算（マスクが存在する場合のみ）
+        if label_masks_list is not None and masks_list is not None:
+            for b_idx in range(batch_size):
+                # マスクデータの取得
+                gt_masks = masks_list[b_idx] if b_idx < len(masks_list) else None
+                label_masks = label_masks_list[b_idx] if b_idx < len(label_masks_list) else None
+                
+                # デバッグ情報：マスクがNoneの場合の詳細情報
+                if gt_masks is None:
+                    print(f"WARNING: [マスクNull原因] バッチインデックス {b_idx} のマスクがNoneです")
+                    continue
+                    
+                # デバッグ情報：ラベルマスクがNoneの場合の詳細情報
+                if label_masks is None:
+                    print(f"WARNING: [マスクNull原因] バッチインデックス {b_idx} のラベルマスクがNoneです")
+                    continue
+                
+                # そのバッチのSEGトークン数を取得
+                seg_count = seg_token_counts[b_idx]
+                
+                # SEGトークンが存在しない場合は損失に含めない
+                if seg_count == 0:
+                    continue
+                
+                # SEGトークンに対応するマスクが存在する場合
+                if seg_count == 1 and len(gt_masks) == 1:
+                    # 1対1のマッピング
+                    gt_mask = gt_masks[0]
+                    pred_mask_idx = seg_token_offset[b_idx]
+                    
+                    # 予測マスクを取得
+                    pred_mask = segmasks[pred_mask_idx]
+                    if pred_mask is None:
+                        print(f"WARNING: [マスクNull原因] バッチインデックス {b_idx} の予測マスクがNoneです")
+                        continue
+                    
+                    # マスク損失の計算
+                    mask_bce_loss += F.binary_cross_entropy_with_logits(pred_mask, gt_mask)
+                    mask_dice_loss += 1 - compute_dice_loss(pred_mask, gt_mask)
+                    num_masks += 1
+                    
+                elif seg_count > 0 and len(gt_masks) > 0:
+                    # 複数マスクの場合は最適なマッチングを見つける
+                    best_match_cost = float('inf')
+                    best_match_masks = None
+                    
+                    # 存在するすべての予測マスクを確認
+                    pred_masks = []
+                    for i in range(seg_count):
+                        pred_mask_idx = seg_token_offset[b_idx] + i
+                        pred_mask = segmasks[pred_mask_idx]
+                        if pred_mask is not None:
+                            pred_masks.append(pred_mask)
+                    
+                    if not pred_masks:
+                        print(f"WARNING: [マスクNull原因] バッチインデックス {b_idx} には予測マスクがありません")
+                        continue
+                    
+                    # データ型とデバイスを確認
+                    gt_masks_tensor = torch.stack(gt_masks).to(self.device) if isinstance(gt_masks[0], torch.Tensor) else torch.tensor(gt_masks).to(self.device)
+                    pred_masks_tensor = torch.stack(pred_masks)
+                    
+                    # サイズが一致することを確認
+                    if gt_masks_tensor.shape[1:] != pred_masks_tensor.shape[1:]:
+                        print(f"WARNING: [マスクNull原因] マスクサイズの不一致: gt_masks={gt_masks_tensor.shape}, pred_masks={pred_masks_tensor.shape}")
+                        gt_masks_tensor = F.interpolate(
+                            gt_masks_tensor.unsqueeze(1).float(), 
+                            size=pred_masks_tensor.shape[1:], 
+                            mode='bilinear', 
+                            align_corners=False
+                        ).squeeze(1)
+                    
+                    # ハンガリアン法で最適マッチングを計算
+                    from scipy.optimize import linear_sum_assignment
+                    
+                    cost_matrix = np.zeros((len(pred_masks), len(gt_masks)))
+                    for i, pred in enumerate(pred_masks):
+                        for j, gt in enumerate(gt_masks):
+                            bce_loss = F.binary_cross_entropy_with_logits(pred, gt)
+                            dice_loss = 1 - compute_dice_loss(pred, gt)
+                            cost_matrix[i, j] = bce_loss.item() + dice_loss.item()
+                    
+                    # 最適割り当てを計算
+                    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+                    
+                    # 割り当てに基づいて損失を計算
+                    for i, j in zip(row_ind, col_ind):
+                        mask_bce_loss += F.binary_cross_entropy_with_logits(pred_masks[i], gt_masks[j])
+                        mask_dice_loss += 1 - compute_dice_loss(pred_masks[i], gt_masks[j])
+                        num_masks += 1
+        
+        # マスク損失の平均を計算
+        if num_masks > 0:
+            mask_bce_loss = mask_bce_loss / num_masks
+            mask_dice_loss = mask_dice_loss / num_masks
+            
+            # 全体の損失を計算（テキスト生成とマスク損失）
+            loss = ce_loss + self.mask_loss_weight * (mask_bce_loss + mask_dice_loss) if ce_loss is not None else self.mask_loss_weight * (mask_bce_loss + mask_dice_loss)
+        else:
+            print(f"WARNING: [マスクNull原因] 有効なマスクペアが見つかりませんでした")
+            # マスクがない場合はテキスト生成損失のみを使用
+            loss = ce_loss if ce_loss is not None else torch.tensor(0., device=self.device)
+        
         return {
             "loss": loss,
             "ce_loss": ce_loss,
-            "mask_bce_loss": mask_bce_loss,
             "mask_dice_loss": mask_dice_loss,
-            "mask_loss": mask_loss,
+            "mask_bce_loss": mask_bce_loss
         }
 
     def evaluate(
@@ -968,3 +992,30 @@ class LISAForCausalLM(nn.Module):
             batch_inputs["images"] = images
             
         return batch_inputs
+
+def compute_dice_loss(inputs, targets, smooth=1):
+    """
+    Compute Dice損失（Sørensen-Dice係数に基づく）
+    
+    Args:
+        inputs: 予測値（シグモイド前のロジット）
+        targets: 正解マスク
+        smooth: 数値安定性のための平滑化係数
+        
+    Returns:
+        Dice係数（1に近いほど良い）
+    """
+    # シグモイド関数で確率値に変換
+    inputs = torch.sigmoid(inputs)
+    
+    # 平坦化
+    inputs = inputs.view(-1)
+    targets = targets.view(-1)
+    
+    # 交差部分
+    intersection = (inputs * targets).sum()
+    
+    # Dice係数の計算: 2*|X∩Y|/(|X|+|Y|)
+    dice = (2. * intersection + smooth) / (inputs.sum() + targets.sum() + smooth)
+    
+    return dice
