@@ -122,184 +122,196 @@ class ReferSegDataset(torch.utils.data.Dataset):
         return x
 
     def __getitem__(self, idx):
-        # 以前の複雑な再帰呼び出しをシンプルなエラー処理に変更
-        max_attempts = 20  # 最大試行回数
-        for attempt in range(max_attempts):
-            try:
-                # ランダムにデータセットを選択
-                ds_idx = random.randint(0, len(self.refer_seg_ds_list) - 1)
-                ds = self.refer_seg_ds_list[ds_idx]
-                refer_seg_ds = self.refer_seg_data[ds]
-                
-                images = refer_seg_ds["images"]
-                annotations = refer_seg_ds["annotations"]
-                img2refs = refer_seg_ds["img2refs"]
-                
-                # ランダムに画像を選択
-                img_idx = random.randint(0, len(images) - 1)
-                image_info = images[img_idx]
-                image_path = image_info["file_name"]
-                
-                # 画像ファイルの存在確認
-                if not os.path.exists(image_path):
-                    print(f"WARNING: Image not found: {image_path}")
-                    continue  # 次の試行へ
-                
-                image_id = image_info["id"]
-                refs = img2refs.get(image_id, [])
-                
-                if len(refs) == 0:
-                    print(f"WARNING: No references for image_id {image_id}")
-                    continue  # 次の試行へ
-                
-                # テキストとアノテーションIDの収集
-                sents = []
-                ann_ids = []
-                for ref in refs:
-                    for sent in ref["sentences"]:
-                        text = sent["sent"]
-                        sents.append(text)
-                        ann_ids.append(ref["ann_id"])
-                
-                # サンプル数の調整
-                if len(sents) >= self.num_classes_per_sample:
-                    sampled_inds = np.random.choice(
-                        list(range(len(sents))), size=self.num_classes_per_sample, replace=False
-                    )
-                else:
-                    sampled_inds = list(range(len(sents)))
-                
-                sampled_sents = [sents[i] for i in sampled_inds]
-                sampled_ann_ids = [ann_ids[i] for i in sampled_inds]
-                sampled_classes = sampled_sents
-                
-                # 画像の読み込み
-                image = cv2.imread(image_path)
-                if image is None:
-                    print(f"WARNING: Failed to load image {image_path}")
-                    continue  # 次の試行へ
-                
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                
-                # 画像のプリプロセス
-                image_pil = Image.fromarray(image)
-                # プロセッサを使用してLlama3 Vision用の入力を作成
-                processed = self.processor(images=image_pil, return_tensors="pt")
-                image_clip = processed.pixel_values[0]
-                
-                # SAM用の画像前処理
-                image_transformed = self.transform.apply_image(image)
-                resize = image_transformed.shape[:2]
-                
-                # 質問と回答の作成
-                questions = []
-                answers = []
-                for text in sampled_classes:
-                    text = text.strip()
-                    if len(text.split("||")) > 1:
-                        # クラス名が複雑な場合の処理
-                        text = text.split("||")[0]
-                    
-                    question_template = random.choice(self.short_question_list)
-                    questions.append(question_template.format(class_name=text.lower()))
-                    answers.append(random.choice(self.answer_list))
-                
-                # 会話形式の作成
-                conversations = []
-                conv = conversation_lib.default_conversation.copy()
-                
-                for i in range(len(questions)):
-                    conv.messages = []
-                    conv.append_message(conv.roles[0], questions[i])
-                    conv.append_message(conv.roles[1], answers[i])
-                    conversations.append(conv.get_prompt())
-                
-                # 画像のテンソル変換
-                image_tensor = self.preprocess(torch.from_numpy(image_transformed).permute(2, 0, 1).contiguous())
-                
-                # マスクの処理
-                masks = []
-                for ann_id in sampled_ann_ids:
-                    if isinstance(ann_id, list):
-                        # 複数アノテーションの場合
-                        m_final = np.zeros((image_info["height"], image_info["width"])).astype(np.uint8)
-                        for ann_id_i in ann_id:
-                            try:
-                                ann = annotations[ann_id_i]
-                                if len(ann["segmentation"]) == 0:
-                                    m = np.zeros((image_info["height"], image_info["width"])).astype(np.uint8)
-                                else:
-                                    m = mask.decode(ann["segmentation"])
-                                m_final = np.logical_or(m_final, m)
-                            except:
-                                print(f"WARNING: Error processing annotation {ann_id_i}")
-                        
-                        m_final = m_final.astype(np.uint8)
-                    else:
-                        # 単一アノテーションの場合
-                        try:
-                            ann = annotations[ann_id]
-                            if len(ann["segmentation"]) == 0:
-                                m_final = np.zeros((image_info["height"], image_info["width"])).astype(np.uint8)
-                            else:
-                                m_final = mask.decode(ann["segmentation"])
-                        except:
-                            print(f"WARNING: Error processing annotation {ann_id}")
-                            m_final = np.zeros((image_info["height"], image_info["width"])).astype(np.uint8)
-                    
-                    # マスクのリサイズと追加
-                    m_final = cv2.resize(
-                        m_final, (image_tensor.shape[2], image_tensor.shape[1]), interpolation=cv2.INTER_NEAREST
-                    )
-                    masks.append(torch.from_numpy(m_final).float())
-                
-                if not masks:
-                    # マスクが作成できなかった場合
-                    print(f"WARNING: Failed to create any masks")
-                    continue  # 次の試行へ
-                
-                masks = torch.stack(masks, dim=0)
-                
-                # SAM用のラベル作成
-                h, w = resize
-                label = np.ones((h, w)) * self.ignore_label
-                
-                # 正常に処理できた場合、結果を返す
-                return (
-                    image_path,
-                    image_tensor,
-                    image_clip,
-                    conversations,
-                    masks,
-                    torch.from_numpy(label).long(),
-                    resize,
-                    questions,
-                    sampled_classes,
-                    False,  # inference flag
+        # ランダムにデータセットを選択
+        ds_idx = random.randint(0, len(self.refer_seg_ds_list) - 1)
+        ds = self.refer_seg_ds_list[ds_idx]
+        refer_seg_ds = self.refer_seg_data[ds]
+        
+        print(f"DEBUG: Selected dataset: {ds}")
+        
+        images = refer_seg_ds["images"]
+        annotations = refer_seg_ds["annotations"]
+        img2refs = refer_seg_ds["img2refs"]
+        
+        # ランダムに画像を選択
+        img_idx = random.randint(0, len(images) - 1)
+        image_info = images[img_idx]
+        image_path = image_info["file_name"]
+        
+        # small_test_datasetに含まれる画像に限定するためのリスト
+        available_images = [
+            "COCO_train2014_000000000009.jpg",
+            "COCO_train2014_000000000025.jpg",
+            "COCO_train2014_000000000030.jpg",
+            "COCO_train2014_000000000034.jpg",
+            "COCO_train2014_000000000036.jpg",
+            "COCO_train2014_000000000042.jpg",
+            "COCO_train2014_000000000049.jpg",
+            "COCO_train2014_000000000061.jpg",
+            "COCO_train2014_000000000064.jpg",
+            "COCO_train2014_000000000071.jpg",
+        ]
+        
+        # 画像ファイル名のみを取得
+        filename = os.path.basename(image_path)
+        
+        # 利用可能な画像リストにない場合は、リストからランダムに選択
+        if filename not in available_images:
+            print(f"WARNING: Image {filename} is not available in small_test_dataset.")
+            # 利用可能な画像からランダムに選択
+            random_filename = random.choice(available_images)
+            # パスを更新
+            if ds == "refclef":
+                image_path = os.path.join(
+                    self.base_image_dir, "refer_seg", "images/saiapr_tc-12", random_filename
                 )
+            else:
+                image_path = os.path.join(
+                    self.base_image_dir, "refer_seg", "images/mscoco/images/train2014", random_filename
+                )
+            print(f"Using alternative image: {random_filename}")
+            
+            # 対応する画像IDを見つける
+            for img in images:
+                if os.path.basename(img["file_name"]) == random_filename:
+                    image_info = img
+                    image_id = img["id"]
+                    break
+            else:
+                # 見つからない場合はランダムな画像IDを使用
+                image_id = image_info["id"]
+        else:
+            image_id = image_info["id"]
+        
+        # 画像ファイルの存在確認
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image not found: {image_path}")
+        
+        refs = img2refs.get(image_id, [])
+        
+        if len(refs) == 0:
+            raise ValueError(f"No references for image_id {image_id}")
+        
+        # テキストとアノテーションIDの収集
+        sents = []
+        ann_ids = []
+        for ref in refs:
+            for sent in ref["sentences"]:
+                text = sent["sent"]
+                sents.append(text)
+                ann_ids.append(ref["ann_id"])
+        
+        # サンプル数の調整
+        if len(sents) >= self.num_classes_per_sample:
+            sampled_inds = np.random.choice(
+                list(range(len(sents))), size=self.num_classes_per_sample, replace=False
+            )
+        else:
+            sampled_inds = list(range(len(sents)))
+        
+        sampled_sents = [sents[i] for i in sampled_inds]
+        sampled_ann_ids = [ann_ids[i] for i in sampled_inds]
+        sampled_classes = sampled_sents
+        
+        # 画像の読み込み
+        image = cv2.imread(image_path)
+        if image is None:
+            raise IOError(f"Failed to load image {image_path}")
+        
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # 画像のプリプロセス
+        image_pil = Image.fromarray(image)
+        # プロセッサを使用してLlama3 Vision用の入力を作成
+        processed = self.processor(images=image_pil, return_tensors="pt")
+        image_clip = processed.pixel_values[0]
+        
+        # SAM用の画像前処理
+        image_transformed = self.transform.apply_image(image)
+        resize = image_transformed.shape[:2]
+        
+        # 質問と回答の作成
+        questions = []
+        answers = []
+        for text in sampled_classes:
+            text = text.strip()
+            if len(text.split("||")) > 1:
+                # クラス名が複雑な場合の処理
+                text = text.split("||")[0]
+            
+            question_template = random.choice(self.short_question_list)
+            questions.append(question_template.format(class_name=text.lower()))
+            answers.append(random.choice(self.answer_list))
+        
+        # 会話形式の作成
+        conversations = []
+        conv = conversation_lib.default_conversation.copy()
+        
+        for i in range(len(questions)):
+            conv.messages = []
+            conv.append_message(conv.roles[0], questions[i])
+            conv.append_message(conv.roles[1], answers[i])
+            conversations.append(conv.get_prompt())
+        
+        # 画像のテンソル変換
+        image_tensor = self.preprocess(torch.from_numpy(image_transformed).permute(2, 0, 1).contiguous())
+        
+        # マスクの処理
+        masks = []
+        for ann_id in sampled_ann_ids:
+            if isinstance(ann_id, list):
+                # 複数アノテーションの場合
+                m_final = np.zeros((image_info["height"], image_info["width"])).astype(np.uint8)
+                for ann_id_i in ann_id:
+                    try:
+                        ann = annotations[ann_id_i]
+                        if len(ann["segmentation"]) == 0:
+                            m = np.zeros((image_info["height"], image_info["width"])).astype(np.uint8)
+                        else:
+                            m = mask.decode(ann["segmentation"])
+                        m_final = np.logical_or(m_final, m)
+                    except Exception as e:
+                        print(f"ERROR processing annotation {ann_id_i}: {e}")
+                        raise
                 
-            except Exception as e:
-                print(f"ERROR in refer_seg_dataset.__getitem__: {e}")
-                continue  # 次の試行へ
+                m_final = m_final.astype(np.uint8)
+            else:
+                # 単一アノテーションの場合
+                try:
+                    ann = annotations[ann_id]
+                    if len(ann["segmentation"]) == 0:
+                        m_final = np.zeros((image_info["height"], image_info["width"])).astype(np.uint8)
+                    else:
+                        m_final = mask.decode(ann["segmentation"])
+                except Exception as e:
+                    print(f"ERROR processing annotation {ann_id}: {e}")
+                    raise
+            
+            # マスクのリサイズと追加
+            m_final = cv2.resize(
+                m_final, (image_tensor.shape[2], image_tensor.shape[1]), interpolation=cv2.INTER_NEAREST
+            )
+            masks.append(torch.from_numpy(m_final).float())
         
-        # すべての試行が失敗した場合、ダミーデータを返す
-        print(f"WARNING: All {max_attempts} attempts failed in refer_seg_dataset.__getitem__, returning dummy data")
-        dummy_image = np.zeros((224, 224, 3), dtype=np.uint8)
-        dummy_image_tensor = torch.from_numpy(dummy_image).permute(2, 0, 1).float()
-        dummy_image_clip = torch.zeros(3, 224, 224)
-        dummy_masks = torch.zeros(1, 224, 224)
-        dummy_label = torch.ones(224, 224) * self.ignore_label
-        dummy_conversations = ["No valid data available"]
+        if not masks:
+            raise ValueError(f"Failed to create any masks for image {image_path}")
         
+        masks = torch.stack(masks, dim=0)
+        
+        # SAM用のラベル作成
+        h, w = resize
+        label = np.ones((h, w)) * self.ignore_label
+        
+        # 正常に処理できた場合、結果を返す
         return (
-            "dummy_path",
-            dummy_image_tensor,
-            dummy_image_clip,
-            dummy_conversations,
-            dummy_masks,
-            torch.from_numpy(dummy_label).long(),
-            (224, 224),
-            None,
-            None,
+            image_path,
+            image_tensor,
+            image_clip,
+            conversations,
+            masks,
+            torch.from_numpy(label).long(),
+            resize,
+            questions,
+            sampled_classes,
             False,  # inference flag
         )

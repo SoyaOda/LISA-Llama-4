@@ -46,12 +46,24 @@ class REFER:
         # also provide dataset name and splitBy information
         # e.g., dataset = 'refcoco', splitBy = 'unc'
         
-        print(f"Initializing REFER with data_root={data_root}, dataset={dataset}, splitBy={splitBy}")
+        print(f"初期化: REFER data_root={data_root}, dataset={dataset}, splitBy={splitBy}")
         
         # 小規模テストデータセット用のパスを構築
-        # オリジナル: refer_seg/refcoco
-        # 小規模テスト: refer_seg/refcoco/refcoco
         self.DATA_DIR = osp.join(data_root, dataset)
+        
+        # small_test_datasetに含まれる画像ファイル一覧
+        self.available_image_files = [
+            "COCO_train2014_000000000009.jpg",
+            "COCO_train2014_000000000025.jpg",
+            "COCO_train2014_000000000030.jpg",
+            "COCO_train2014_000000000034.jpg",
+            "COCO_train2014_000000000036.jpg",
+            "COCO_train2014_000000000042.jpg",
+            "COCO_train2014_000000000049.jpg",
+            "COCO_train2014_000000000061.jpg",
+            "COCO_train2014_000000000064.jpg",
+            "COCO_train2014_000000000071.jpg"
+        ]
         
         # 画像ディレクトリのパスを設定
         if dataset in ["refcoco", "refcoco+", "refcocog"]:
@@ -59,8 +71,9 @@ class REFER:
         elif dataset == "refclef":
             self.IMAGE_DIR = osp.join(data_root, "images/saiapr_tc-12")
         else:
-            print("No refer dataset is called [%s]" % dataset)
-            sys.exit()
+            error_msg = f"エラー: データセット[{dataset}]は存在しません"
+            print(error_msg)
+            raise ValueError(error_msg)
 
         self.dataset = dataset
 
@@ -75,43 +88,18 @@ class REFER:
             # 小規模テストデータセット用のパス
             alternative_data_dir = osp.join(self.DATA_DIR, dataset)
             if osp.exists(alternative_data_dir):
-                print(f"Original path {ref_file} not found, trying alternative: {alternative_data_dir}")
+                print(f"代替パスを確認: {alternative_data_dir}")
                 ref_file = osp.join(alternative_data_dir, "refs(" + splitBy + ").p")
                 self.DATA_DIR = alternative_data_dir  # DATAディレクトリを更新
         
-        print("ref_file: ", ref_file)
-        print("file exists: ", osp.exists(ref_file))
+        print(f"参照ファイル: {ref_file}")
+        print(f"ファイル存在: {osp.exists(ref_file)}")
         
+        # ファイルが存在しない場合はエラーを発生
         if not osp.exists(ref_file):
-            print(f"ERROR: Reference file not found at {ref_file}")
-            print(f"Available files in {osp.dirname(ref_file)}:")
-            try:
-                print(os.listdir(osp.dirname(ref_file)))
-            except:
-                print("Could not list directory contents")
-            
-            # データが見つからない場合はダミーデータを作成
-            print("Creating dummy data as fallback")
-            self.data = {
-                "dataset": dataset,
-                "refs": [],
-                "images": [],
-                "annotations": [],
-                "categories": []
-            }
-            self.Refs = {}
-            self.Anns = {}
-            self.Imgs = {}
-            self.Cats = {}
-            self.Sents = {}
-            self.imgToRefs = {}
-            self.imgToAnns = {}
-            self.refToAnn = {}
-            self.annToRef = {}
-            self.catToRefs = {}
-            self.sentToRef = {}
-            self.sentToTokens = {}
-            return
+            error_msg = f"エラー: 参照ファイルが見つかりません: {ref_file}"
+            print(error_msg)
+            raise FileNotFoundError(error_msg)
             
         # 通常のデータロード処理
         self.data = {}
@@ -124,47 +112,54 @@ class REFER:
             instances_file = osp.join(self.DATA_DIR, "instances.json")
             
             if not osp.exists(instances_file):
-                print(f"Warning: instances file not found at {instances_file}")
-                print("Creating dummy instances data")
-                self.data["images"] = []
-                self.data["annotations"] = []
-                self.data["categories"] = []
-            else:
-                instances = json.load(open(instances_file, "rb"))
-                self.data["images"] = instances["images"]
-                self.data["annotations"] = instances["annotations"]
-                self.data["categories"] = instances["categories"]
+                error_msg = f"エラー: インスタンスファイルが見つかりません: {instances_file}"
+                print(error_msg)
+                raise FileNotFoundError(error_msg)
+                
+            instances = json.load(open(instances_file, "rb"))
+            self.data["images"] = instances["images"]
+            self.data["annotations"] = instances["annotations"]
+            self.data["categories"] = instances["categories"]
             
-            # create index
+            # インスタンスデータをフィルタリングしてsmall_test_datasetに含まれる画像のみに限定
+            print(f"利用可能な画像ファイル数: {len(self.data['images'])}")
+            
+            # 元の画像数を保存
+            original_image_count = len(self.data["images"])
+            
+            # small_test_datasetに含まれる画像のみをフィルタリング（mscocoの場合のみ）
+            if dataset in ["refcoco", "refcoco+", "refcocog"]:
+                filtered_images = []
+                for img in self.data["images"]:
+                    if img["file_name"] in self.available_image_files:
+                        filtered_images.append(img)
+                
+                self.data["images"] = filtered_images
+                print(f"フィルタリング後の画像数: {len(self.data['images'])} (元: {original_image_count})")
+            
+            # 画像IDのリストを作成
+            valid_image_ids = [img["id"] for img in self.data["images"]]
+            
+            # アノテーションも有効な画像IDのみに限定
+            original_ann_count = len(self.data["annotations"])
+            self.data["annotations"] = [ann for ann in self.data["annotations"] if ann["image_id"] in valid_image_ids]
+            print(f"フィルタリング後のアノテーション数: {len(self.data['annotations'])} (元: {original_ann_count})")
+            
+            # 参照データも有効な画像IDのみに限定
+            original_ref_count = len(self.data["refs"])
+            self.data["refs"] = [ref for ref in self.data["refs"] if ref["image_id"] in valid_image_ids]
+            print(f"フィルタリング後の参照数: {len(self.data['refs'])} (元: {original_ref_count})")
+            
+            # インデックスを作成
             self.createIndex()
-            print("DONE (t=%.2fs)" % (time.time() - tic))
+            print("完了 (t=%.2fs)" % (time.time() - tic))
             
         except Exception as e:
-            print(f"ERROR loading reference data: {e}")
+            error_msg = f"エラー: 参照データの読み込みに失敗しました: {e}"
+            print(error_msg)
             import traceback
             traceback.print_exc()
-            
-            # データロードに失敗した場合はダミーデータを作成
-            print("Creating dummy data as fallback")
-            self.data = {
-                "dataset": dataset,
-                "refs": [],
-                "images": [],
-                "annotations": [],
-                "categories": []
-            }
-            self.Refs = {}
-            self.Anns = {}
-            self.Imgs = {}
-            self.Cats = {}
-            self.Sents = {}
-            self.imgToRefs = {}
-            self.imgToAnns = {}
-            self.refToAnn = {}
-            self.annToRef = {}
-            self.catToRefs = {}
-            self.sentToRef = {}
-            self.sentToTokens = {}
+            raise
 
     def createIndex(self):
         # create sets of mapping

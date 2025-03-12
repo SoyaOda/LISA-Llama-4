@@ -12,7 +12,7 @@ import tqdm
 import transformers
 from peft import LoraConfig, get_peft_model
 from torch.utils.tensorboard import SummaryWriter
-from transformers import AutoProcessor
+from transformers import AutoProcessor, AutoTokenizer
 
 from model.LISA import LISAForCausalLM
 from model.llama3_2 import conversation as conversation_lib
@@ -303,27 +303,68 @@ def main(args):
 
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1
-    train_dataset = HybridDataset(
-        args.dataset_dir,
-        tokenizer,
-        args.vision_tower,
-        samples_per_epoch=args.batch_size
-        * args.grad_accumulation_steps
-        * args.steps_per_epoch
-        * world_size,
-        precision=args.precision,
-        image_size=args.image_size,
-        num_classes_per_sample=args.num_classes_per_sample,
-        exclude_val=args.exclude_val,
-        dataset=args.dataset,
-        sample_rate=[float(x) for x in args.sample_rates.split(",")],
-        sem_seg_data=args.sem_seg_data,
-        refer_seg_data=args.refer_seg_data,
-        vqa_data=args.vqa_data,
-        reason_seg_data=args.reason_seg_data,
-        explanatory=args.explanatory,
-        processor=processor,
-    )
+    
+    # 小規模テストデータセットを使用する場合の警告
+    if "small_test_dataset" in args.dataset_dir:
+        print("\n")
+        print("=" * 80)
+        print("  警告: small_test_datasetを使用しています")
+        print("  このデータセットは限られた画像ファイルのみを含んでいます:")
+        print("    - ade20k: 10個の画像")
+        print("    - coco/cocostuff: 10個の画像")
+        print("    - refer_seg/images/mscoco/images/train2014: 9個の画像")
+        print("    - reason_seg/ReasonSeg/train: 10組の画像-JSONペア")
+        print("  指定された`--dataset`と`--refer_seg_data`がこのデータセットと互換性があることを確認してください。")
+        print("=" * 80)
+        print("\n")
+    
+    try:
+        train_dataset = HybridDataset(
+            args.dataset_dir,
+            tokenizer,
+            args.vision_tower,
+            samples_per_epoch=args.batch_size
+            * args.grad_accumulation_steps
+            * args.steps_per_epoch
+            * world_size,
+            precision=args.precision,
+            image_size=args.image_size,
+            num_classes_per_sample=args.num_classes_per_sample,
+            exclude_val=args.exclude_val,
+            dataset=args.dataset,
+            sample_rate=[float(x) for x in args.sample_rates.split(",")],
+            sem_seg_data=args.sem_seg_data,
+            refer_seg_data=args.refer_seg_data,
+            vqa_data=args.vqa_data,
+            reason_seg_data=args.reason_seg_data,
+            explanatory=args.explanatory,
+            processor=processor,
+        )
+    except FileNotFoundError as e:
+        print("\n")
+        print("=" * 80)
+        print(f"エラー: データセットの初期化に失敗しました - ファイルが見つかりません")
+        print(f"原因: {e}")
+        print("解決策:")
+        print("1. `--dataset`引数と`--refer_seg_data`引数が`small_test_dataset`の構成と互換性があることを確認してください")
+        print("2. 以下のコマンドラインオプションを試してください:")
+        print("   --dataset=\"sem_seg||vqa||reason_seg\" --sample_rates=\"4,3,1\"")
+        print("   または")
+        print("   --dataset=\"sem_seg||reason_seg\" --sample_rates=\"4,1\"")
+        print("=" * 80)
+        print("\n")
+        raise
+    except Exception as e:
+        print("\n")
+        print("=" * 80)
+        print(f"エラー: データセットの初期化に失敗しました")
+        print(f"原因: {e}")
+        print("解決策:")
+        print("1. データセットの構造とコード実装の互換性を確認してください")
+        print("2. `--dataset`および関連するデータセット引数を確認してください")
+        print("=" * 80)
+        print("\n")
+        raise
 
     if args.no_eval == False:
         val_dataset = ValDataset(

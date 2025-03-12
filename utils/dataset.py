@@ -358,32 +358,52 @@ class HybridDataset(torch.utils.data.Dataset):
         if "refer_seg" in dataset_names:
             refer_seg_idx = dataset_names.index("refer_seg")
             if refer_seg_data is not None:
-                try:
-                    print(f"Initializing ReferSegDataset with base_dir={base_image_dir}, data={refer_seg_data}")
+                # small_test_datasetに実際に存在するデータセットを特定
+                available_datasets = []
+                for ds in refer_seg_data.split("||"):
+                    # データセットディレクトリの存在確認
+                    data_path = os.path.join(base_image_dir, "refer_seg", ds)
+                    if os.path.exists(data_path):
+                        # refs(unc).pファイルの存在確認
+                        ref_file = os.path.join(data_path, ds, "refs(unc).p")
+                        if os.path.exists(ref_file):
+                            available_datasets.append(ds)
+                            print(f"確認: {ds}データセットが利用可能 ({ref_file})")
+                        else:
+                            # ファイルが存在しない場合は明示的にエラーを表示
+                            print(f"エラー: {ds}のrefファイルが見つかりません: {ref_file}")
+                    else:
+                        # ディレクトリが存在しない場合も明示的にエラーを表示
+                        print(f"エラー: {ds}ディレクトリが見つかりません: {data_path}")
+                
+                if available_datasets:
+                    # 利用可能なデータセットのみを使用
+                    active_refer_seg_data = "||".join(available_datasets)
+                    print(f"利用可能なrefer_segデータセット: {active_refer_seg_data}")
+                    
+                    print(f"ReferSegDatasetを初期化します: base_dir={base_image_dir}, data={active_refer_seg_data}")
                     self.refer_seg_dataset = ReferSegDataset(
-                        base_image_dir,
-                        tokenizer,
-                        vision_tower,
-                        samples_per_epoch=samples_per_epoch // 4,
+                        base_image_dir=base_image_dir,
+                        tokenizer=tokenizer,
+                        vision_tower=vision_tower,
+                        samples_per_epoch=samples_per_epoch,
                         precision=precision,
                         image_size=image_size,
-                        num_classes_per_sample=num_classes_per_sample, 
-                        exclude_val=exclude_val,
-                        refer_seg_data=refer_seg_data,
+                        num_classes_per_sample=num_classes_per_sample,
+                        refer_seg_data=active_refer_seg_data,
                         processor=processor,
                     )
                     self.dataset_list.append(self.refer_seg_dataset)
-                except Exception as e:
-                    print(f"ERROR: Failed to initialize ReferSegDataset: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    print("Creating dummy dataset for refer_seg")
-                    self.refer_seg_dataset = None
-                    self.dataset_list.append(None)
-                    self.sample_rate[refer_seg_idx] = 0
+                else:
+                    # 利用可能なデータセットがない場合はエラーを出す
+                    error_msg = f"エラー: 指定されたrefer_segデータセット({refer_seg_data})が見つかりません"
+                    print(error_msg)
+                    raise FileNotFoundError(error_msg)
             else:
-                self.dataset_list.append(None)
-                self.sample_rate[refer_seg_idx] = 0
+                # refer_seg_dataが指定されていない場合もエラーを出す
+                error_msg = "エラー: refer_seg_dataが指定されていません"
+                print(error_msg)
+                raise ValueError(error_msg)
         else:
             self.refer_seg_dataset = None
 
