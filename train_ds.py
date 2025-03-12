@@ -46,7 +46,8 @@ def parse_args(args):
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
 
     parser.add_argument(
-        "--dataset", default="sem_seg||refer_seg||vqa||reason_seg", type=str
+        "--dataset", default="sem_seg||reason_seg", type=str,
+        help="データセットの選択（small_test_datasetでは'sem_seg||reason_seg'を推奨）。'vqa'を含めると、COCOデータが不足している場合にエラーが発生します。"
     )
     parser.add_argument("--sample_rates", default="9,3,3,1", type=str)
     parser.add_argument(

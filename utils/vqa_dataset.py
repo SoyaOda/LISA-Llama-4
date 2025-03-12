@@ -1,6 +1,8 @@
 import json
 import os
 import random
+import glob
+import numpy as np
 
 import cv2
 import torch
@@ -63,11 +65,31 @@ class VQADataset(torch.utils.data.Dataset):
 
         DATA_DIR = os.path.join(base_image_dir, "llava_dataset")
         self.vqa_image_root = os.path.join(base_image_dir, "coco/train2017")
+        
+        # JSON データをロード
         with open(os.path.join(DATA_DIR, "{}.json".format(vqa_data))) as f:
-            vqa_data = json.load(f)
-        self.vqa_data = vqa_data
-
-        print("vqa_data: ", len(self.vqa_data))
+            vqa_data_full = json.load(f)
+        
+        # 実際に存在する画像ファイルの一覧を取得
+        available_images = []
+        if os.path.exists(self.vqa_image_root):
+            available_images = [os.path.basename(f) for f in glob.glob(os.path.join(self.vqa_image_root, "*.jpg"))]
+            print(f"Found {len(available_images)} available images in {self.vqa_image_root}")
+        else:
+            print(f"WARNING: VQA image directory not found: {self.vqa_image_root}")
+        
+        # 存在する画像ファイルだけをフィルタリング
+        self.vqa_data = []
+        if available_images:
+            for item in vqa_data_full:
+                if item["image"] in available_images:
+                    self.vqa_data.append(item)
+            
+            print(f"Filtered VQA data from {len(vqa_data_full)} to {len(self.vqa_data)} items based on available images")
+        else:
+            # 画像が見つからない場合は空のリストを使用
+            print("WARNING: No available images found for VQA dataset")
+            self.vqa_data = []
 
     def __len__(self):
         return self.samples_per_epoch
@@ -85,6 +107,10 @@ class VQADataset(torch.utils.data.Dataset):
         return x
 
     def __getitem__(self, idx):
+        # データセットが空の場合は明示的なエラーを返す
+        if len(self.vqa_data) == 0:
+            raise ValueError("VQAデータセットが空です。small_test_datasetにはLLaVAデータに対応するCOCO画像が含まれていません。")
+            
         idx = random.randint(0, len(self.vqa_data) - 1)
         item = self.vqa_data[idx]
         image_path = os.path.join(self.vqa_image_root, item["image"])

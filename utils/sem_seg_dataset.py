@@ -148,154 +148,58 @@ def init_cocostuff(base_image_dir):
                 cocostuff_classes.append(line.strip().split(": ")[-1])
         cocostuff_classes = np.array(cocostuff_classes)
         
-        # パスの構築方法を改善
-        # base_image_dirが相対パスか絶対パスかをチェック
-        if os.path.isabs(base_image_dir):
-            # 絶対パスの場合はそのまま使用
-            cocostuff_dir = os.path.join(base_image_dir, "cocostuff")
-            coco_dir = os.path.join(base_image_dir, "coco")
-        else:
-            # 相対パスの場合は現在の作業ディレクトリからの相対パスを構築
-            current_dir = os.getcwd()
-            cocostuff_dir = os.path.normpath(os.path.join(current_dir, base_image_dir, "cocostuff"))
-            coco_dir = os.path.normpath(os.path.join(current_dir, base_image_dir, "coco"))
+        # 直接ディレクトリからファイルを取得する方法に切り替え
+        cocostuff_dir = os.path.join(base_image_dir, "cocostuff", "train2017")
+        coco_dir = os.path.join(base_image_dir, "coco", "train2017")
         
-        # 可能性のあるディレクトリパスを確認
-        possible_cocostuff_dirs = [
-            os.path.join(cocostuff_dir, "train2017"),
-            os.path.join(base_image_dir, "cocostuff/train2017"),
-            os.path.join(cocostuff_dir)
-        ]
+        print(f"Looking for annotation files in: {cocostuff_dir}")
+        print(f"Looking for image files in: {coco_dir}")
         
-        cocostuff_train_dir = None
-        for dir_path in possible_cocostuff_dirs:
-            if os.path.exists(dir_path):
-                print(f"Found cocostuff training directory: {dir_path}")
-                cocostuff_train_dir = dir_path
-                break
-        
-        # 見つからない場合は最初のパスを使用
-        if not cocostuff_train_dir:
-            cocostuff_train_dir = possible_cocostuff_dirs[0]
-            print(f"WARNING: [マスクNull原因] Could not find cocostuff directory, using default: {cocostuff_train_dir}")
-        
-        # cocoのトレーニングディレクトリも同様に検索
-        possible_coco_dirs = [
-            os.path.join(coco_dir, "train2017"),
-            os.path.join(base_image_dir, "coco/train2017"),
-            os.path.join(coco_dir)
-        ]
-        
-        coco_train_dir = None
-        for dir_path in possible_coco_dirs:
-            if os.path.exists(dir_path):
-                print(f"Found coco training directory: {dir_path}")
-                coco_train_dir = dir_path
-                break
-        
-        # 見つからない場合は最初のパスを使用
-        if not coco_train_dir:
-            coco_train_dir = possible_coco_dirs[0]
-            print(f"WARNING: [マスクNull原因] Could not find coco directory, using default: {coco_train_dir}")
-        
-        print(f"DEBUG: Current working directory: {os.getcwd()}")
-        print(f"DEBUG: Cocostuff directory: {cocostuff_dir}")
-        print(f"DEBUG: Cocostuff train directory: {cocostuff_train_dir}")
-        print(f"DEBUG: Cocostuff train directory exists: {os.path.exists(cocostuff_train_dir)}")
-        print(f"DEBUG: Coco directory: {coco_dir}")
-        print(f"DEBUG: Coco train directory: {coco_train_dir}")
-        print(f"DEBUG: Coco train directory exists: {os.path.exists(coco_train_dir)}")
-        
-        # ディレクトリが存在しない場合は空のリストを返す
-        if not os.path.exists(cocostuff_train_dir):
-            print(f"WARNING: [マスクNull原因] Cocostuff train directory not found: {cocostuff_train_dir}")
+        # ディレクトリの存在確認
+        if not os.path.exists(cocostuff_dir):
+            print(f"WARNING: Cocostuff directory does not exist: {cocostuff_dir}")
             return cocostuff_classes, [], []
             
-        if not os.path.exists(coco_train_dir):
-            print(f"WARNING: [マスクNull原因] Coco train directory not found: {coco_train_dir}")
+        if not os.path.exists(coco_dir):
+            print(f"WARNING: COCO directory does not exist: {coco_dir}")
             return cocostuff_classes, [], []
-        
+            
         # ラベルファイル（PNG）を取得
-        cocostuff_labels = []
-        
-        # まずディレクトリ内のすべてのPNGファイルを検索
-        try:
-            png_files = glob.glob(os.path.join(cocostuff_train_dir, "*.png"))
-            if png_files:
-                cocostuff_labels = png_files
-                print(f"DEBUG: Found {len(png_files)} PNG files in {cocostuff_train_dir}")
-            else:
-                print(f"WARNING: [マスクNull原因] No PNG files found in {cocostuff_train_dir}")
-                if os.path.exists(cocostuff_train_dir):
-                    print(f"Directory contents: {os.listdir(cocostuff_train_dir)}")
-                    
-                    # もしPNGファイルがなければ、代わりにJPGファイルを探す
-                    jpg_files = glob.glob(os.path.join(cocostuff_train_dir, "*.jpg"))
-                    if jpg_files:
-                        print(f"Found {len(jpg_files)} JPG files instead, using these")
-                        cocostuff_labels = jpg_files
-                
-        except Exception as e:
-            print(f"ERROR: [マスクNull原因] Error searching for PNG files: {e}")
-            import traceback
-            traceback.print_exc()
-        
+        cocostuff_labels = sorted(glob.glob(os.path.join(cocostuff_dir, "*.png")))
         if not cocostuff_labels:
-            print(f"WARNING: [マスクNull原因] No label files found for cocostuff in {cocostuff_train_dir}")
+            print(f"WARNING: No PNG files found in {cocostuff_dir}")
             return cocostuff_classes, [], []
+            
+        print(f"Found {len(cocostuff_labels)} label files")
         
-        cocostuff_labels = sorted(cocostuff_labels)
-        print(f"DEBUG: Found {len(cocostuff_labels)} label files")
-        
-        # 対応する画像ファイル（JPG）のパスを構築
+        # 対応する画像ファイル（JPG）を構築
         cocostuff_images = []
-        valid_pairs = []
+        valid_labels = []
+        
         for label_path in cocostuff_labels:
-            # ファイル名のみを取得
+            # 同じファイル名を持つ画像を探す
             filename = os.path.basename(label_path)
             image_filename = filename.replace(".png", ".jpg")
-            image_path = os.path.join(coco_train_dir, image_filename)
+            image_path = os.path.join(coco_dir, image_filename)
             
-            # 画像ファイルの存在を確認
             if not os.path.exists(image_path):
-                print(f"WARNING: [マスクNull原因] Image file does not exist: {image_path}")
-                # 可能性のあるパスを試す
-                alternative_paths = [
-                    os.path.join(cocostuff_dir, image_filename),
-                    os.path.join(coco_dir, image_filename),
-                    os.path.join(base_image_dir, "coco", image_filename)
-                ]
+                print(f"WARNING: Image file does not exist: {image_path}")
+                continue
                 
-                found_alternative = False
-                for alt_path in alternative_paths:
-                    if os.path.exists(alt_path):
-                        print(f"Found alternative path for image: {alt_path}")
-                        image_path = alt_path
-                        found_alternative = True
-                        break
-                
-                if not found_alternative:
-                    print(f"WARNING: [マスクNull原因] Could not find image for label: {label_path}")
-                    continue
-            
             cocostuff_images.append(image_path)
-            valid_pairs.append(label_path)
+            valid_labels.append(label_path)
         
         # 有効なラベルパスのみを保持
-        cocostuff_labels = valid_pairs
+        cocostuff_labels = valid_labels
         
-        print("cocostuff: ", len(cocostuff_images))
-        if len(cocostuff_images) != len(cocostuff_labels):
-            print(f"WARNING: [マスクNull原因] Mismatch between images ({len(cocostuff_images)}) and labels ({len(cocostuff_labels)})")
+        print(f"cocostuff: Found {len(cocostuff_images)} valid image-label pairs")
         
         return cocostuff_classes, cocostuff_images, cocostuff_labels
     
     except Exception as e:
-        print(f"ERROR: [マスクNull原因] Failed to initialize cocostuff dataset: {e}")
+        print(f"ERROR: Failed to initialize cocostuff dataset: {e}")
         import traceback
         traceback.print_exc()
-        # 例外を再発生させる代わりに空のリストを返す
-        print("Returning empty lists for cocostuff")
         return cocostuff_classes, [], []
 
 
