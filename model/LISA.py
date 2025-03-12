@@ -15,8 +15,24 @@ from transformers import (
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          DEFAULT_IMAGE_PATCH_TOKEN)
 
-from .llama3_2.model.language_model.llama3_2 import (Llama3VisionForCausalLM,
-                                                  Llama3VisionMetaModel)
+# llama3_2モジュールからのインポートパスを修正
+try:
+    from model.llama3_2.model.language_model.llama3_2 import Llama3VisionMetaModel
+    print("Llama3VisionMetaModelを正しくインポートしました")
+except ImportError as e:
+    print(f"警告: Llama3VisionMetaModelのインポートに失敗しました: {e}")
+    print("代替としてダミークラスを使用します")
+    
+    # インポートに失敗した場合は単純なダミークラスを定義
+    class Llama3VisionMetaModel(nn.Module):
+        def __init__(self, config, **kwargs):
+            super().__init__()
+            print("警告: ダミーのLlama3VisionMetaModelを使用しています")
+            self.config = config
+        
+        def forward(self, *args, **kwargs):
+            raise NotImplementedError("ダミーLlama3VisionMetaModelは機能しません")
+
 from .segment_anything import build_sam_vit_h
 
 
@@ -138,62 +154,18 @@ class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
             config = SimpleNamespace()
             
             # 必要な設定を追加
-            config.train_mask_decoder = kwargs.get("train_mask_decoder", True)
-            config.out_dim = kwargs.get("out_dim", 256)
-            config.vision_tower = kwargs.get("vision_tower", "meta-llama/Llama-3.2-11B-Vision-Instruct")
-        
-        # vision_towerをmodel_nameとして渡す
-        model_name = kwargs.get("vision_tower") or getattr(config, "vision_tower", None)
-        if model_name is None:
-            model_name = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-        
-        print("LisaModel初期化: 継承順序デバッグ開始")
-        print(f"LisaModel初期化前 - クラスのMRO (Method Resolution Order): {[cls.__name__ for cls in self.__class__.__mro__]}")
-        
-        # LisaMetaModelを先に初期化して必要なフィールドを設定
-        print("LisaMetaModel初期化前...")
+            for key, value in kwargs.items():
+                setattr(config, key, value)
+                
+        # 親クラスの初期化 - 多重継承なので明示的に両方呼び出す
+        print("LisaModelの初期化: 親クラスを初期化します")
         LisaMetaModel.__init__(self, config, **kwargs)
-        print("LisaMetaModel初期化後...")
+        Llama3VisionMetaModel.__init__(self, config, **kwargs)
         
-        # visual_modelの存在を確認
-        if hasattr(self, 'visual_model'):
-            print("LisaMetaModel初期化後: visual_model属性が存在します")
-            print(f"  - visual_model type: {type(self.visual_model).__name__}")
-            # 念のため、visual_modelを一時変数に保存
-            original_visual_model = self.visual_model
-        else:
-            print("警告: LisaMetaModel初期化後、visual_model属性が見つかりません")
-            original_visual_model = None
-        
-        # 次にLlama3VisionMetaModelを初期化
-        print("Llama3VisionMetaModel初期化前...")
-        Llama3VisionMetaModel.__init__(self, config, model_name=model_name, **kwargs)
-        print("Llama3VisionMetaModel初期化後...")
-        
-        # 継承後のvisual_modelの状態を確認
-        if hasattr(self, 'visual_model'):
-            print("継承完了後: visual_model属性が存在します")
-            print(f"  - visual_model type: {type(self.visual_model).__name__}")
-        else:
-            print("警告: 継承完了後、visual_model属性が失われています")
-            
-        # original_visual_modelがあり、現在のvisual_modelと異なる場合や存在しない場合は復元
-        if original_visual_model is not None:
-            if not hasattr(self, 'visual_model') or self.visual_model is not original_visual_model:
-                print("visual_model属性を復元します")
-                self.visual_model = original_visual_model
-        
-        # 属性のリストを出力
-        print("LisaModel初期化後の全属性リスト:")
-        obj_attrs = [attr for attr in dir(self) if not attr.startswith('__')]
-        print(f"  - 属性: {', '.join(obj_attrs[:20])}...")
-        
-        # 重要: visual_modelが多重継承で上書きされている可能性があるため、
-        # LisaMetaModelのvisual_modelを明示的に参照して保持する
-        # これによりLISAForCausalLMからも正しく参照できるようになる
+        # SAMモデルが正しく初期化されたか確認
         if not hasattr(self, 'visual_model'):
-            print("警告: visual_model属性が継承後に失われています。明示的に再設定します。")
-            # SAMモデルを再初期化
+            print("警告: visual_model属性が見つかりません。SAMモデルを初期化します。")
+            # SAMモデルを初期化
             vision_pretrained = kwargs.get("vision_pretrained", None)
             if vision_pretrained:
                 from .segment_anything import build_sam_vit_h
@@ -229,6 +201,8 @@ class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
         self.config.freeze_mm_mlp_adapter = True
         self.config.pretrain_mm_mlp_adapter = None
         self.config.mm_use_im_patch_token = False
+        
+        print("LisaModelの初期化: 成功しました")
 
 
 class LISAForCausalLM(nn.Module):
@@ -446,9 +420,8 @@ class LISAForCausalLM(nn.Module):
             print(f"Error initializing model: {e}")
             raise
             
-        # tryブロックの外でLISAモデルを初期化
-        # 必要なパラメータを準備
-        lisa_kwargs = {
+        # 重要: モデル初期化後にLISA用の設定を行う
+        lisa_config = {
             'train_mask_decoder': train_mask_decoder,
             'out_dim': out_dim,
             'vision_pretrained': vision_pretrained,
@@ -457,30 +430,22 @@ class LISAForCausalLM(nn.Module):
         }
         
         # configがNoneの場合、モデルの設定を使用して新しいConfigオブジェクトを作成
-        if config is None:
-            if hasattr(self.model, 'config'):
-                # モデルの設定を基にconfigを作成
-                config = self.model.config
-                # 必要な属性を追加
-                if not hasattr(config, "train_mask_decoder"):
-                    config.train_mask_decoder = train_mask_decoder
-                if not hasattr(config, "out_dim"):
-                    config.out_dim = out_dim
-                print(f"モデル設定からconfigを生成: {type(config).__name__}")
-            else:
-                # 最低限必要な属性を持つ簡易configオブジェクトを作成
-                from types import SimpleNamespace
-                config = SimpleNamespace()
+        # まずconfigを初期化する（model.configから取得）
+        if hasattr(self.model, 'config'):
+            config = self.model.config
+            # 必要な属性を追加
+            if not hasattr(config, "train_mask_decoder"):
                 config.train_mask_decoder = train_mask_decoder
                 config.out_dim = out_dim
+                config.vision_pretrained = vision_pretrained
                 config.vision_tower = vision_tower
-                # MllamaConfigのように.text_configを持つ可能性を考慮
-                if hasattr(self.model, 'config') and hasattr(self.model.config, 'text_config'):
-                    config.text_config = self.model.config.text_config
-                print("警告: 簡易configオブジェクトを生成しました")
-        
-        # LISAモデルの初期化
-        self.lisa_model = LisaModel(config, **lisa_kwargs)
+        else:
+            # モデルのconfigが存在しない場合、エラーを表示
+            print("エラー: モデルにconfig属性がありません。LISAモデルを初期化できません。")
+            raise ValueError("モデルの設定情報が見つかりません。")
+            
+        # Llama3VisionMetaModelとLisaMetaModelを継承したLisaModelを作成
+        self.lisa_model = LisaModel(config, **lisa_config)
         
         # LISAモデルの視覚モデルを共有
         self.visual_model = self.lisa_model.visual_model
@@ -655,8 +620,19 @@ class LISAForCausalLM(nn.Module):
         label_list: List[torch.Tensor],
         resize_list: List[tuple],
         inference: bool = False,
+        processor=None,  # プロセッサを明示的に受け取るパラメータを追加
         **kwargs,
     ):
+        # プロセッサが指定されていない場合はself.processorを使用
+        if processor is None:
+            if hasattr(self, 'processor') and self.processor is not None:
+                processor = self.processor
+            else:
+                # 最終的な対策として、その場でプロセッサを作成
+                print("警告: プロセッサが指定されていないため、新しく作成します")
+                from transformers import AutoProcessor
+                processor = AutoProcessor.from_pretrained("meta-llama/Llama-3.2-11B-Vision-Instruct")
+        
         # SAM用の特徴抽出
         image_embeddings = self.get_visual_embs(images)
         batch_size = image_embeddings.shape[0]
