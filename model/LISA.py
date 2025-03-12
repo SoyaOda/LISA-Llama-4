@@ -153,6 +153,26 @@ class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
         # 次にLlama3VisionMetaModelを初期化
         Llama3VisionMetaModel.__init__(self, config, model_name=model_name, **kwargs)
 
+        # 重要: visual_modelが多重継承で上書きされている可能性があるため、
+        # LisaMetaModelのvisual_modelを明示的に参照して保持する
+        # これによりLISAForCausalLMからも正しく参照できるようになる
+        if not hasattr(self, 'visual_model'):
+            print("警告: visual_model属性が継承後に失われています。明示的に再設定します。")
+            # SAMモデルを再初期化
+            vision_pretrained = kwargs.get("vision_pretrained", None)
+            if vision_pretrained:
+                from .segment_anything import build_sam_vit_h
+                self.visual_model = build_sam_vit_h(vision_pretrained)
+                for param in self.visual_model.parameters():
+                    param.requires_grad = False
+                if config.train_mask_decoder:
+                    self.visual_model.mask_decoder.train()
+                    for param in self.visual_model.mask_decoder.parameters():
+                        param.requires_grad = True
+            else:
+                print("エラー: vision_pretrainedが指定されていないため、SAMモデルを初期化できません")
+                raise ValueError("SAMモデルの初期化に必要なvision_pretrainedパスが指定されていません")
+
         # 設定を構成
         self.config.use_cache = False
         
