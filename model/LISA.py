@@ -159,354 +159,183 @@ class LisaModel(nn.Module):
     """
     def __init__(
         self,
-        model_cfg=None,
+        model_id="meta-llama/Llama-3.2-11B-Vision-Instruct",
+        sam_vision_encoder=None,
+        mask_decoder=None,
+        device_map=None,
         torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        vision_pretrained='checkpoints/sam_vit_h_4b8939.pth',
-        freeze_vision_model=True,
-        freeze_llm=False,
-        out_dim=256,
         train_mask_decoder=True,
-        *args, **kwargs
+        out_dim=256
     ):
         """
-        Llama3.2 Vision + SAMの統合モデル初期化
+        SAMに基づいたLlama 3.2 Visionモデル。
         
         Args:
-            model_cfg (dict): モデル設定
-            torch_dtype (torch.dtype): 使用するデータ型
-            low_cpu_mem_usage (bool): 低CPUメモリ使用を有効にするか
-            vision_pretrained (str): 視覚モデルの事前学習済み重み
-            freeze_vision_model (bool): 視覚モデルを凍結するか
-            freeze_llm (bool): 言語モデルを凍結するか
-            out_dim (int): 出力次元数
+            model_id: Llama 3.2 Visionモデルの識別子
+            sam_vision_encoder: SAMのビジョンエンコーダー
+            mask_decoder: マスクデコーダー
+            device_map: モデルをどのデバイスにマッピングするか
+            torch_dtype: モデルのデータ型
+            train_mask_decoder: マスクデコーダーを訓練するかどうか
+            out_dim: 出力次元
         """
         super().__init__()
         
-        # 設定初期化
-        from transformers import MllamaConfig, MllamaForConditionalGeneration
+        print(f"LisaModelを初期化します。model_id: {model_id}")
+        self.model_id = model_id
+        self.train_mask_decoder = train_mask_decoder
+        self.out_dim = out_dim
+        self.seg_token_idx = None
         
-        if model_cfg is None:
-            # デフォルト設定を使用
-            try:
-                self.config = MllamaConfig.from_pretrained("meta-llama/Llama-3.2-11B-Vision-Instruct")
-            except Exception as e:
-                print(f"MllamaConfigの初期化エラー: {e}")
-                from transformers import AutoConfig
-                self.config = AutoConfig.from_pretrained("meta-llama/Llama-3.2-11B-Vision-Instruct")
-        else:
-            self.config = model_cfg
-        
-        self.torch_dtype = torch_dtype
-        self.freeze_llm = freeze_llm
-        
-        # Llama3.2 Visionモデルの初期化
+        # configオブジェクトを初期化
         try:
-            print(f"Llama3.2 Visionモデルの初期化: meta-llama/Llama-3.2-11B-Vision-Instruct")
-            print(f"  - torch_dtype: {torch_dtype}")
-            
-            self.model = MllamaForConditionalGeneration.from_pretrained(
-                "meta-llama/Llama-3.2-11B-Vision-Instruct",
-                torch_dtype=torch_dtype,
-                low_cpu_mem_usage=low_cpu_mem_usage,
-            )
+            # MllamaConfigを使用してconfigを作成
+            from transformers import MllamaConfig
+            try:
+                print(f"MllamaConfigを使用してconfigを初期化します: {model_id}")
+                self.config = MllamaConfig.from_pretrained(model_id)
+            except Exception as e:
+                print(f"MllamaConfigの初期化中にエラーが発生しました: {e}")
+                print("AutoConfigを使用して再試行します")
+                from transformers import AutoConfig
+                self.config = AutoConfig.from_pretrained(model_id)
         except Exception as e:
-            print(f"モデル初期化エラー: {e}")
-            raise
+            print(f"configの初期化中にエラーが発生しました: {e}")
+            print("空のconfigを作成します")
+            from transformers import PretrainedConfig
+            self.config = PretrainedConfig()
         
-        # セグメンテーション関連
+        # seg_token_idxの属性を追加
         self.config.seg_token_idx = None
         
-        # SAMモデルの初期化
-        if vision_pretrained is not None:
+        # Llama 3.2 Visionモデルを初期化
+        try:
+            print(f"MllamaForConditionalGenerationを初期化します: {model_id}")
+            print(f"torch_dtype: {torch_dtype}")
+            from transformers import MllamaForConditionalGeneration
+            self.model = MllamaForConditionalGeneration.from_pretrained(
+                model_id,
+                device_map=device_map,
+                torch_dtype=torch_dtype
+            )
+            print("MllamaForConditionalGenerationの初期化が成功しました")
+        except Exception as e:
+            print(f"MllamaForConditionalGenerationの初期化中にエラーが発生しました: {e}")
+            print("AutoModelForVision2Seqで再試行します")
             try:
-                print(f"SAMモデルの初期化: {vision_pretrained}")
-                self.visual_model = build_sam(checkpoint=vision_pretrained)
-                
-                # 視覚モデルの凍結制御
-                if hasattr(self.visual_model, 'image_encoder'):
-                    for param in self.visual_model.image_encoder.parameters():
-                        param.requires_grad = not freeze_vision_model
-                if hasattr(self.visual_model, 'prompt_encoder'):
-                    for param in self.visual_model.prompt_encoder.parameters():
-                        param.requires_grad = True
-                if hasattr(self.visual_model, 'mask_decoder') and train_mask_decoder:
-                    for param in self.visual_model.mask_decoder.parameters():
-                        param.requires_grad = True
+                from transformers import AutoModelForVision2Seq
+                self.model = AutoModelForVision2Seq.from_pretrained(
+                    model_id,
+                    device_map=device_map,
+                    torch_dtype=torch_dtype
+                )
+                print("AutoModelForVision2Seqの初期化が成功しました")
             except Exception as e:
-                print(f"SAMモデルの初期化中にエラー: {e}")
+                print(f"AutoModelForVision2Seqの初期化中もエラーが発生しました: {e}")
                 raise
-
-        # 設定を構成
-        self.config.use_cache = False
         
-        # 他の設定属性を確実に設定
-        self.config.image_aspect_ratio = "square"
-        self.config.image_grid_pinpoints = None
-        self.config.tune_mm_mlp_adapter = False
-        self.config.freeze_mm_mlp_adapter = True
-        self.config.pretrain_mm_mlp_adapter = None
-        self.config.mm_use_im_patch_token = False
-
-        # 投影層
-        in_dim = 4096  # Llama3.2 11Bの隠れ層サイズ
-        self.out_dim = out_dim
-        text_fc = [
-            nn.Linear(in_dim, in_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(in_dim, out_dim),
-            nn.Dropout(0.0),
-        ]
-        self.text_hidden_fcs = nn.ModuleList([nn.Sequential(*text_fc)])
+        # プロセッサを初期化
+        try:
+            print(f"プロセッサを初期化します: {model_id}")
+            from transformers import AutoProcessor
+            self.processor = AutoProcessor.from_pretrained(model_id)
+            print("プロセッサの初期化が成功しました")
+        except Exception as e:
+            print(f"プロセッサの初期化中にエラーが発生しました: {e}")
+            self.processor = None  # プロセッサなしで続行
         
-        for param in self.text_hidden_fcs.parameters():
-            param.requires_grad = True
+        # SAMビジョンエンコーダーの初期化または設定
+        print("SAMビジョンエンコーダーを設定中...")
+        if sam_vision_encoder is not None:
+            self.visual_model = sam_vision_encoder
+            print("提供されたSAMビジョンエンコーダーを使用します")
+        else:
+            print("SAMビジョンエンコーダーを初期化します")
+            # 何らかのデフォルトビジョンモデルをここで初期化
+            # ただし、実際の実装ではユーザーが事前に初期化したエンコーダーを提供することが望ましい
+            self.visual_model = None
+        
+        # マスクデコーダーの初期化または設定
+        print("マスクデコーダーを設定中...")
+        if mask_decoder is not None:
+            self.mask_decoder = mask_decoder
+            print("提供されたマスクデコーダーを使用します")
+        else:
+            print("マスクデコーダーを初期化します")
+            # 何らかのデフォルトマスクデコーダーをここで初期化
+            # ただし、実際の実装ではユーザーが事前に初期化したデコーダーを提供することが望ましい
+            self.mask_decoder = None
+        
+        # マスクデコーダーのパラメータの勾配設定
+        if self.mask_decoder is not None:
+            for p in self.mask_decoder.parameters():
+                p.requires_grad = train_mask_decoder
+            print(f"マスクデコーダーの訓練設定: {train_mask_decoder}")
             
-        print("LisaModelの初期化: 成功しました")
-        
-    def forward(self, *args, **kwargs):
-        """
-        前方伝播処理。引数をLlama3.2 Visionモデルに渡します。
-        """
-        # Llama3.2 Visionモデルの呼び出し
-        if not hasattr(self, 'model'):
-            raise AttributeError("modelがLisaModelオブジェクトに設定されていません")
-        
-        return self.model(*args, **kwargs)
-        
-    def get_processor(self):
-        """
-        LISAモデル用のプロセッサを取得します
-        """
-        if not hasattr(self, "processor") or self.processor is None:
-            self.processor = super().get_processor()
-        return self.processor
-    
-    def get_model(self):
-        """
-        内部モデルを返します。
-        train_ds.py内でmodel.model.configにアクセスするために必要です。
-        """
-        return self.model
-    
-    def get_input_embeddings(self):
-        """
-        入力埋め込み層を返します。
-        PEFTのLoRAを適用するために必要です。
-        """
-        if hasattr(self.model, "get_input_embeddings"):
-            return self.model.get_input_embeddings()
-        # モデルが直接メソッドを持っていない場合は、埋め込み層を直接取得
-        if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
-            return self.model.model.embed_tokens
-        # MllamaモデルではLlamaモデル部分の埋め込み層を取得
-        if hasattr(self.model, "text_model") and hasattr(self.model.text_model, "embed_tokens"):
-            return self.model.text_model.embed_tokens
-        # 最後の手段として例外をスロー
-        raise NotImplementedError("このモデルでは入力埋め込み層が見つかりません")
-    
-    def get_output_embeddings(self):
-        """
-        出力埋め込み層を返します。
-        PEFTの一部の操作に必要です。
-        """
-        if hasattr(self.model, "get_output_embeddings"):
-            return self.model.get_output_embeddings()
-        # モデルが直接メソッドを持っていない場合は、出力埋め込み層を直接取得
-        if hasattr(self.model, "lm_head"):
-            return self.model.lm_head
-        # MllamaモデルではLlamaモデル部分の出力埋め込み層を取得
-        if hasattr(self.model, "text_model") and hasattr(self.model.text_model, "lm_head"):
-            return self.model.text_model.lm_head
-        # 最後の手段として例外をスロー
-        raise NotImplementedError("このモデルでは出力埋め込み層が見つかりません")
-    
-    def set_input_embeddings(self, value):
-        """
-        入力埋め込み層を設定します。
-        resize_token_embeddingsで必要です。
-        """
-        if hasattr(self.model, "set_input_embeddings"):
-            return self.model.set_input_embeddings(value)
-        # モデルが直接メソッドを持っていない場合は、埋め込み層を直接設定
-        if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
-            self.model.model.embed_tokens = value
-            return
-        # MllamaモデルではLlamaモデル部分の埋め込み層を設定
-        if hasattr(self.model, "text_model") and hasattr(self.model.text_model, "embed_tokens"):
-            self.model.text_model.embed_tokens = value
-            return
-        # 最後の手段として例外をスロー
-        raise NotImplementedError("このモデルでは入力埋め込み層を設定できません")
-    
-    def set_output_embeddings(self, value):
-        """
-        出力埋め込み層を設定します。
-        resize_token_embeddingsで必要です。
-        """
-        if hasattr(self.model, "set_output_embeddings"):
-            return self.model.set_output_embeddings(value)
-        # モデルが直接メソッドを持っていない場合は、出力埋め込み層を直接設定
-        if hasattr(self.model, "lm_head"):
-            self.model.lm_head = value
-            return
-        # MllamaモデルではLlamaモデル部分の出力埋め込み層を設定
-        if hasattr(self.model, "text_model") and hasattr(self.model.text_model, "lm_head"):
-            self.model.text_model.lm_head = value
-            return
-        # 最後の手段として例外をスロー
-        raise NotImplementedError("このモデルでは出力埋め込み層を設定できません")
-    
-    def tie_weights(self):
-        """
-        入力埋め込みと出力埋め込みを結合します（同じパラメータを共有）。
-        """
-        output_embeddings = self.get_output_embeddings()
-        if output_embeddings is not None:
-            self.set_output_embeddings(self.get_input_embeddings())
+            # マスクデコーダーの入力用の投影層の初期化
+            self.mlp = nn.Sequential(
+                nn.Linear(self.model.config.hidden_size, self.out_dim),
+                nn.GELU(),
+                nn.Linear(self.out_dim, self.out_dim)
+            )
             
     def resize_token_embeddings(self, new_num_tokens):
         """
-        トークン埋め込みをリサイズします。
-        """
-        # 入力埋め込みのリサイズ
-        self.model.resize_token_embeddings(new_num_tokens)
-        
-        # 出力埋め込みのリサイズ（入出力が分離している場合）
-        try:
-            output_embeddings = self.model.get_output_embeddings()
-            input_embeddings = self.model.get_input_embeddings()
-            
-            if output_embeddings is not None and output_embeddings.weight.shape[0] != new_num_tokens:
-                print(f"出力埋め込みをリサイズ: {output_embeddings.weight.shape[0]} -> {new_num_tokens}")
-                
-                # 新しい出力埋め込みを作成
-                new_lm_head = nn.Linear(
-                    input_embeddings.weight.shape[1],
-                    new_num_tokens,
-                    bias=output_embeddings.bias is not None,
-                    device=output_embeddings.weight.device,
-                    dtype=output_embeddings.weight.dtype
-                )
-                
-                # 既存の重みをコピー
-                with torch.no_grad():
-                    new_lm_head.weight[:output_embeddings.weight.shape[0], :] = output_embeddings.weight
-                    if output_embeddings.bias is not None:
-                        new_lm_head.bias[:output_embeddings.bias.shape[0]] = output_embeddings.bias
-                
-                # 新しい埋め込みを設定
-                self.model.set_output_embeddings(new_lm_head)
-        except Exception as e:
-            print(f"出力埋め込みのリサイズ中にエラーが発生しました: {e}")
-
-    def get_visual_embs(self, pixel_values: torch.FloatTensor):
-        """
-        SAMビジュアルエンコーダーを使用して画像の特徴抽出を行う
+        トークン埋め込みをリサイズする
         
         Args:
-            pixel_values: 入力画像 [batch_size, channels, height, width]
-            
+            new_num_tokens: 新しいトークン数
+        
         Returns:
-            image_embeddings: SAMの画像埋め込み
+            リサイズされたモデル
         """
-        with torch.no_grad():
-            # バッチサイズが大きい場合は分割処理
-            if pixel_values is None:
-                raise ValueError("入力画像 (pixel_values) がNoneです")
-            
-            # SAMのvisual_modelが存在するか確認
-            if not hasattr(self, "lisa_model") or not hasattr(self.lisa_model, "visual_model"):
-                raise AttributeError("visual_modelが見つかりません。SAMモデルが正しく初期化されていない可能性があります。")
-            
-            batch_size = pixel_values.shape[0]
-            max_batch_per_iter = 1  # GPUメモリに余裕がある場合は2や4に増やせます
-            
-            image_embeddings_list = []
-            
-            # 入力解像度の取得
-            original_h, original_w = pixel_values.shape[-2:]
-            
-            # 処理中に一時的にbf16/fp16に変換してメモリ使用量を削減
-            original_dtype = pixel_values.dtype
-            
-            # データ型チェック
-            if original_dtype == torch.bfloat16:
-                print(f"SAMエンコーダー: 入力画像がBFloat16形式です。処理前に変換を行います。")
-            
-            for i in range(0, batch_size, max_batch_per_iter):
-                # 毎回明示的にキャッシュをクリア
-                torch.cuda.empty_cache()
+        try:
+            if not hasattr(self, 'model'):
+                print("警告: self.modelが存在しません。トークン埋め込みはリサイズできません。")
+                return
                 
-                # バッチの切り出し
-                end_idx = min(i + max_batch_per_iter, batch_size)
-                current_batch = pixel_values[i:end_idx]
-                
-                # SAMエンコーダーはどのデータ型をサポートしているか確認
-                # PyTorchのコンバージョン互換性のために明示的にfloat32に変換
-                if hasattr(self.lisa_model.visual_model.image_encoder, "pixel_mean") and \
-                   hasattr(self.lisa_model.visual_model.image_encoder, "dtype"):
-                    # SAMエンコーダーの推奨データ型を取得
-                    target_dtype = getattr(self.lisa_model.visual_model.image_encoder, "dtype", torch.float32)
-                    if current_batch.dtype != target_dtype:
-                        print(f"SAMエンコーダー: 画像データを{current_batch.dtype}から{target_dtype}に変換します")
-                        current_batch = current_batch.to(target_dtype)
+            print(f"モデルの埋め込みをリサイズします: {new_num_tokens}")
+            
+            # Input埋め込みのリサイズ
+            try:
+                self.model.resize_token_embeddings(new_num_tokens)
+                print("Input埋め込みのリサイズに成功しました")
+            except Exception as e:
+                print(f"Input埋め込みのリサイズ中にエラーが発生しました: {e}")
+            
+            # Output埋め込み（LM head）のリサイズ
+            # LM headがtiedされていない場合に必要
+            try:
+                lm_head = self.model.get_output_embeddings()
+                if lm_head is not None:
+                    old_num_tokens, emb_dim = lm_head.weight.shape
+                    if old_num_tokens != new_num_tokens:
+                        print(f"Output埋め込み（LM head）もリサイズします: {old_num_tokens} -> {new_num_tokens}")
+                        
+                        # 新しい線形層を作成
+                        new_lm_head = nn.Linear(
+                            in_features=emb_dim, 
+                            out_features=new_num_tokens, 
+                            bias=lm_head.bias is not None
+                        )
+                        
+                        # 既存の重みとバイアスをコピー
+                        new_lm_head.weight.data[:old_num_tokens, :] = lm_head.weight.data
+                        if lm_head.bias is not None:
+                            new_lm_head.bias.data[:old_num_tokens] = lm_head.bias.data
+                        
+                        # 新しいLM headを設定
+                        self.model.set_output_embeddings(new_lm_head)
+                        print("Output埋め込み（LM head）のリサイズに成功しました")
                 else:
-                    # SAMエンコーダーの仕様が不明な場合はfloat32を使用
-                    if current_batch.dtype != torch.float32:
-                        print(f"SAMエンコーダー: データ型が不明のため、画像データを{current_batch.dtype}からfloat32に変換します")
-                        current_batch = current_batch.to(torch.float32)
+                    print("Output埋め込み（LM head）が見つかりません")
+            except Exception as e:
+                print(f"Output埋め込み（LM head）のリサイズ中にエラーが発生しました: {e}")
                 
-                try:
-                    # bf16/fp16での処理（メモリ効率化）
-                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                        # SAMのイメージエンコーダーを実行
-                        try:
-                            image_embeddings = self.lisa_model.visual_model.image_encoder(current_batch)
-                        except Exception as e:
-                            print(f"SAMイメージエンコーダーの実行中にエラーが発生しました: {e}")
-                            # 考えられる問題のデバッグ情報を出力
-                            print(f"現在のバッチ形状: {current_batch.shape}, データ型: {current_batch.dtype}")
-                            print(f"イメージエンコーダーのデバイス: {next(self.lisa_model.visual_model.image_encoder.parameters()).device}")
-                            print(f"入力データのデバイス: {current_batch.device}")
-                            
-                            # デバイスの不一致を修正して再試行
-                            encoder_device = next(self.lisa_model.visual_model.image_encoder.parameters()).device
-                            if current_batch.device != encoder_device:
-                                print(f"デバイスの不一致を修正: {current_batch.device} -> {encoder_device}")
-                                current_batch = current_batch.to(encoder_device)
-                                image_embeddings = self.lisa_model.visual_model.image_encoder(current_batch)
-                            else:
-                                # 他の理由でエラーが発生している場合は再度例外を発生
-                                raise
-                        
-                        # 元の精度に戻す
-                        image_embeddings = image_embeddings.to(original_dtype)
-                        
-                        image_embeddings_list.append(image_embeddings)
-                except RuntimeError as e:
-                    # メモリ不足などの実行時エラー
-                    if "out of memory" in str(e):
-                        print(f"メモリ不足のため、FP32で再試行します: {e}")
-                        # メモリ効率を犠牲にしてFP32で試行
-                        image_embeddings = self.lisa_model.visual_model.image_encoder(current_batch)
-                        image_embeddings = image_embeddings.to(original_dtype)
-                        image_embeddings_list.append(image_embeddings)
-                    else:
-                        # その他のランタイムエラー
-                        print(f"SAMエンコーダーの実行中にエラーが発生しました: {e}")
-                        raise
-            
-            # 最終的なバッチの結合
-            torch.cuda.empty_cache()
-            if len(image_embeddings_list) == 1:
-                # 単一バッチの場合は結合の必要なし
-                image_embeddings = image_embeddings_list[0]
-            else:
-                # 複数バッチがある場合は結合
-                image_embeddings = torch.cat(image_embeddings_list, 0)
-            
-        return image_embeddings
+            return self.model
+        except Exception as e:
+            print(f"resize_token_embeddings中にエラーが発生しました: {e}")
+            return None
 
     def forward(self, **kwargs):
         if "past_key_values" in kwargs:
@@ -738,7 +567,19 @@ class LisaModel(nn.Module):
             print("画像データなし")
         
         # <SEG>トークンのマスクを作成（元のLISAコードを参考にしているが、現時点では未使用）
-        seg_token_mask = input_ids[:, 1:] == self.seg_token_idx
+        # seg_token_idxにアクセスする前にチェック
+        seg_token_idx = getattr(self, 'seg_token_idx', None)
+        if seg_token_idx is None:
+            # LisaModelからの取得を試みる
+            seg_token_idx = getattr(self.lisa_model, 'seg_token_idx', None)
+            if seg_token_idx is None:
+                # どちらにも存在しない場合は警告を出す
+                print("警告: seg_token_idxが設定されていません")
+                # デフォルト値として-1を使用
+                seg_token_idx = -1
+        
+        # seg_token_idxを使用してマスク作成
+        seg_token_mask = input_ids[:, 1:] == seg_token_idx
         seg_token_mask = torch.cat(
             [
                 seg_token_mask,
@@ -747,126 +588,81 @@ class LisaModel(nn.Module):
             dim=1,
         )
         
-        # プロセッサ呼び出し部分
+        # プロセッサを使用してLlama3.2 Visionモデルの入力を準備
+        processor_inputs = None
         try:
-            if processor is not None and images_for_processor is not None:
-                # プロンプトにimage tokenを追加
-                if isinstance(text_input, str):
-                    # 単一のテキスト入力の場合、リストに変換
-                    text_input = [f"<|image|> {text_input}"]
-                elif isinstance(text_input, list):
-                    # リスト内の各テキストを処理
-                    for i in range(len(text_input)):
-                        if not text_input[i].startswith("<|image|>"):
-                            text_input[i] = f"<|image|> {text_input[i]}"
-                
-                print(f"入力データ情報:")
-                print(f"  text_input: type={type(text_input)}")
-                if isinstance(text_input, list):
-                    print(f"  text_input長さ: {len(text_input)}")
-                    if len(text_input) > 0:
-                        print(f"  最初のアイテム: {text_input[0][:50]}...")
-                
-                if isinstance(images_for_processor, list):
-                    print(f"  images_for_processor: リスト（PILイメージ）長さ={len(images_for_processor)}")
-                else:
-                    print(f"  images_for_processor: shape={images_for_processor.shape if hasattr(images_for_processor, 'shape') else 'unknown'}, dtype={images_for_processor.dtype if hasattr(images_for_processor, 'dtype') else 'unknown'}")
-                
-                # Llama3.2 Visionモデルのプロセッサを使用して入力を処理
-                processor_inputs = processor(
-                    text=text_input,
-                    images=images_for_processor,
-                    return_tensors="pt",
-                    padding=True
-                )
-                
-                # デバイスを合わせる
-                if device is not None and processor_inputs is not None:
-                    processor_inputs = {k: v.to(device) for k, v in processor_inputs.items()}
-                
-                # 必要に応じてプロセッサの出力の形状を表示
-                if processor_inputs is not None and all(key in processor_inputs for key in ["input_ids", "attention_mask"]):
-                    print(f"processor出力: input_ids={processor_inputs['input_ids'].shape}, attention_mask={processor_inputs['attention_mask'].shape}")
-                    if "pixel_values" in processor_inputs:
-                        print(f"  pixel_values={processor_inputs['pixel_values'].shape}")
-            else:
-                processor_inputs = None
-                print("プロセッサまたは画像データが利用できません")
-        except Exception as e:
-            processor_inputs = None
-            print(f"プロセッサエラー: {e}")
-            print(f"入力データ情報:")
-            print(f"  text_input: type={type(text_input)}")
-            if isinstance(text_input, list):
-                print(f"  text_input長さ: {len(text_input)}")
-                if len(text_input) > 0:
-                    print(f"  最初のアイテム: {text_input[0][:50]}...")
+            # テキストとPIL画像を渡してプロセッサを実行
+            processor_inputs = processor(
+                text=text_input,
+                images=images_for_processor if images_for_processor else None,
+                return_tensors="pt",
+                padding=True,
+                truncation=True
+            )
             
-            if isinstance(images_for_processor, list):
-                print(f"  images_for_processor: リスト長さ={len(images_for_processor)}")
-            else:
-                print(f"  images_for_processor: shape={images_for_processor.shape if hasattr(images_for_processor, 'shape') else type(images_for_processor)}, dtype={images_for_processor.dtype if hasattr(images_for_processor, 'dtype') else 'unknown'}")
-        
-        # 出力のhidden statesを要求
-        output_hidden_states = True if self.seg_token_idx is not None else False
-        
-        # モデル実行
+            # プロセッサが出力するデータについてのデバッグ情報
+            print(f"プロセッサ出力: {sorted(processor_inputs.keys())}")
+            
+            # デバイスをinput_idsと一致させる（テンソルの場合）
+            if device is not None:
+                for key, value in processor_inputs.items():
+                    if isinstance(value, torch.Tensor):
+                        processor_inputs[key] = value.to(device)
+            
+        except Exception as e:
+            print(f"プロセッサの実行中にエラーが発生しました: {e}")
+            print(f"テキスト入力: {text_input[:100]}...")  # 最初の100文字のみ
+            print(f"画像入力タイプ: {type(images_for_processor)}")
+            if isinstance(images_for_processor, list) and len(images_for_processor) > 0:
+                print(f"  - 最初の画像タイプ: {type(images_for_processor[0])}")
+                if hasattr(images_for_processor[0], 'size'):
+                    print(f"  - 最初の画像サイズ: {images_for_processor[0].size}")
+            traceback.print_exc()  # デバッグのために詳細なスタックトレースを表示
+            processor_inputs = None
+            
+        # モデル実行（Llama3.2 Vision）
         vision_x = None
-        if processor_inputs is not None:
-            try:
-                # cache_dataパラメータを削除し、Llama3.2 Visionモデルに対応
-                outputs = self.model(
-                    input_ids=processor_inputs.get("input_ids"),
-                    attention_mask=processor_inputs.get("attention_mask"),
-                    pixel_values=processor_inputs.get("pixel_values", None),
-                    output_hidden_states=output_hidden_states,
+        try:
+            if processor_inputs is not None:
+                print("Llama3.2 Visionモデルを実行します")
+                
+                # cache_dataパラメータを削除（Llama3.2 Visionモデルは対応していない）
+                # モデルを実行してテキスト表現を取得
+                outputs = self.lisa_model.model(
+                    **processor_inputs,
+                    output_hidden_states=True,
                     return_dict=True
                 )
-                vision_x = outputs
-            except Exception as e:
-                print(f"[エラー情報] モデル実行中にエラーが発生しました: {e}")
-                print(f"入力データの情報:")
                 
-                # 入力データの詳細情報を表示
-                def print_tensor_info(name, tensor):
-                    if isinstance(tensor, torch.Tensor):
-                        print(f"  {name}: shape={tensor.shape}, dtype={tensor.dtype}")
-                    elif isinstance(tensor, list):
-                        print(f"  {name}: list of {len(tensor)} items")
-                        if len(tensor) > 0:
-                            print(f"    先頭アイテム: {type(tensor[0])}")
-                            if hasattr(tensor[0], 'shape'):
-                                print(f"    shape={tensor[0].shape}, dtype={tensor[0].dtype}")
-                    else:
-                        print(f"  {name}: type={type(tensor)}")
+                # hidden_statesを抽出
+                vision_x = outputs.hidden_states
                 
-                # 全ての入力パラメータを表示
-                for key, value in kwargs.items():
-                    print_tensor_info(key, value)
-                
-                # モデル実行エラー時はNoneを返す
+                # hidden_statesの形状を表示（デバッグ用）
+                if vision_x is not None:
+                    if isinstance(vision_x, tuple):
+                        print(f"hidden_statesはタプルです（長さ: {len(vision_x)}）")
+                        # 最後の層のhidden_stateを使用
+                        vision_x = vision_x[-1]
+                    print(f"vision_x形状: {vision_x.shape}")
+                else:
+                    print("警告: モデル出力からhidden_statesが取得できませんでした")
+            else:
+                print("プロセッサ入力がNoneのため、モデルは実行されません")
                 vision_x = None
-                
-                # 早期終了（モデルエラー時）
-                return {
-                    "loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
-                    "ce_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
-                    "mask_bce_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
-                    "mask_dice_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
-                    "mask_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
-                }
-        else:
-            print("プロセッサの出力がありません。モデルは実行されません。")
-            vision_x = None
+        except Exception as e:
+            print(f"モデル実行中にエラーが発生しました: {e}")
             
-            # 早期終了（プロセッサエラー時）
-            return {
-                "loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
-                "ce_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
-                "mask_bce_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
-                "mask_dice_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
-                "mask_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
-            }
+            # 入力テンソルに関する詳細情報（デバッグ用）
+            if processor_inputs is not None:
+                for key, value in processor_inputs.items():
+                    if isinstance(value, torch.Tensor):
+                        print(f"  - {key}: 形状={value.shape}, データ型={value.dtype}, デバイス={value.device}")
+                    else:
+                        print(f"  - {key}: タイプ={type(value)}")
+            
+            print(f"詳細なエラー情報:")
+            traceback.print_exc()
+            vision_x = None
 
         # モデル出力からlogitsを取得（あれば）
         if hasattr(vision_x, 'logits'):
@@ -1315,77 +1111,38 @@ class LISAForCausalLM(nn.Module):
     LISA for Causal Language Modeling.
     Llama3.2 Vision (MllamaForConditionalGeneration) + SAM
     """
-    def __init__(
-        self,
-        model_id="meta-llama/Llama-3.2-11B-Vision-Instruct",
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        train_mask_decoder=True,
-        out_dim=256,
-        ce_loss_weight=1.0,
-        dice_loss_weight=1.0,
-        bce_loss_weight=1.0,
-        seg_token_idx=None,
-        vision_pretrained=None,
-        vision_tower=None,
-        use_mm_start_end=True,
-        device_map=None,
-    ):
+    def __init__(self, **kwargs):
         super().__init__()
         
-        self.ce_loss_weight = ce_loss_weight
-        self.dice_loss_weight = dice_loss_weight
-        self.bce_loss_weight = bce_loss_weight
+        self.lisa_model = LisaModel(
+            model_id="meta-llama/Llama-3.2-11B-Vision-Instruct",
+            sam_vision_encoder=kwargs.get("sam_encoder", None),
+            mask_decoder=kwargs.get("mask_decoder", None),
+            torch_dtype=kwargs.get("torch_dtype", torch.float16),
+            device_map=kwargs.get("device_map", None),
+        )
         
-        # LisaModelの初期化
-        try:
-            self.lisa_model = LisaModel(
-                model_id,
-                torch_dtype=torch_dtype,
-                low_cpu_mem_usage=low_cpu_mem_usage,
-                vision_pretrained=vision_pretrained,
-                train_mask_decoder=train_mask_decoder,
-                out_dim=out_dim,
-            )
-        except Exception as e:
-            print(f"LisaModelの初期化中にエラーが発生しました: {e}")
-            traceback.print_exc()
-            raise
-            
-        # セグメンテーショントークンの設定
-        self.seg_token_idx = seg_token_idx
+        # 各種パラメータを設定
+        self.device = kwargs.get("device", "cuda" if torch.cuda.is_available() else "cpu")
         
-        # プロセッサの初期化
-        try:
-            self.processor = AutoProcessor.from_pretrained(model_id)
-            
-            # <SEG>トークンをプロセッサに追加
-            if "<SEG>" not in self.processor.tokenizer.get_vocab():
-                print("<SEG>トークンを追加します")
-                num_added_tokens = self.processor.tokenizer.add_special_tokens(
-                    {"additional_special_tokens": ["<SEG>"]}
-                )
-                vocab = self.processor.tokenizer.get_vocab()
-                self.seg_token_idx = vocab.get("<SEG>")
-                print(f"<SEG>トークンのIDは {self.seg_token_idx} です")
-                
-                # モデルの埋め込みとヘッドを拡張
-                self.lisa_model.resize_token_embeddings(len(self.processor.tokenizer))
-            else:
-                # すでに存在する場合はIDを取得
-                vocab = self.processor.tokenizer.get_vocab()
-                self.seg_token_idx = vocab.get("<SEG>")
-                print(f"既存の<SEG>トークンのIDは {self.seg_token_idx} です")
-        except Exception as e:
-            print(f"プロセッサの初期化中にエラーが発生しました: {e}")
-            raise
-            
+        self.ce_loss_weight = kwargs.get("ce_loss_weight", 1.0)
+        self.bce_loss_weight = kwargs.get("bce_loss_weight", 1.0)
+        self.dice_loss_weight = kwargs.get("dice_loss_weight", 1.0)
+        
+        # seg_token_idxをLisaModelから取得
+        self.seg_token_idx = getattr(self.lisa_model, "seg_token_idx", None)
+        if self.seg_token_idx is None:
+            print("警告: seg_token_idxがLISAForCausalLMで設定されていません")
+            self.seg_token_idx = -1  # デフォルト値（エラー時用）
+
     def get_processor(self):
-        """
-        プロセッサを取得
-        """
-        return self.processor
-        
+        """processorを取得"""
+        if hasattr(self.lisa_model, "processor"):
+            return self.lisa_model.processor
+        else:
+            print("警告: processorが設定されていません")
+            return None
+            
     def get_visual_embs(self, images, return_width_height=False):
         """
         ビジュアルな埋め込みを取得
