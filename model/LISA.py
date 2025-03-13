@@ -696,7 +696,6 @@ class LISAForCausalLM(nn.Module):
             embedding_token_seg = self.get_input_embeddings()(torch.tensor([[self.seg_token_idx]], device=device))
             embedding_token_seg = embedding_token_seg.squeeze(0)
         
-        # Llama 3.2 Visionを使用するためにprocessorで入力を準備
         # processorはpixel_valuesとaspect_ratio_idsを自動的に生成
         processor = self.get_processor()
         
@@ -723,63 +722,54 @@ class LISAForCausalLM(nn.Module):
                 "processorは文字列または文字列のリストを期待しています。"
             )
         
-        # デバッグ情報を出力
-        print(f"images_clip形状: {images_clip.shape if isinstance(images_clip, torch.Tensor) else 'not a tensor'}")
+        # 画像データの準備
+        # Llama3.2 Visionプロセッサでは、バッチ内の各要素に対して同じ数の画像が必要
+        device = input_ids.device if isinstance(input_ids, torch.Tensor) else None
         
-        # Llama3.2 Visionプロセッサでは、各バッチ要素に対して同じ数の画像が必要
-        # 形状を調整: 現在の形状は [batch_size, num_images, ...] であるが
-        # 単一画像のみを使用するように修正する
-        if isinstance(images_clip, torch.Tensor):
-            # バッチ内の最初の画像のみを使用
-            if len(images_clip.shape) >= 3 and images_clip.shape[1] > 0:
-                # 画像形状の確認
-                if len(images_clip.shape) == 6:  # [batch, num_images, num_clips, channels, height, width]
-                    # 最初の画像セットのみを使用
-                    images_for_processor = images_clip[:, 0]
-                    print(f"processorに渡す画像形状: {images_for_processor.shape}")
-                else:
-                    # そのまま使用
-                    images_for_processor = images_clip
-                    print(f"既存の画像形状をそのまま使用: {images_for_processor.shape}")
+        if images_clip is not None and isinstance(images_clip, torch.Tensor):
+            print(f"images_clip形状: {images_clip.shape}")
+            
+            # バッチサイズを取得
+            batch_size = images_clip.shape[0] if len(images_clip.shape) > 0 else 1
+            
+            # 形状を調整して各バッチ要素が同じ数の画像を持つようにする
+            if len(images_clip.shape) == 6:  # [batch, num_images, num_clips, channels, height, width]
+                # 各バッチ要素に1つの画像を使用
+                images_for_processor = images_clip[:, 0, 0]  # [batch, channels, height, width]
+            elif len(images_clip.shape) == 5:  # [batch, num_clips, channels, height, width]
+                images_for_processor = images_clip[:, 0]  # [batch, channels, height, width]
             else:
-                # 画像がない場合は空のリストを渡す
-                images_for_processor = None
-                print("画像データなし、Noneを渡します")
+                images_for_processor = images_clip
+            
+            print(f"processorに渡す画像形状: {images_for_processor.shape}")
         else:
-            # テンソルでない場合はそのまま使用
-            images_for_processor = images_clip
-            print(f"テンソルでない画像データ: {type(images_for_processor)}")
+            images_for_processor = None
+            print("画像データなし")
         
         # processorで入力を準備
         try:
-            processor_inputs = processor(
-                text=text_input,
-                images=images_for_processor,
-                return_tensors="pt",
-                padding=True,
-            )
+            if images_for_processor is not None:
+                processor_inputs = processor(
+                    text=text_input,
+                    images=images_for_processor,
+                    return_tensors="pt",
+                    padding=True,
+                )
+            else:
+                processor_inputs = processor(
+                    text=text_input,
+                    return_tensors="pt",
+                    padding=True,
+                )
+            
+            # デバイスを合わせる
+            if device is not None:
+                processor_inputs = {k: v.to(device) for k, v in processor_inputs.items()}
+            
             print("プロセッサ実行成功")
         except Exception as e:
             print(f"プロセッサエラー: {e}")
-            # エラー発生時の処理を追加
-            if images_for_processor is not None:
-                # 1つの画像だけを試してみる（最初のバッチ要素の最初の画像）
-                if isinstance(images_for_processor, torch.Tensor) and len(images_for_processor.shape) >= 4:
-                    single_image = images_for_processor[0].unsqueeze(0)
-                    print(f"単一画像試行: {single_image.shape}")
-                    processor_inputs = processor(
-                        text=text_input[0] if isinstance(text_input, list) else text_input,
-                        images=single_image,
-                        return_tensors="pt",
-                        padding=True,
-                    )
-                else:
-                    raise e
-            else:
-                raise e
-        
-        # デバイスを合わせる
-        processor_inputs = {k: v.to(device) for k, v in processor_inputs.items()}
+            raise e
         
         # ラベルを追加（存在する場合）
         if labels is not None:
@@ -957,10 +947,9 @@ class LISAForCausalLM(nn.Module):
             if isinstance(images, torch.Tensor):
                 batch_size = images.shape[0]
                 # aspect_ratio_idsを作成（デフォルトで0）
-                # これは画像のアスペクト比情報をモデルに提供します
                 device = images.device
                 batch_inputs["aspect_ratio_ids"] = torch.zeros(batch_size, dtype=torch.long, device=device)
-            
+
         return batch_inputs
 
 def compute_dice_loss(inputs, targets, smooth=1):
