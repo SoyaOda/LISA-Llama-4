@@ -676,6 +676,20 @@ class LISAForCausalLM(nn.Module):
         batch_size = image_embeddings.shape[0]
         assert batch_size == len(offset) - 1
 
+        # input_idsが1次元の場合、2次元に変換
+        if input_ids.dim() == 1:
+            # エラーデバッグ情報を追加
+            print(f"input_idsが1次元です。形状: {input_ids.shape}")
+            # 1次元の場合は1xN形式にリシェイプ
+            input_ids = input_ids.unsqueeze(0)
+            print(f"変換後のinput_ids形状: {input_ids.shape}")
+            
+            # 同様にattention_masksとlabelsも調整
+            if attention_masks is not None and attention_masks.dim() == 1:
+                attention_masks = attention_masks.unsqueeze(0)
+            if labels is not None and labels.dim() == 1:
+                labels = labels.unsqueeze(0)
+                
         # <SEG>トークンのマスクを作成
         seg_token_mask = input_ids[:, 1:] == self.seg_token_idx
         seg_token_mask = torch.cat(
