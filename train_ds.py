@@ -119,6 +119,17 @@ def main(args):
     else:
         writer = None
 
+    # NCCL環境変数を設定
+    os.environ["NCCL_DEBUG"] = "INFO"  # NCCLのデバッグ情報を表示
+    os.environ["NCCL_IB_DISABLE"] = "1"  # InfiniBandを無効化（問題がある場合）
+    os.environ["NCCL_P2P_DISABLE"] = "1"  # P2P通信を無効化（問題がある場合）
+    
+    # GPUの可視性を確認
+    print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
+    print(f"Available GPUs: {torch.cuda.device_count()}")
+    for i in range(torch.cuda.device_count()):
+        print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+
     # Create model
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.version,
@@ -412,32 +423,93 @@ def main(args):
         },
         "gradient_clipping": 1.0,
         "zero_optimization": {
-            "stage": 2,
+            "stage": 3,
             "contiguous_gradients": True,
             "overlap_comm": True,
             "reduce_scatter": True,
             "reduce_bucket_size": 5e8,
             "allgather_bucket_size": 5e8,
+            "offload_optimizer": {
+                "device": "cpu",
+                "pin_memory": True
+            },
+            "offload_param": {
+                "device": "cpu",
+                "pin_memory": True
+            },
+            "stage3_prefetch_bucket_size": 5e8,
+            "stage3_param_persistence_threshold": 1e6
         },
+        "communication_data_type": "fp32",
+        "prescale_gradients": False,
+        "wall_clock_breakdown": False,
+        "comms_logger": {
+            "enabled": False,
+            "verbose": False,
+            "prof_all": False,
+            "debug": False
+        }
     }
     
     # DeepSpeedの初期化前に注意事項を表示
     print("DeepSpeedの初期化を開始します（meta tensorがある場合にエラーが発生する可能性があります）")
     print("問題が発生した場合は、モデルをCPUに完全に移動してからDeepSpeedを初期化してください")
     
-    model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
-        model=model,
-        model_parameters=model.parameters(),
-        training_data=train_dataset,
-        collate_fn=partial(
-            collate_fn,
-            tokenizer=tokenizer,
-            conv_type=args.conv_type,
-            use_mm_start_end=args.use_mm_start_end,
-            local_rank=args.local_rank,
-        ),
-        config=ds_config,
-    )
+    try:
+        model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
+            model=model,
+            model_parameters=model.parameters(),
+            training_data=train_dataset,
+            collate_fn=partial(
+                collate_fn,
+                tokenizer=tokenizer,
+                conv_type=args.conv_type,
+                use_mm_start_end=args.use_mm_start_end,
+                local_rank=args.local_rank,
+                processor=processor,
+            ),
+            config=ds_config,
+        )
+    except RuntimeError as e:
+        if "NCCL error" in str(e):
+            print("\n" + "="*80)
+            print("NCCLエラーが発生しました。単一GPUモードにフォールバックします。")
+            print("エラー詳細:", str(e))
+            print("="*80 + "\n")
+            
+            # 単一GPUモードの設定
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(args.local_rank)
+            print(f"単一GPUモード: CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
+            
+            # Zero-3をZero-2に変更
+            ds_config["zero_optimization"]["stage"] = 2
+            if "offload_optimizer" in ds_config["zero_optimization"]:
+                del ds_config["zero_optimization"]["offload_optimizer"]
+            if "offload_param" in ds_config["zero_optimization"]:
+                del ds_config["zero_optimization"]["offload_param"]
+            if "stage3_prefetch_bucket_size" in ds_config["zero_optimization"]:
+                del ds_config["zero_optimization"]["stage3_prefetch_bucket_size"]
+            if "stage3_param_persistence_threshold" in ds_config["zero_optimization"]:
+                del ds_config["zero_optimization"]["stage3_param_persistence_threshold"]
+            
+            # 再試行
+            model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
+                model=model,
+                model_parameters=model.parameters(),
+                training_data=train_dataset,
+                collate_fn=partial(
+                    collate_fn,
+                    tokenizer=tokenizer,
+                    conv_type=args.conv_type,
+                    use_mm_start_end=args.use_mm_start_end,
+                    local_rank=args.local_rank,
+                    processor=processor,
+                ),
+                config=ds_config,
+            )
+        else:
+            # NCCLエラー以外は再発生
+            raise
 
     if args.auto_resume and len(args.resume) == 0:
         resume = os.path.join(args.log_dir, "ckpt_model")
