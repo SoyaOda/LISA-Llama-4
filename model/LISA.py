@@ -197,6 +197,18 @@ class LisaModel(nn.Module):
         self.seg_token_idx = None
         self.vision_pretrained = vision_pretrained
         
+        # 量子化オプションを設定
+        quantization_config = None
+        if load_in_8bit or load_in_4bit:
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=load_in_8bit,
+                load_in_4bit=load_in_4bit,
+                bnb_4bit_compute_dtype=torch_dtype,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4"
+            )
+            print(f"量子化設定: 8ビット={load_in_8bit}, 4ビット={load_in_4bit}")
+        
         # configオブジェクトを初期化
         try:
             # MllamaConfigを使用してconfigを作成
@@ -220,108 +232,81 @@ class LisaModel(nn.Module):
         
         # Llama 3.2 Visionモデルを初期化
         try:
-            print(f"MllamaForConditionalGenerationを初期化します: {model_id}")
-            print(f"torch_dtype: {torch_dtype}")
-            from transformers import MllamaForConditionalGeneration
-            self.model = MllamaForConditionalGeneration.from_pretrained(
+            # AutoModelForVision2Seqを使用してモデルをロード
+            from transformers import AutoModelForVision2Seq, AutoProcessor
+            print(f"AutoModelForVision2Seqを使用してモデルをロードします: {model_id}")
+            print(f"デバイスマップ: {device_map}, データ型: {torch_dtype}")
+
+            # メモリを節約するための設定
+            self.model = AutoModelForVision2Seq.from_pretrained(
                 model_id,
                 device_map=device_map,
-                torch_dtype=torch_dtype
+                torch_dtype=torch_dtype,
+                quantization_config=quantization_config
             )
-            print("MllamaForConditionalGenerationの初期化が成功しました")
+            print("モデルのロードに成功しました")
             
-            # モデルをトレーニングモードに設定し、勾配計算を有効化
-            self.model.train()
-            
-            # パラメータのrequires_gradをチェック
-            param_requires_grad = sum(p.requires_grad for p in self.model.parameters())
-            total_params = sum(1 for p in self.model.parameters())
-            print(f"トレーニング可能なパラメータ: {param_requires_grad}/{total_params}")
-            
-            # 勾配計算が必要なパラメータがない場合は警告
-            if param_requires_grad == 0:
-                print("警告: モデルにトレーニング可能なパラメータがありません")
-                # 勾配計算を有効化（例：最後の層など）
-                try:
-                    # LM headの勾配計算を有効化
-                    if hasattr(self.model, "lm_head"):
-                        print("lm_headの勾配計算を有効化します")
-                        for param in self.model.lm_head.parameters():
-                            param.requires_grad = True
-                except Exception as e:
-                    print(f"パラメータの勾配設定中にエラーが発生しました: {e}")
-            
-        except Exception as e:
-            print(f"MllamaForConditionalGenerationの初期化中にエラーが発生しました: {e}")
-            print("AutoModelForVision2Seqで再試行します")
+            # プロセッサを初期化
             try:
-                from transformers import AutoModelForVision2Seq
-                self.model = AutoModelForVision2Seq.from_pretrained(
-                    model_id,
-                    device_map=device_map,
-                    torch_dtype=torch_dtype
-                )
-                print("AutoModelForVision2Seqの初期化が成功しました")
+                print(f"プロセッサを初期化します: {model_id}")
+                self.processor = AutoProcessor.from_pretrained(model_id)
+                print("プロセッサの初期化に成功しました")
             except Exception as e:
-                print(f"AutoModelForVision2Seqの初期化中もエラーが発生しました: {e}")
-                raise
-        
-        # プロセッサを初期化
-        try:
-            print(f"プロセッサを初期化します: {model_id}")
-            from transformers import AutoProcessor
-            self.processor = AutoProcessor.from_pretrained(model_id)
-            print("プロセッサの初期化が成功しました")
+                print(f"プロセッサの初期化中にエラーが発生しました: {e}")
+                self.processor = None
+                
         except Exception as e:
-            print(f"プロセッサの初期化中にエラーが発生しました: {e}")
-            self.processor = None  # プロセッサなしで続行
+            print(f"モデル初期化中にエラーが発生しました: {e}")
+            import traceback
+            traceback.print_exc()
+            self.model = None
+            self.processor = None
+            raise ValueError(f"モデルの初期化に失敗しました: {e}")
         
-        # SAMビジョンエンコーダーの初期化または設定
-        print("SAMビジョンエンコーダーを設定中...")
+        # SAMビジョンエンコーダーの初期化
+        print("SAMビジョンエンコーダーを初期化します")
         if sam_vision_encoder is not None:
             self.visual_model = sam_vision_encoder
             print("提供されたSAMビジョンエンコーダーを使用します")
         else:
-            print("SAMビジョンエンコーダーを初期化します")
+            # SAMビジョンエンコーダーを構築
             try:
-                # 直接インポートしたbuild_sam_vit_hを使用
-                vision_pretrained = self.vision_pretrained
                 if vision_pretrained:
-                    print(f"SAMモデルをロード: {vision_pretrained}")
+                    print(f"SAMビジョンエンコーダーを構築します: {vision_pretrained}")
+                    from .segment_anything import build_sam_vit_h
                     self.visual_model = build_sam_vit_h(checkpoint=vision_pretrained)
-                    print("SAMモデルの初期化が成功しました")
+                    print("SAMビジョンエンコーダーの構築に成功しました")
                 else:
-                    print("警告: SAMモデルのチェックポイントが指定されていません")
+                    print("警告: vision_pretrainedが指定されていないため、SAMビジョンエンコーダーを初期化していません")
                     self.visual_model = None
             except Exception as e:
                 print(f"SAMビジョンエンコーダーの初期化中にエラーが発生しました: {e}")
-                traceback.print_exc()  # スタックトレースを出力
+                traceback.print_exc()
                 self.visual_model = None
-        
-        # マスクデコーダーの初期化または設定
-        print("マスクデコーダーを設定中...")
+                raise ValueError(f"SAMビジョンエンコーダーの初期化に失敗しました: {e}")
+
+        # マスクデコーダーの初期化
+        print("マスクデコーダーを初期化します")
         if mask_decoder is not None:
             self.mask_decoder = mask_decoder
             print("提供されたマスクデコーダーを使用します")
+        elif hasattr(self, 'visual_model') and self.visual_model is not None:
+            print("SAMのマスクデコーダーを使用します")
+            self.mask_decoder = self.visual_model.mask_decoder
         else:
-            print("マスクデコーダーを初期化します")
-            # 何らかのデフォルトマスクデコーダーをここで初期化
-            # ただし、実際の実装ではユーザーが事前に初期化したデコーダーを提供することが望ましい
+            print("警告: マスクデコーダーを初期化していません")
             self.mask_decoder = None
         
-        # マスクデコーダーのパラメータの勾配設定
-        if self.mask_decoder is not None:
-            for p in self.mask_decoder.parameters():
-                p.requires_grad = train_mask_decoder
-            print(f"マスクデコーダーの訓練設定: {train_mask_decoder}")
-            
-            # マスクデコーダーの入力用の投影層の初期化
-            self.mlp = nn.Sequential(
-                nn.Linear(self.model.config.hidden_size, self.out_dim),
-                nn.GELU(),
-                nn.Linear(self.out_dim, self.out_dim)
-            )
-            
+        # トレーニング設定
+        if not train_mask_decoder and hasattr(self, 'mask_decoder') and self.mask_decoder is not None:
+            print("マスクデコーダーをフリーズします")
+            for param in self.mask_decoder.parameters():
+                param.requires_grad = False
+                
+        # デバイス情報の表示
+        if hasattr(self, 'model') and self.model is not None:
+            print(f"初期化されたモデルのデバイス: {next(self.model.parameters()).device}")
+        
     def resize_token_embeddings(self, new_num_tokens):
         """
         トークン埋め込みのサイズを変更します。
@@ -361,7 +346,7 @@ class LisaModel(nn.Module):
             return self.model
         else:
             print("警告: resize_token_embeddingsメソッドがモデルにありません")
-            return self
+            return None
             
     def get_processor(self):
         """
@@ -451,17 +436,48 @@ class LisaModel(nn.Module):
                 if isinstance(input_ids, torch.Tensor):
                     if tokenizer is None:
                         raise ValueError("テンソル形式のinput_idsに対してtokenizerが必要です")
+                    
                     # トークンIDをテキストにデコード
-                    text_input = tokenizer.batch_decode(input_ids, skip_special_tokens=False)
+                    decoded_texts = tokenizer.batch_decode(input_ids, skip_special_tokens=False)
+                    
+                    # 各テキストに画像トークンが含まれているか確認し、なければ追加
+                    processed_texts = []
+                    for text in decoded_texts:
+                        # 画像トークンがない場合は、テキストの先頭に追加
+                        if "<|image|>" not in text:
+                            text = "<|image|> " + text
+                        processed_texts.append(text)
+                    
+                    text_input = processed_texts
                 else:
                     # すでに文字列または文字列のリストの場合
-                    text_input = input_ids
+                    text_input = []
+                    if isinstance(input_ids, str):
+                        input_ids = [input_ids]
+                        
+                    for text in input_ids:
+                        if "<|image|>" not in text:
+                            text = "<|image|> " + text
+                        text_input.append(text)
                 
                 # 画像入力の準備
                 images_for_processor = None
                 if images_clip is not None:
                     # テンソルからPILイメージに変換
                     try:
+                        from PIL import Image
+                        import numpy as np
+                        
+                        # 画像の形状を確認
+                        print(f"images_clip形状: {images_clip.shape}")
+                        
+                        # 6次元の場合の処理（特殊なケース）
+                        if images_clip.dim() == 6:
+                            print("6次元の画像テンソルを検出しました。最初の画像のみを使用します。")
+                            # 最初の有効な画像を抽出 - 最初の3次元を取得
+                            images_clip = images_clip[0, 0]
+                            print(f"抽出後のimages_clip形状: {images_clip.shape}")
+                        
                         # 単一画像か複数画像かを確認
                         if len(images_clip.shape) == 4:  # [batch, channels, height, width]
                             images_for_processor = []
@@ -482,13 +498,33 @@ class LisaModel(nn.Module):
                     except Exception as e:
                         print(f"画像変換中にエラーが発生しました: {e}")
                         traceback.print_exc()
-                        # 変換に失敗した場合、元のテンソルを使用
-                        images_for_processor = images_clip
+                        # エラーを表示して中断（デバッグのため）
+                        raise ValueError(f"画像変換中にエラーが発生しました: {e}")
+                
+                # 画像とテキストの数が一致していることを確認
+                if images_for_processor is not None:
+                    num_images = len(images_for_processor)
+                    num_texts = len(text_input)
+                    
+                    if num_images != num_texts:
+                        print(f"警告: 画像数({num_images})とテキスト数({num_texts})が一致しません。調整します。")
+                        # 画像数に合わせてテキストを調整
+                        if num_images > num_texts:
+                            # テキストを複製
+                            text_input = text_input * (num_images // num_texts + 1)
+                            text_input = text_input[:num_images]
+                        else:
+                            # 画像を複製（ただし実際には実装が複雑なので、エラーを発生させる）
+                            raise ValueError(f"テキスト数({num_texts})が画像数({num_images})より多いため、処理できません。")
                 
                 # プロセッサを実行して入力を準備
                 try:
                     # デバイスを確認
                     device = next(self.model.parameters()).device
+                    
+                    print(f"プロセッサに渡す情報 - テキスト数: {len(text_input)}, 画像数: {len(images_for_processor) if images_for_processor else 0}")
+                    for i, txt in enumerate(text_input):
+                        print(f"  テキスト{i}: {txt[:50]}...")
                     
                     # プロセッサ実行
                     processor_inputs = processor(
@@ -523,14 +559,15 @@ class LisaModel(nn.Module):
                 except Exception as e:
                     print(f"プロセッサ実行中にエラーが発生しました: {e}")
                     traceback.print_exc()
-                    processor_inputs = None
+                    # エラーを表示して中断（デバッグのため）
+                    raise ValueError(f"プロセッサ実行中にエラーが発生しました: {e}")
             else:
                 print("プロセッサが利用できないため、入力を手動で準備します")
                 processor_inputs = None
         except Exception as e:
             print(f"入力準備中にエラーが発生しました: {e}")
             traceback.print_exc()
-            processor_inputs = None
+            raise ValueError(f"入力準備中にエラーが発生しました: {e}")
         
         # モデル実行（Llama3.2 Vision）
         vision_x = None
@@ -1004,7 +1041,7 @@ class LISAForCausalLM(nn.Module, GenerationMixin):
             vision_pretrained=kwargs.get("vision_pretrained", None),
             load_in_8bit=kwargs.get("load_in_8bit", False),  # 8ビット量子化オプション
             load_in_4bit=kwargs.get("load_in_4bit", False)   # 4ビット量子化オプション
-            )
+        )
         
         # オリジナルLISAとの互換性のために、model属性も追加
         self.model = self.lisa_model
@@ -1177,55 +1214,102 @@ class LISAForCausalLM(nn.Module, GenerationMixin):
                         import numpy as np
                         from PIL import Image
                         
+                        # 画像の形状を確認
+                        print(f"推論用画像形状: {images.shape}")
+                        
+                        # 6次元の場合の処理（特殊なケース）
+                        if images.dim() == 6:
+                            print("6次元の画像テンソルを検出しました。最初の画像のみを使用します。")
+                            # 最初の有効な画像を抽出
+                            images = images[0, 0]
+                            print(f"抽出後の画像形状: {images.shape}")
+                        
                         # バッチサイズを取得
-                        batch_size = images.shape[0]
+                        batch_size = images.shape[0] if len(images.shape) >= 4 else 1
                         pil_images = []
                         
                         # テンソルをPILイメージに変換
-                        for i in range(batch_size):
-                            # チャネルを最後に移動
-                            img_np = images[i].permute(1, 2, 0).cpu().numpy()
+                        if len(images.shape) == 4:  # [batch, channels, height, width]
+                            for i in range(batch_size):
+                                # チャネルを最後に移動
+                                img_np = images[i].permute(1, 2, 0).cpu().numpy()
+                                img_np = np.clip(img_np, 0, 1)
+                                img_np = (img_np * 255).astype(np.uint8)
+                                pil_images.append(Image.fromarray(img_np))
+                        else:
+                            # 単一画像の場合
+                            img_np = images.permute(1, 2, 0).cpu().numpy()
                             img_np = np.clip(img_np, 0, 1)
                             img_np = (img_np * 255).astype(np.uint8)
-                            pil_images.append(Image.fromarray(img_np))
+                            pil_images = [Image.fromarray(img_np)]
+                            batch_size = 1
                         
-                        # テキスト入力を用意
-                        text = [""] * batch_size  # 空のテキスト
+                        # テキスト入力を用意 - 必ず<|image|>トークンを含める
+                        text = []
+                        for _ in range(batch_size):
+                            # 空文字列でも<|image|>トークンが解釈される
+                            text.append("<|image|>")
                         
-                        # プロセッサを使用
-                        device = images.device
+                        print(f"プロセッサに渡す情報 - テキスト数: {len(text)}, 画像数: {len(pil_images)}")
+                        
+                        # デバイスを確認
+                        device = images.device if hasattr(images, 'device') else "cuda" if torch.cuda.is_available() else "cpu"
                         image_inputs = processor(text=text, images=pil_images, return_tensors="pt", padding=True)
                         
                         # デバイスを合わせる
                         for k, v in image_inputs.items():
                             if isinstance(v, torch.Tensor):
                                 image_inputs[k] = v.to(device)
+                                
+                        # バッチ入力に追加
+                        for k, v in image_inputs.items():
+                            batch_inputs[k] = v
+                            
+                        # 入力の形状とデータ型を表示（デバッグ用）
+                        for key, value in batch_inputs.items():
+                            if isinstance(value, torch.Tensor):
+                                print(f"  - {key}: 形状={value.shape}, データ型={value.dtype}, デバイス={value.device}")
+                            else:
+                                print(f"  - {key}: タイプ={type(value)}")
                     else:
-                        print("警告: 画像がテンソル形式ではありません")
-                        # フォールバック: 直接pixel_valuesとaspect_ratio_idsを設定
-                        batch_inputs["pixel_values"] = images
-                        batch_size = images.shape[0]
-                        device = images.device
-                        batch_inputs["aspect_ratio_ids"] = torch.zeros(batch_size, dtype=torch.long, device=device)
+                        print("警告: 画像がテンソル形式ではありません。直接処理します。")
+                        # 直接PILイメージとして処理
+                        pil_images = images if isinstance(images, list) else [images]
+                        batch_size = len(pil_images)
+                        
+                        # テキスト入力を用意
+                        text = ["<|image|>"] * batch_size
+                        
+                        # プロセッサを使用
+                        device = "cuda" if torch.cuda.is_available() else "cpu"
+                        image_inputs = processor(text=text, images=pil_images, return_tensors="pt", padding=True)
+                        
+                        # デバイスを合わせる
+                        for k, v in image_inputs.items():
+                            if isinstance(v, torch.Tensor):
+                                image_inputs[k] = v.to(device)
+                                
+                        # バッチ入力に追加
+                        for k, v in image_inputs.items():
+                            batch_inputs[k] = v
                 except Exception as e:
                     print(f"プロセッサによる画像処理中にエラーが発生しました: {e}")
+                    import traceback
                     traceback.print_exc()
-                    # フォールバック: 直接pixel_valuesとaspect_ratio_idsを設定
-                    batch_inputs["pixel_values"] = images
-                    batch_size = images.shape[0]
-                    device = images.device
-                    batch_inputs["aspect_ratio_ids"] = torch.zeros(batch_size, dtype=torch.long, device=device)
+                    # エラーを表示して中断（デバッグのため）
+                    raise ValueError(f"推論用の画像処理中にエラーが発生しました: {e}")
             else:
                 # プロセッサが利用できない場合は直接設定
+                print("プロセッサが利用できないため、画像を直接pixel_valuesとして設定します")
                 batch_inputs["pixel_values"] = images
-                batch_size = images.shape[0]
-                device = images.device
+                batch_size = images.shape[0] if len(images.shape) >= 4 else 1
+                device = images.device if hasattr(images, 'device') else "cuda" if torch.cuda.is_available() else "cpu"
                 batch_inputs["aspect_ratio_ids"] = torch.zeros(batch_size, dtype=torch.long, device=device)
 
         # aspect_ratio_idsが含まれていることを確認
         if "pixel_values" in batch_inputs and "aspect_ratio_ids" not in batch_inputs:
             print("警告: pixel_valuesがありますが、aspect_ratio_idsがありません。デフォルト値を設定します。")
-            device = batch_inputs["pixel_values"].device
+            device = batch_inputs["pixel_values"].device if hasattr(batch_inputs["pixel_values"], 'device') else "cuda" if torch.cuda.is_available() else "cpu"
             batch_size = batch_inputs["pixel_values"].shape[0]
             batch_inputs["aspect_ratio_ids"] = torch.zeros(batch_size, dtype=torch.long, device=device)
 
