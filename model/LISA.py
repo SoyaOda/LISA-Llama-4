@@ -115,10 +115,10 @@ class LisaMetaModel:
             self.config.out_dim = kwargs.get("out_dim", 256)
             
         # vision_pretrained設定を取得
-            self.vision_pretrained = kwargs.get("vision_pretrained", None)
+        self.vision_pretrained = kwargs.get("vision_pretrained", None)
         
         # オリジナルLISAコードと同様に常にSAMを初期化
-            self.initialize_lisa_modules(self.config)
+        self.initialize_lisa_modules(self.config)
 
     def initialize_lisa_modules(self, config):
         # SAM
@@ -196,13 +196,13 @@ class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
         # MllamaConfigではmm_接頭辞がない可能性がある属性の対応
         # vision_tower
         if hasattr(self.config, "mm_vision_tower"):
-        self.config.vision_tower = self.config.mm_vision_tower
+            self.config.vision_tower = self.config.mm_vision_tower
         # 既にvision_towerが設定されている場合は何もしない（MllamaConfigの場合）
         
         # vision_select_feature
         if not hasattr(self.config, "mm_vision_select_feature"):
             # MllamaConfig用に新しく属性を追加
-        self.config.mm_vision_select_feature = "patch"
+            self.config.mm_vision_select_feature = "patch"
         
         # 他の設定属性を確実に設定
         self.config.image_aspect_ratio = "square"
@@ -211,7 +211,7 @@ class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
         self.config.freeze_mm_mlp_adapter = True
         self.config.pretrain_mm_mlp_adapter = None
         self.config.mm_use_im_patch_token = False
-
+        
         print("LisaModelの初期化: 成功しました")
 
 
@@ -630,52 +630,51 @@ class LISAForCausalLM(nn.Module):
 
     def model_forward(
         self,
-        input_ids=None,
+        input_ids,
         attention_mask=None,
-        past_key_values=None,
-        inputs_embeds=None,
+        attention_masks=None,
         labels=None,
-        use_cache=None,
-        output_attentions=None,
-        output_hidden_states=None,
         images=None,
         images_clip=None,
         masks_list=None,
-        label_list=None,
         label_masks_list=None,
-        attention_masks=None,
+        label_list=None,
+        inputs_embeds=None,
         offset=None,
         resize_list=None,
         inference=False,
-        tokenizer=None,  # デフォルト値をNoneに設定
+        tokenizer=None,
         **kwargs
     ):
-        """
-        モデルの前方伝播処理を行います。
+        """LISA/VLオブジェクトの前方伝播処理と損失計算を行う。
         
         注意: Llama 3.2 Visionモデル（MllamaForConditionalGeneration）では、
         画像入力は'images'ではなく'pixel_values'パラメータとして渡す必要があります。
-        また、'aspect_ratio_ids'も必要です。
+        このメソッドでは内部的にimages_clipを'pixel_values'として渡します。
         
+        理想的には以下の方法で入力を準備するとよいでしょう:
+        ```
+        processor = AutoProcessor.from_pretrained("meta-llama/Llama-3.2-11B-Vision-Instruct")
+        inputs = processor(text=text_prompt, images=image, return_tensors="pt")
+        outputs = model(**inputs)
+        ```
+        
+        processorは画像を適切な形式に変換し、<|image|>トークンを処理します。
+
         Args:
-            input_ids (torch.Tensor, optional): 入力ID。デフォルトはNone。
-            attention_mask (torch.Tensor, optional): アテンションマスク。デフォルトはNone。
-            past_key_values (tuple, optional): 過去のキー値。デフォルトはNone。
+            input_ids (torch.Tensor): 入力トークンのID
+            attention_mask (torch.Tensor, optional): アテンションマスク
+            attention_masks (torch.Tensor, optional): 互換性のためのアテンションマスク
+            labels (torch.Tensor, optional): ラベルデータ。デフォルトはNone。
+            images (list, optional): 画像のリスト。デフォルトはNone。
+            images_clip (list, optional): CLIP形式の画像のリスト。デフォルトはNone。
+            masks_list (list, optional): マスクのリスト。デフォルトはNone。
+            label_masks_list (list, optional): ラベルのマスクのリスト。デフォルトはNone。
+            label_list (list, optional): 互換性のためのラベルマスクのリスト。
             inputs_embeds (torch.Tensor, optional): 入力埋め込み。デフォルトはNone。
-            labels (torch.Tensor, optional): ラベル。デフォルトはNone。
-            use_cache (bool, optional): キャッシュを使用するかどうか。デフォルトはNone。
-            output_attentions (bool, optional): アテンションを出力するかどうか。デフォルトはNone。
-            output_hidden_states (bool, optional): 隠れ状態を出力するかどうか。デフォルトはNone。
-            images (torch.Tensor, optional): 画像テンソル。デフォルトはNone。
-            images_clip (torch.Tensor, optional): CLIP用の画像テンソル。デフォルトはNone。
-            masks_list (list, optional): マスクリスト。デフォルトはNone。
-            label_list (list, optional): ラベルリスト。デフォルトはNone。
-            label_masks_list (list, optional): ラベルマスクリスト。デフォルトはNone。
-            attention_masks (torch.Tensor, optional): アテンションマスク（複数形）。デフォルトはNone。
             offset (torch.Tensor, optional): オフセット値。デフォルトはNone。
             resize_list (list, optional): リサイズリスト。デフォルトはNone。
             inference (bool, optional): 推論モードかどうか。デフォルトはFalse。
-            tokenizer (object, optional): トークナイザー。デフォルトはNone。
 
         Returns:
             dict: 計算された損失と出力値を含む辞書
@@ -697,35 +696,53 @@ class LISAForCausalLM(nn.Module):
             embedding_token_seg = self.get_input_embeddings()(torch.tensor([[self.seg_token_idx]], device=device))
             embedding_token_seg = embedding_token_seg.squeeze(0)
         
-        # モデル入力を準備
-        model_inputs = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "past_key_values": past_key_values,
-            "inputs_embeds": inputs_embeds,
-            "labels": labels,
-            "use_cache": use_cache,
-            "output_attentions": output_attentions,
-            "output_hidden_states": output_hidden_states,
-        }
+        # Llama 3.2 Visionを使用するためにprocessorで入力を準備
+        # processorはpixel_valuesとaspect_ratio_idsを自動的に生成
+        processor = self.get_processor()
         
-        # Llama 3.2 Visionモデルは'images'ではなく'pixel_values'を期待します
-        # images_clipをpixel_valuesとして使用
-        if images_clip is not None:
-            # imagesパラメータ名を変更
-            model_inputs["pixel_values"] = images_clip
+        # テキスト入力の準備: Llama3.2 Vision processorは文字列または文字列のリストを期待する
+        if isinstance(input_ids, torch.Tensor):
+            if tokenizer is None:
+                # tokenizerが提供されていない場合はエラーメッセージを出力
+                raise ValueError(
+                    "テンソル形式のinput_idsが渡されましたが、tokenizerがNoneです。"
+                    "processorがテキストを処理するには、文字列データが必要です。"
+                    "tokenizerを提供するか、文字列または文字列のリスト形式のテキストを渡してください。"
+                )
+            # トークンIDをテキストにデコード
+            text_input = tokenizer.batch_decode(input_ids, skip_special_tokens=False)
+            print(f"デコードされたテキスト（デバッグ用）: {text_input[:2]}")  # 最初の2つのみ表示
+        else:
+            # すでに文字列または文字列のリストの場合はそのまま使用
+            text_input = input_ids
             
-            # aspect_ratio_idsもモデルに渡す必要があります
-            # シンプルな実装として、すべての画像が同じアスペクト比と仮定
-            if hasattr(model_inputs["pixel_values"], "shape"):
-                batch_size = model_inputs["pixel_values"].shape[0]
-                model_inputs["aspect_ratio_ids"] = torch.zeros((batch_size,), dtype=torch.long, device=device)
+        if not isinstance(text_input, (str, list)):
+            # 文字列または文字列のリストでない場合はエラー
+            raise ValueError(
+                f"text_inputの型が無効です: {type(text_input)}。"
+                "processorは文字列または文字列のリストを期待しています。"
+            )
         
-        # 不要なNoneのパラメータを削除
-        model_inputs = {k: v for k, v in model_inputs.items() if v is not None}
+        # processorで入力を準備
+        processor_inputs = processor(
+            text=text_input,
+            images=images_clip,
+            return_tensors="pt",
+            padding=True,
+        )
         
-        # モデルを呼び出す
-        outputs = self.model(**model_inputs)
+        # デバイスを合わせる
+        processor_inputs = {k: v.to(device) for k, v in processor_inputs.items()}
+        
+        # ラベルを追加（存在する場合）
+        if labels is not None:
+            processor_inputs["labels"] = labels
+            
+        # 出力のhidden statesを要求
+        processor_inputs["output_hidden_states"] = True
+        
+        # 必要なパラメータでモデルを呼び出す
+        outputs = self.model(**processor_inputs)
         
         # embeddings処理
         embeddings = torch.stack(outputs.hidden_states).squeeze(1)[-1]
@@ -902,7 +919,7 @@ class LISAForCausalLM(nn.Module):
             print(f"WARNING: [マスクNull原因] 有効なマスクペアが見つかりませんでした")
             # マスクがない場合はテキスト生成損失のみを使用
             loss = ce_loss if ce_loss is not None else torch.tensor(0., device=device)
-
+        
         return {
             "loss": loss,
             "ce_loss": ce_loss,
@@ -951,7 +968,7 @@ class LISAForCausalLM(nn.Module):
             # 必要なのは最終デコーダレイヤーの隠れ状態のみ
             output_hidden_states = outputs.hidden_states[-1][-1]  # 最後のトークンの最後のレイヤー
             output_ids = outputs.sequences
-
+            
             # 生成されたテキストを表示（デバッグ用）
             if tokenizer:
                 print("生成されたテキスト:", tokenizer.batch_decode(output_ids, skip_special_tokens=False))
@@ -1051,11 +1068,6 @@ class LISAForCausalLM(nn.Module):
         if images is not None:
             # Llama 3.2 Visionでは'images'ではなく'pixel_values'を使用
             batch_inputs["pixel_values"] = images
-            
-            # aspect_ratio_idsも追加
-            device = images.device
-            batch_size = images.shape[0]
-            batch_inputs["aspect_ratio_ids"] = torch.zeros((batch_size,), dtype=torch.long, device=device)
             
         return batch_inputs
 
