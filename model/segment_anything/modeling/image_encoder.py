@@ -380,42 +380,70 @@ def add_decomposed_rel_pos(
 
     B, _, dim = q.shape
     r_q = q.reshape(B, q_h, q_w, dim)
-    rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
-    rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
-
-    # メモリ使用量を減らすためにチャンク処理を導入
-    # 大きなテンソルの一度にリシェイプする代わりに、小さなチャンクで処理
     
-    # 各チャンクのサイズを定義
-    chunk_size = 4  # バッチサイズが大きい場合は小さな値を使用
+    # メモリ節約のためにeinsum計算を分割
+    # バッチサイズが大きい場合、一度に計算すると多くのメモリを使用するため
+    # バッチごとに計算しメモリを解放
     
-    # 出力テンソルを初期化
-    attn_out = torch.zeros_like(attn)
+    # チャンクサイズを定義
+    chunk_size = max(1, B // 4)  # バッチサイズに基づいてチャンクサイズを調整
     
-    # チャンク処理
+    # メモリ効率のため、結果を格納するリスト
+    rel_h_chunks = []
+    rel_w_chunks = []
+    
+    # チャンク処理: einsum計算を分割
     for i in range(0, B, chunk_size):
         end_idx = min(i + chunk_size, B)
-        chunk_batch_size = end_idx - i
+        r_q_chunk = r_q[i:end_idx]
         
-        # 現在のチャンクを処理
-        with torch.cuda.amp.autocast(enabled=True):  # 半精度計算でメモリ使用量を減らす
-            # 現在のバッチチャンクを取得
-            attn_chunk = attn[i:end_idx]
-            rel_h_chunk = rel_h[i:end_idx]
-            rel_w_chunk = rel_w[i:end_idx]
-            
-            # リシェイプとREPE計算を実行
-            attn_reshaped = attn_chunk.view(chunk_batch_size, q_h, q_w, k_h, k_w)
-            attn_with_rel_h = attn_reshaped + rel_h_chunk[:, :, :, :, None]
-            attn_with_rel_pos = attn_with_rel_h + rel_w_chunk[:, :, :, None, :]
-            
-            # 元の形状に戻す
-            attn_out[i:end_idx] = attn_with_rel_pos.view(chunk_batch_size, q_h * q_w, k_h * k_w)
+        # 各チャンクに対してeinsum計算
+        rel_h_chunk = torch.einsum("bhwc,hkc->bhwk", r_q_chunk, Rh)
+        rel_w_chunk = torch.einsum("bhwc,wkc->bhwk", r_q_chunk, Rw)
         
-        # 不要なキャッシュをクリア
-        torch.cuda.empty_cache()
+        rel_h_chunks.append(rel_h_chunk)
+        rel_w_chunks.append(rel_w_chunk)
+        
+        # 明示的なメモリ解放
+        del r_q_chunk
+        if i % (chunk_size * 4) == 0:  # 定期的にキャッシュをクリア
+            torch.cuda.empty_cache()
     
-    return attn_out
+    # チャンクを結合
+    rel_h = torch.cat(rel_h_chunks, dim=0)
+    rel_w = torch.cat(rel_w_chunks, dim=0)
+    
+    del rel_h_chunks, rel_w_chunks
+    torch.cuda.empty_cache()
+    
+    # チャンク処理による最終的なアテンション計算
+    # 大きなテンソルを一度に作成するのではなく、チャンクごとに計算して結合
+    result_chunks = []
+    
+    for i in range(0, B, chunk_size):
+        end_idx = min(i + chunk_size, B)
+        
+        # 現在のチャンクを取得
+        attn_chunk = attn[i:end_idx]
+        rel_h_chunk = rel_h[i:end_idx]
+        rel_w_chunk = rel_w[i:end_idx]
+        
+        # チャンクごとの計算
+        chunk_result = (
+            attn_chunk.view(end_idx - i, q_h, q_w, k_h, k_w)
+            + rel_h_chunk[:, :, :, :, None]
+            + rel_w_chunk[:, :, :, None, :]
+        ).view(end_idx - i, q_h * q_w, k_h * k_w)
+        
+        result_chunks.append(chunk_result)
+        
+        # 不要なメモリを解放
+        del attn_chunk, rel_h_chunk, rel_w_chunk, chunk_result
+        if i % (chunk_size * 4) == 0:  # 定期的にキャッシュをクリア
+            torch.cuda.empty_cache()
+    
+    # 結果を結合
+    return torch.cat(result_chunks, dim=0)
 
 
 class PatchEmbed(nn.Module):

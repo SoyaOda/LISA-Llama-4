@@ -37,7 +37,7 @@ def parse_args(args):
         choices=["fp32", "bf16", "fp16"],
         help="precision for inference",
     )
-    parser.add_argument("--image_size", default=1024, type=int, help="image size")
+    parser.add_argument("--image_size", default=768, type=int, help="image size for SAM model (smaller values use less GPU memory)")
     parser.add_argument("--model_max_length", default=512, type=int)
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument(

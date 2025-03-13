@@ -196,13 +196,13 @@ class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
         # MllamaConfigではmm_接頭辞がない可能性がある属性の対応
         # vision_tower
         if hasattr(self.config, "mm_vision_tower"):
-        self.config.vision_tower = self.config.mm_vision_tower
+            self.config.vision_tower = self.config.mm_vision_tower
         # 既にvision_towerが設定されている場合は何もしない（MllamaConfigの場合）
         
         # vision_select_feature
         if not hasattr(self.config, "mm_vision_select_feature"):
             # MllamaConfig用に新しく属性を追加
-        self.config.mm_vision_select_feature = "patch"
+            self.config.mm_vision_select_feature = "patch"
         
         # 他の設定属性を確実に設定
         self.config.image_aspect_ratio = "square"
@@ -611,15 +611,40 @@ class LISAForCausalLM(nn.Module):
 
     def get_visual_embs(self, pixel_values: torch.FloatTensor):
         with torch.no_grad():
+            # バッチサイズが大きい場合は分割処理
+            batch_size = pixel_values.shape[0]
+            max_batch_per_iter = 1  # GPUメモリに余裕がある場合は2や4に増やせます
+            
             image_embeddings_list = []
-            for i in range(pixel_values.shape[0]):
+            
+            # 入力解像度の取得
+            original_h, original_w = pixel_values.shape[-2:]
+            
+            # 処理中に一時的にbf16/fp16に変換してメモリ使用量を削減
+            original_dtype = pixel_values.dtype
+            
+            for i in range(0, batch_size, max_batch_per_iter):
+                # 毎回明示的にキャッシュをクリア
                 torch.cuda.empty_cache()
-                image_embeddings = self.lisa_model.visual_model.image_encoder(
-                    pixel_values[i].unsqueeze(0)
-                )
-                image_embeddings_list.append(image_embeddings)
+                
+                # バッチの切り出し
+                end_idx = min(i + max_batch_per_iter, batch_size)
+                current_batch = pixel_values[i:end_idx]
+                
+                # bf16/fp16での処理（メモリ効率化）
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    # SAMのイメージエンコーダーを実行
+                    image_embeddings = self.lisa_model.visual_model.image_encoder(current_batch)
+                    
+                    # 元の精度に戻す
+                    image_embeddings = image_embeddings.to(original_dtype)
+                    
+                    image_embeddings_list.append(image_embeddings)
+            
+            # 最終的なバッチの結合
             torch.cuda.empty_cache()
             image_embeddings = torch.cat(image_embeddings_list, 0)
+            
         return image_embeddings
 
     def forward(self, **kwargs):
