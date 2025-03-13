@@ -27,6 +27,9 @@ from transformers.utils import is_flash_attn_2_available
 import json
 from PIL import Image
 
+# SAMモデルをインポート
+from model.segment_anything import build_sam_vit_h
+
 # llama3_2モジュールからのインポートパスを修正
 try:
     from model.llama3_2.model.language_model.llama3_2 import Llama3VisionMetaModel
@@ -255,30 +258,18 @@ class LisaModel(nn.Module):
         else:
             print("SAMビジョンエンコーダーを初期化します")
             try:
-                from .segment_anything import build_sam_vit_h
+                # 直接インポートしたbuild_sam_vit_hを使用
                 vision_pretrained = self.vision_pretrained
                 if vision_pretrained:
                     print(f"SAMモデルをロード: {vision_pretrained}")
                     self.visual_model = build_sam_vit_h(checkpoint=vision_pretrained)
+                    print("SAMモデルの初期化が成功しました")
                 else:
                     print("警告: SAMモデルのチェックポイントが指定されていません")
                     self.visual_model = None
-            except ImportError:
-                try:
-                    # 別のインポートパスを試す
-                    from model.segment_anything import build_sam_vit_h
-                    vision_pretrained = self.vision_pretrained
-                    if vision_pretrained:
-                        print(f"SAMモデルをロード: {vision_pretrained}")
-                        self.visual_model = build_sam_vit_h(checkpoint=vision_pretrained)
-                    else:
-                        print("警告: SAMモデルのチェックポイントが指定されていません")
-                        self.visual_model = None
-                except Exception as e:
-                    print(f"SAMビジョンエンコーダーの初期化中にエラーが発生しました: {e}")
-                    self.visual_model = None
             except Exception as e:
                 print(f"SAMビジョンエンコーダーの初期化中にエラーが発生しました: {e}")
+                traceback.print_exc()  # スタックトレースを出力
                 self.visual_model = None
         
         # マスクデコーダーの初期化または設定
@@ -307,62 +298,58 @@ class LisaModel(nn.Module):
             
     def resize_token_embeddings(self, new_num_tokens):
         """
-        トークン埋め込みをリサイズする
+        トークン埋め込みのサイズを変更します。
         
         Args:
             new_num_tokens: 新しいトークン数
-        
+            
         Returns:
-            リサイズされたモデル
+            更新されたモデル
         """
-        try:
-            if not hasattr(self, 'model'):
-                print("警告: self.modelが存在しません。トークン埋め込みはリサイズできません。")
-                return
+        if hasattr(self.model, "resize_token_embeddings"):
+            print(f"resize_token_embeddingsメソッドを呼び出します: {new_num_tokens}")
+            # モデルのトークン埋め込みのサイズを変更
+            self.model.resize_token_embeddings(new_num_tokens)
+            
+            # 出力埋め込みのサイズも変更（Llama3.2は入出力の埋め込みが分離しているため）
+            if hasattr(self.model, "lm_head"):
+                print("lm_headのサイズも変更します")
+                current_lm_head = self.model.lm_head
+                input_embeddings = self.model.model.embed_tokens
                 
-            print(f"モデルの埋め込みをリサイズします: {new_num_tokens}")
-            
-            # Input埋め込みのリサイズ
-            try:
-                self.model.resize_token_embeddings(new_num_tokens)
-                print("Input埋め込みのリサイズに成功しました")
-            except Exception as e:
-                print(f"Input埋め込みのリサイズ中にエラーが発生しました: {e}")
-            
-            # Output埋め込み（LM head）のリサイズ
-            # LM headがtiedされていない場合に必要
-            try:
-                lm_head = self.model.get_output_embeddings()
-                if lm_head is not None:
-                    old_num_tokens, emb_dim = lm_head.weight.shape
-                    if old_num_tokens != new_num_tokens:
-                        print(f"Output埋め込み（LM head）もリサイズします: {old_num_tokens} -> {new_num_tokens}")
-                        
-                        # 新しい線形層を作成
-                        new_lm_head = nn.Linear(
-                            in_features=emb_dim, 
-                            out_features=new_num_tokens, 
-                            bias=lm_head.bias is not None
-                        )
-                        
-                        # 既存の重みとバイアスをコピー
-                        new_lm_head.weight.data[:old_num_tokens, :] = lm_head.weight.data
-                        if lm_head.bias is not None:
-                            new_lm_head.bias.data[:old_num_tokens] = lm_head.bias.data
-                        
-                        # 新しいLM headを設定
-                        self.model.set_output_embeddings(new_lm_head)
-                        print("Output埋め込み（LM head）のリサイズに成功しました")
-                else:
-                    print("Output埋め込み（LM head）が見つかりません")
-            except Exception as e:
-                print(f"Output埋め込み（LM head）のリサイズ中にエラーが発生しました: {e}")
+                # 新しいlm_headを作成
+                new_lm_head = nn.Linear(
+                    input_embeddings.embedding_dim, new_num_tokens, bias=current_lm_head.bias is not None
+                )
+                
+                # 既存の重みをコピー
+                new_lm_head.weight.data[:current_lm_head.weight.data.shape[0]] = current_lm_head.weight.data
+                
+                # バイアスがある場合はそれもコピー
+                if current_lm_head.bias is not None:
+                    new_lm_head.bias.data[:current_lm_head.bias.data.shape[0]] = current_lm_head.bias.data
+                
+                # モデルの出力レイヤーを更新
+                self.model.lm_head = new_lm_head
                 
             return self.model
-        except Exception as e:
-            print(f"resize_token_embeddings中にエラーが発生しました: {e}")
+        else:
+            print("警告: resize_token_embeddingsメソッドがモデルにありません")
+            return self
+            
+    def get_processor(self):
+        """
+        モデルのprocessorを取得します。
+        
+        Returns:
+            processor: モデルのprocessor、設定されていない場合はNone
+        """
+        if hasattr(self, "processor"):
+            return self.processor
+        else:
+            print("警告: processorが設定されていません")
             return None
-
+    
     def forward(self, **kwargs):
         """
         モデルの前方伝播。
@@ -418,7 +405,15 @@ class LisaModel(nn.Module):
             if labels is not None and labels.dim() == 1:
                 labels = labels.unsqueeze(0)
 
-        processor = self.get_processor()
+        # プロセッサを取得
+        try:
+            processor = self.get_processor()
+            if processor is None:
+                raise ValueError("processorが初期化されていません。model_forwardメソッドを実行できません。")
+        except AttributeError as e:
+            print(f"[エラー情報] プロセッサの取得中にエラーが発生しました: {e}")
+            print("データの処理を続行しますが、一部の機能が制限される可能性があります。")
+            processor = None
         
         # テキスト入力の準備: Llama3.2 Vision processorは文字列または文字列のリストを期待する
         if isinstance(input_ids, torch.Tensor):
@@ -1078,10 +1073,10 @@ class LisaModel(nn.Module):
 
     def get_visual_embs(self, images):
         """
-        SAMのvisual_modelを使用して画像埋め込みを取得します
+        SAMの画像エンコーダーを使用して視覚的特徴を抽出します。
         
         Args:
-            images: 入力画像テンソル [batch_size, channels, height, width]
+            images: 入力画像テンソル
             
         Returns:
             image_embeddings: SAM画像エンコーダからの特徴
@@ -1097,11 +1092,16 @@ class LisaModel(nn.Module):
         if images.device != device:
             images = images.to(device)
             
-        with torch.no_grad():
-            # SAMイメージエンコーダを呼び出し
-            image_embeddings = self.visual_model.image_encoder(images)
-            
-        return image_embeddings
+        try:
+            with torch.no_grad():
+                # SAMイメージエンコーダを呼び出し
+                image_embeddings = self.visual_model.image_encoder(images)
+                
+            return image_embeddings
+        except Exception as e:
+            print(f"SAM画像エンコーダの実行中にエラーが発生しました: {e}")
+            traceback.print_exc()
+            raise
 
 class LISAForCausalLM(nn.Module, GenerationMixin):
     """
@@ -1209,10 +1209,10 @@ class LISAForCausalLM(nn.Module, GenerationMixin):
             
     def get_visual_embs(self, images):
         """
-        SAMのvisual_modelを使用して画像埋め込みを取得します
+        SAMの画像エンコーダーを使用して視覚的特徴を抽出します。
         
         Args:
-            images: 入力画像テンソル [batch_size, channels, height, width]
+            images: 入力画像テンソル
             
         Returns:
             image_embeddings: SAM画像エンコーダからの特徴
@@ -1228,11 +1228,16 @@ class LISAForCausalLM(nn.Module, GenerationMixin):
         if images.device != device:
             images = images.to(device)
             
-        with torch.no_grad():
-            # SAMイメージエンコーダを呼び出し
-            image_embeddings = self.visual_model.image_encoder(images)
-            
-        return image_embeddings
+        try:
+            with torch.no_grad():
+                # SAMイメージエンコーダを呼び出し
+                image_embeddings = self.visual_model.image_encoder(images)
+                
+            return image_embeddings
+        except Exception as e:
+            print(f"SAM画像エンコーダの実行中にエラーが発生しました: {e}")
+            traceback.print_exc()
+            raise
         
     def forward(self, **kwargs):
         """
