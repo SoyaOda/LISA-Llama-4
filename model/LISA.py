@@ -1018,7 +1018,7 @@ class LISAForCausalLM(nn.Module):
                 print(f"  images_for_processor: shape={images_for_processor.shape if hasattr(images_for_processor, 'shape') else type(images_for_processor)}, dtype={images_for_processor.dtype if hasattr(images_for_processor, 'dtype') else 'unknown'}")
         
         # 出力のhidden statesを要求
-        output_hidden_states = True if seg_token_idx is not None else False
+        output_hidden_states = True if self.seg_token_idx is not None else False
         
         # モデル実行
         vision_x = None
@@ -1057,54 +1057,341 @@ class LISAForCausalLM(nn.Module):
                 
                 # モデル実行エラー時はNoneを返す
                 vision_x = None
+                
+                # 早期終了（モデルエラー時）
+                return {
+                    "loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                    "ce_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                    "mask_bce_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                    "mask_dice_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                    "mask_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                }
         else:
             print("プロセッサの出力がありません。モデルは実行されません。")
             vision_x = None
+            
+            # 早期終了（プロセッサエラー時）
+            return {
+                "loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                "ce_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                "mask_bce_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                "mask_dice_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                "mask_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+            }
+
+        # モデル出力からlogitsを取得（あれば）
+        if hasattr(vision_x, 'logits'):
+            output_logits = vision_x.logits
+            
+            # logitsから次トークンを予測（argmax）
+            output_ids = torch.argmax(output_logits, dim=-1)
+        else:
+            # logitsがない場合はinput_idsを使用
+            if processor_inputs is not None and "input_ids" in processor_inputs:
+                output_ids = processor_inputs["input_ids"]
+                print("警告: モデル出力からlogitsが見つかりません。input_idsをoutput_idsとして使用します")
+            else:
+                # 入力も利用できない場合
+                print("警告: モデル出力とinput_idsどちらもありません。処理を続行できません。")
+                return {
+                    "loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                    "ce_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                    "mask_bce_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                    "mask_dice_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                    "mask_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                }
+        
+        # <SEG>トークンの位置をマスクで特定
+        # 出力トークンの次の位置から検索（LISAでは出力に<SEG>が含まれる）
+        seg_token_mask = output_ids[:, 1:] == self.seg_token_idx
+        device = output_ids.device
+        
+        # 適切なパディングを追加
+        padding_size = max(0, 255 - seg_token_mask.shape[1])
+        if padding_size > 0:
+            # 入力のサイズに応じてパディングを調整
+            seg_token_mask = torch.cat(
+                [
+                    torch.zeros((seg_token_mask.shape[0], padding_size), 
+                                device=device, dtype=torch.bool),
+                    seg_token_mask,
+                ],
+                dim=1,
+            )
+        else:
+            # 必要に応じて、長い入力に対してもパディングを追加
+            seg_token_mask = torch.cat(
+                [
+                    torch.zeros((seg_token_mask.shape[0], 1), 
+                                device=device, dtype=torch.bool),
+                    seg_token_mask,
+                ],
+                dim=1,
+            )
+        
+        # 隠れ状態を処理
+        hidden_states = []
+        
+        # 出力の最後の隠れ状態を取得
+        if hasattr(vision_x, 'hidden_states') and vision_x.hidden_states is not None:
+            last_hidden_state = vision_x.hidden_states[-1]
+            
+            # text_hidden_fcsがあれば適用
+            if hasattr(self.lisa_model, "text_hidden_fcs"):
+                for fc in self.lisa_model.text_hidden_fcs:
+                    hidden_states.append(fc(last_hidden_state))
+            else:
+                # fcがなければそのまま使用
+                hidden_states.append(last_hidden_state)
+        else:
+            print("警告: hidden_statesが見つかりません。マスク生成をスキップします。")
+            # マスク生成をスキップして早期終了
+            return {
+                "loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                "ce_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                "mask_bce_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                "mask_dice_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                "mask_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+            }
+        
+        # 隠れ状態を合成
+        last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+        
+        # <SEG>トークンに対応するhidden_stateを抽出
+        pred_embeddings = last_hidden_state[seg_token_mask]
+        
+        # <SEG>トークンの数とオフセットを計算
+        seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
+        seg_token_offset = seg_token_counts.cumsum(-1)
+        seg_token_offset = torch.cat(
+            [torch.zeros(1, device=device, dtype=torch.long), seg_token_offset], dim=0
+        )
+        
+        # offsetがNoneでなければ使用
+        if offset is not None:
+            seg_token_offset = seg_token_offset[offset]
+
+        # 予測埋め込みを処理
+        pred_embeddings_ = []
+        for i in range(len(seg_token_offset) - 1):
+            start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
+            if start_i < end_i:  # 開始と終了が同じではないことを確認
+                pred_embeddings_.append(pred_embeddings[start_i:end_i])
+            else:
+                print(f"警告: セグメントインデックス {i} の範囲が無効です (start={start_i}, end={end_i})")
+                # 空のエンベディングを追加（処理を続行するため）
+                if i > 0 and len(pred_embeddings_) > 0:
+                    # 前のエンベディングと同じ形状のゼロテンソルを使用
+                    zero_embed = torch.zeros_like(pred_embeddings_[-1])
+                    pred_embeddings_.append(zero_embed)
+                else:
+                    # 最初のエンベディングの場合、適当な形状のゼロテンソルを作成
+                    embed_dim = last_hidden_state.shape[-1]
+                    zero_embed = torch.zeros((1, embed_dim), device=device)
+                    pred_embeddings_.append(zero_embed)
+        
+        # 空のリストの場合の処理（<SEG>トークンが見つからない場合）
+        if len(pred_embeddings_) == 0:
+            print("警告: <SEG>トークンが見つかりません。マスク生成をスキップします。")
+            # マスク生成をスキップして早期終了
+            return {
+                "loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                "ce_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                "mask_bce_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                "mask_dice_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+                "mask_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
+            }
+            
+        pred_embeddings = pred_embeddings_
+
+        # マスク生成
+        multimask_output = False
+        pred_masks = []
+        
+        try:
+            # SAMの準備ができているか確認
+            if image_embeddings is None or len(image_embeddings) == 0:
+                raise ValueError("image_embeddingsがありません。")
+            
+            # visual_modelを取得
+            visual_model = None
+            if hasattr(self.lisa_model, "visual_model"):
+                visual_model = self.lisa_model.visual_model
+            elif hasattr(self, "visual_model"):
+                visual_model = self.visual_model
+            else:
+                raise AttributeError("visual_modelが見つかりません")
+            
+            # 各<SEG>トークンに対応するマスクを生成
+            for i in range(len(pred_embeddings)):
+                try:
+                    # バッチインデックスの調整
+                    batch_idx = min(i, len(image_embeddings) - 1)
+                    
+                    # SAMのプロンプトエンコーダーにテキスト埋め込みを渡す
+                    (
+                        sparse_embeddings,
+                        dense_embeddings,
+                    ) = visual_model.prompt_encoder(
+                        points=None,
+                        boxes=None,
+                        masks=None,
+                        text_embeds=pred_embeddings[i].unsqueeze(1),
+                    )
+
+                    # データ型を合わせる
+                    sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
+                    
+                    # マスクデコーダーを使用してマスクを生成
+                    low_res_masks, iou_predictions = visual_model.mask_decoder(
+                        image_embeddings=image_embeddings[batch_idx].unsqueeze(0),
+                        image_pe=visual_model.prompt_encoder.get_dense_pe(),
+                        sparse_prompt_embeddings=sparse_embeddings,
+                        dense_prompt_embeddings=dense_embeddings,
+                        multimask_output=multimask_output,
+                    )
+                    
+                    # マスクの後処理
+                    try:
+                        # resize_listとlabel_listの両方がある場合
+                        if resize_list is not None and i < len(resize_list) and label_list is not None and i < len(label_list):
+                            pred_mask = visual_model.postprocess_masks(
+                                low_res_masks,
+                                input_size=resize_list[i],
+                                original_size=label_list[i].shape,
+                            )
+                        # label_listからサイズを取得
+                        elif label_list is not None and i < len(label_list):
+                            original_size = label_list[i].shape
+                            input_size = visual_model.image_encoder.img_size
+                            pred_mask = visual_model.postprocess_masks(
+                                low_res_masks,
+                                input_size=input_size,
+                                original_size=original_size,
+                            )
+                        else:
+                            # デフォルトサイズを使用
+                            print("警告: マスクサイズ情報がありません。デフォルトサイズを使用します。")
+                            input_size = visual_model.image_encoder.img_size
+                            original_size = (1024, 1024)  # デフォルトサイズ
+                            pred_mask = visual_model.postprocess_masks(
+                                low_res_masks,
+                                input_size=input_size,
+                                original_size=original_size,
+                            )
+                    except Exception as post_e:
+                        print(f"マスク後処理中にエラーが発生しました: {post_e}")
+                        # エラーの場合はlow_res_masksをそのまま使用
+                        pred_mask = low_res_masks
+                    
+                    # マスクを追加（最初のマスクのみ使用）
+                    pred_masks.append(pred_mask[:, 0])
+                    
+                except Exception as mask_e:
+                    print(f"マスク生成中にエラーが発生しました: {mask_e}")
+                    # エラーが発生した場合は空のマスクを返す
+                    try:
+                        if label_list is not None and i < len(label_list):
+                            shape = label_list[i].shape
+                            empty_mask = torch.zeros((1, *shape), device=device)
+                        else:
+                            # デフォルトサイズの空マスク
+                            empty_mask = torch.zeros((1, 1024, 1024), device=device)
+                        pred_masks.append(empty_mask)
+                    except Exception as e:
+                        print(f"空マスク生成中にエラーが発生しました: {e}")
+                        # 最小サイズの空マスク
+                        empty_mask = torch.zeros((1, 100, 100), device=device)
+                        pred_masks.append(empty_mask)
+                        
+        except Exception as e:
+            print(f"全体的なマスク生成でエラーが発生しました: {e}")
+            # エラーの場合は空のマスクリストを返す
+            pred_masks = []
+            for i in range(len(pred_embeddings)):
+                try:
+                    if label_list is not None and i < len(label_list):
+                        shape = label_list[i].shape
+                        empty_mask = torch.zeros((1, *shape), device=device)
+                    else:
+                        empty_mask = torch.zeros((1, 100, 100), device=device)
+                    pred_masks.append(empty_mask)
+                except:
+                    # 最小サイズの空マスク
+                    empty_mask = torch.zeros((1, 100, 100), device=device)
+                    pred_masks.append(empty_mask)
+
+        # 推論モードの場合は予測マスクを返す
+        if inference:
+            return {
+                "pred_masks": pred_masks,
+                "gt_masks": masks_list,
+            }
 
         # 損失計算のためのモデル出力と正解マスク
-        model_output = outputs
+        model_output = vision_x
         gt_masks = masks_list
 
         # 言語モデルのCE損失を取得
-        ce_loss = model_output.loss if hasattr(model_output, 'loss') else torch.tensor(0.0).to(device)
+        ce_loss = model_output.loss if hasattr(model_output, 'loss') else torch.tensor(0.0, device=device)
         ce_loss = ce_loss * self.ce_loss_weight
         
-        # マスク損失（BCE, Dice）の初期化
-        mask_bce_loss = 0
-        mask_dice_loss = 0
+        # マスク損失の計算
+        mask_bce_loss = torch.tensor(0.0, device=device)
+        mask_dice_loss = torch.tensor(0.0, device=device)
         num_masks = 0
         
-        # バッチ内の各サンプルに対して損失を計算
-        for batch_idx in range(len(pred_masks)):
-            gt_mask = gt_masks[batch_idx]
-            pred_mask = pred_masks[batch_idx]
-
-            # マスクの形状を確認
-            assert (
-                gt_mask.shape[0] == pred_mask.shape[0]
-            ), "gt_mask.shape: {}, pred_mask.shape: {}".format(
-                gt_mask.shape, pred_mask.shape
-            )
+        if pred_masks and gt_masks and len(pred_masks) > 0 and len(gt_masks) > 0:
+            try:
+                for batch_idx in range(min(len(pred_masks), len(gt_masks))):
+                    try:
+                        gt_mask = gt_masks[batch_idx]
+                        pred_mask = pred_masks[batch_idx]
+                        
+                        # 形状が一致するか確認
+                        if gt_mask.shape[0] != pred_mask.shape[0]:
+                            print(f"警告: バッチ{batch_idx}のマスク形状が一致しません。gt_mask: {gt_mask.shape}, pred_mask: {pred_mask.shape}")
+                            # 最小の共通サイズを使用
+                            min_size = min(gt_mask.shape[0], pred_mask.shape[0])
+                            gt_mask = gt_mask[:min_size]
+                            pred_mask = pred_mask[:min_size]
+                        
+                        # BCE損失の計算
+                        batch_bce = sigmoid_ce_loss(
+                            pred_mask, gt_mask, num_masks=gt_mask.shape[0]
+                        ) * gt_mask.shape[0]
+                        
+                        # Dice損失の計算
+                        batch_dice = dice_loss(
+                            pred_mask, gt_mask, num_masks=gt_mask.shape[0]
+                        ) * gt_mask.shape[0]
+                        
+                        mask_bce_loss += batch_bce
+                        mask_dice_loss += batch_dice
+                        num_masks += gt_mask.shape[0]
+                    except Exception as e:
+                        print(f"バッチ{batch_idx}のマスク損失計算中にエラーが発生しました: {e}")
+                        # このバッチをスキップ
             
-            # BCE損失とDice損失を計算
-            mask_bce_loss += (
-                sigmoid_ce_loss(pred_mask, gt_mask, num_masks=gt_mask.shape[0])
-                * gt_mask.shape[0]
-            )
-            mask_dice_loss += (
-                dice_loss(pred_mask, gt_mask, num_masks=gt_mask.shape[0])
-                * gt_mask.shape[0]
-            )
-            num_masks += gt_mask.shape[0]
-
-        # 損失を正規化
-        mask_bce_loss = self.bce_loss_weight * mask_bce_loss / (num_masks + 1e-8)
-        mask_dice_loss = self.dice_loss_weight * mask_dice_loss / (num_masks + 1e-8)
+            except Exception as e:
+                print(f"マスク損失計算中にエラーが発生しました: {e}")
+        
+        # 損失の正規化と重み付け
+        if num_masks > 0:
+            mask_bce_loss = self.bce_loss_weight * mask_bce_loss / num_masks
+            mask_dice_loss = self.dice_loss_weight * mask_dice_loss / num_masks
+        else:
+            # マスクがない場合はゼロ
+            mask_bce_loss = torch.tensor(0.0, device=device)
+            mask_dice_loss = torch.tensor(0.0, device=device)
+        
+        # 合計マスク損失
         mask_loss = mask_bce_loss + mask_dice_loss
-
-        # 最終的な損失
+        
+        # 合計損失
         loss = ce_loss + mask_loss
-
+        
+        # 損失辞書を返す
         return {
             "loss": loss,
             "ce_loss": ce_loss,

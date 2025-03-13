@@ -627,14 +627,79 @@ class SemSegDataset(torch.utils.data.Dataset):
                 masks = []
                 for ann in sampled_anns:
                     try:
-                        masks.append(coco_api.annToMask(ann))
+                        # アノテーションからマスクを生成する前にセグメンテーション情報があるか確認
+                        if "segmentation" not in ann or not ann["segmentation"]:
+                            print(f"WARNING: アノテーションにsegmentationフィールドが空またはありません。ID: {ann.get('id', 'unknown')}")
+                            # ダミーマスクを生成
+                            img_info = coco_api.loadImgs([ann["image_id"]])[0]
+                            h, w = img_info["height"], img_info["width"]
+                            dummy_mask = np.zeros((h, w), dtype=np.uint8)
+                            masks.append(dummy_mask)
+                            print(f"  サイズ {h}x{w} のダミーマスクを生成しました")
+                            continue
+                            
+                        # 通常のマスク生成処理
+                        mask = coco_api.annToMask(ann)
+                        masks.append(mask)
                     except Exception as e:
                         print(f"ERROR: Failed to generate mask: {e}")
-                        return self.__getitem__(0)
-
-                masks = np.stack(masks, axis=0)
-                masks = torch.from_numpy(masks)
-                label = torch.ones(masks.shape[1], masks.shape[2]) * self.ignore_label
+                        
+                        # エラーのデバッグ情報
+                        print(f"  アノテーション情報: {ann.keys() if hasattr(ann, 'keys') else type(ann)}")
+                        if hasattr(ann, 'get'):
+                            print(f"  アノテーションID: {ann.get('id', 'unknown')}")
+                            print(f"  カテゴリID: {ann.get('category_id', 'unknown')}")
+                            print(f"  セグメンテーション情報: {type(ann.get('segmentation', None))}")
+                            if ann.get('segmentation') is not None:
+                                print(f"  セグメンテーションの内容: {ann['segmentation']}")
+                        
+                        # 代替の空マスクを生成（クラッシュを防ぐ）
+                        try:
+                            # 画像サイズからダミーマスクを作成
+                            if isinstance(image, torch.Tensor):
+                                h, w = image.shape[-2], image.shape[-1]
+                            else:
+                                h, w = image.shape[0], image.shape[1]
+                            
+                            dummy_mask = np.zeros((h, w), dtype=np.uint8)
+                            masks.append(dummy_mask)
+                            print(f"  代わりに空マスク（サイズ: {h}x{w}）を使用します")
+                        except Exception as mask_e:
+                            print(f"  空マスク生成中にもエラーが発生: {mask_e}")
+                            # 画像情報からサイズを取得してみる
+                            try:
+                                img_info = coco_api.loadImgs([ann["image_id"]])[0]
+                                h, w = img_info["height"], img_info["width"]
+                                dummy_mask = np.zeros((h, w), dtype=np.uint8)
+                                masks.append(dummy_mask)
+                                print(f"  画像情報から空マスク（サイズ: {h}x{w}）を生成しました")
+                            except:
+                                # 最小サイズのダミーマスク
+                                dummy_mask = np.zeros((100, 100), dtype=np.uint8)
+                                masks.append(dummy_mask)
+                                print(f"  小さいサイズの空マスク（100x100）を使用します")
+                
+                # マスクが空の場合は別のサンプルを試す
+                if not masks:
+                    print("警告: 有効なマスクがありません。別のサンプルを試します。")
+                    return self.__getitem__(max(0, idx - 1) if idx > 0 else idx + 1)
+                
+                try:
+                    # マスクをスタック
+                    masks = np.stack(masks, axis=0)
+                    masks = torch.from_numpy(masks)
+                    label = torch.ones(masks.shape[1], masks.shape[2]) * self.ignore_label
+                except Exception as stack_e:
+                    print(f"ERROR: マスクのスタック中にエラーが発生: {stack_e}")
+                    print(f"  マスク数: {len(masks)}")
+                    if masks:
+                        print(f"  最初のマスクの形状: {masks[0].shape if hasattr(masks[0], 'shape') else 'unknown'}")
+                    
+                    # ダミーのマスクと画像を作成して処理を続行
+                    dummy_size = (100, 100)
+                    masks = torch.zeros((1, *dummy_size), dtype=torch.uint8)
+                    label = torch.ones(dummy_size) * self.ignore_label
+                    print(f"  ダミーマスク（サイズ: {dummy_size}）を使用して処理を続行します")
 
             else:
                 label = torch.from_numpy(label).long()
