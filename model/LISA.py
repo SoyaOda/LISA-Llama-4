@@ -1190,6 +1190,31 @@ class LISAForCausalLM(nn.Module):
         # オリジナルLISAとの互換性のために、model属性も追加
         self.model = self.lisa_model
         
+        # オリジナルLISAとの互換性のためにconfigを追加
+        if hasattr(self.lisa_model, 'config'):
+            # LisaModelからconfigを取得
+            self.config = self.lisa_model.config
+        elif hasattr(self.lisa_model, 'model') and hasattr(self.lisa_model.model, 'config'):
+            # モデルからconfigを取得
+            self.config = self.lisa_model.model.config
+        else:
+            # configがなければ作成
+            print("警告: lisa_modelからconfigが見つからないため、新しいconfigを作成します")
+            from transformers import PretrainedConfig
+            self.config = PretrainedConfig()
+            # 基本的な属性を設定
+            self.config.model_type = "mllama"
+            
+        # 必要な属性をconfigに追加
+        if not hasattr(self.config, 'train_mask_decoder'):
+            self.config.train_mask_decoder = kwargs.get("train_mask_decoder", True)
+        if not hasattr(self.config, 'out_dim'):
+            self.config.out_dim = kwargs.get("out_dim", 256)
+        if not hasattr(self.config, 'vision_tower'):
+            self.config.vision_tower = kwargs.get("vision_tower", kwargs.get("model_id", "meta-llama/Llama-3.2-11B-Vision-Instruct"))
+        if not hasattr(self.config, 'mm_vision_tower'):
+            self.config.mm_vision_tower = self.config.vision_tower
+        
         # 各種パラメータを設定
         self.device = kwargs.get("device", "cuda" if torch.cuda.is_available() else "cpu")
         
