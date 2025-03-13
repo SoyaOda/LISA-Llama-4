@@ -603,8 +603,6 @@ def train(
                             print(f"マスク {idx}: None")
 
             try:
-                # input_dictにtokenizerを追加
-                input_dict["tokenizer"] = tokenizer
                 output_dict = model(**input_dict)
             except Exception as e:
                 print(f"\n[エラー情報] モデル実行中にエラーが発生しました: {e}")
@@ -716,8 +714,6 @@ def validate(val_loader, model_engine, epoch, writer, args):
             input_dict["images_clip"] = input_dict["images_clip"].float()
 
         with torch.no_grad():
-            # input_dictにtokenizerを追加
-            input_dict["tokenizer"] = tokenizer
             output_dict = model_engine(**input_dict)
 
         pred_masks = output_dict["pred_masks"]
