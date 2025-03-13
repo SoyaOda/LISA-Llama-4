@@ -152,70 +152,74 @@ class LisaMetaModel:
             param.requires_grad = True
 
 
-class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
+class LisaModel(nn.Module):
+    """
+    LISAのベースモデル
+    """
     def __init__(
         self,
-        config,
-        **kwargs,
+        model_cfg=None,
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+        vision_pretrained='checkpoints/sam_vit_h_4b8939.pth',
+        freeze_vision_model=True,
+        freeze_llm=False,
+        out_dim=256,
+        *args, **kwargs
     ):
-        # 事前にconfigの存在を確認
-        if config is None:
-            print("警告: LisaModelの初期化時にconfigがNoneです")
-            from types import SimpleNamespace
-            config = SimpleNamespace()
-            
-            # 必要な設定を追加
-            for key, value in kwargs.items():
-                setattr(config, key, value)
-                
-        # 親クラスの初期化 - 多重継承なので明示的に両方呼び出す
-        print("LisaModelの初期化: 親クラスを初期化します")
-        LisaMetaModel.__init__(self, config, **kwargs)
-        Llama3VisionMetaModel.__init__(self, config, **kwargs)
+        """
+        Llama3.2 Vision + SAMの統合モデル初期化
         
-        # 必要なモデル属性を追加
-        model_id = kwargs.get("model_id", "meta-llama/Llama-3.2-11B-Vision-Instruct")
-        torch_dtype = kwargs.get("torch_dtype", torch.bfloat16)
+        Args:
+            model_cfg (dict): モデル設定
+            torch_dtype (torch.dtype): 使用するデータ型
+            low_cpu_mem_usage (bool): 低CPUメモリ使用を有効にするか
+            vision_pretrained (str): 視覚モデルの事前学習済み重み
+            freeze_vision_model (bool): 視覚モデルを凍結するか
+            freeze_llm (bool): 言語モデルを凍結するか
+            out_dim (int): 出力次元数
+        """
+        super().__init__()
         
-        # モデルインスタンスを作成
+        # 設定初期化
+        if model_cfg is None:
+            self.config = MllamaConfig()
+        else:
+            self.config = model_cfg
+        
+        self.torch_dtype = torch_dtype
+        self.freeze_llm = freeze_llm
+        
+        # Llama3.2 Visionモデルの初期化
         self.model = MllamaForConditionalGeneration.from_pretrained(
-            model_id,
+            "meta-llama/Llama-3.2-11B-Vision-Instruct",
             torch_dtype=torch_dtype,
-            low_cpu_mem_usage=kwargs.get("low_cpu_mem_usage", True),
-            device_map=kwargs.get("device_map", None),
+            low_cpu_mem_usage=low_cpu_mem_usage,
         )
         
-        # SAMモデルが正しく初期化されたか確認
-        if not hasattr(self, 'visual_model'):
-            print("警告: visual_model属性が見つかりません。SAMモデルを初期化します。")
-            # SAMモデルを初期化
-            vision_pretrained = kwargs.get("vision_pretrained", None)
-            if vision_pretrained:
-                from .segment_anything import build_sam_vit_h
-                self.visual_model = build_sam_vit_h(vision_pretrained)
-                for param in self.visual_model.parameters():
-                    param.requires_grad = False
-                if config.train_mask_decoder:
-                    self.visual_model.mask_decoder.train()
+        # セグメンテーション関連
+        self.config.seg_token_idx = None
+        
+        # SAMモデルの初期化
+        if vision_pretrained is not None:
+            try:
+                print(f"SAMモデルの初期化: {vision_pretrained}")
+                self.visual_model = build_sam(checkpoint=vision_pretrained)
+                
+                # 視覚モデルの凍結制御
+                for param in self.visual_model.image_encoder.parameters():
+                    param.requires_grad = not freeze_vision_model
+                for param in self.visual_model.prompt_encoder.parameters():
+                    param.requires_grad = True
+                if train_mask_decoder:
                     for param in self.visual_model.mask_decoder.parameters():
                         param.requires_grad = True
-            else:
-                print("エラー: vision_pretrainedが指定されていないため、SAMモデルを初期化できません")
-                raise ValueError("SAMモデルの初期化に必要なvision_pretrainedパスが指定されていません")
+            except Exception as e:
+                print(f"SAMモデルの初期化中にエラー: {e}")
+                raise
 
         # 設定を構成
         self.config.use_cache = False
-        
-        # MllamaConfigではmm_接頭辞がない可能性がある属性の対応
-        # vision_tower
-        if hasattr(self.config, "mm_vision_tower"):
-            self.config.vision_tower = self.config.mm_vision_tower
-        # 既にvision_towerが設定されている場合は何もしない（MllamaConfigの場合）
-        
-        # vision_select_feature
-        if not hasattr(self.config, "mm_vision_select_feature"):
-            # MllamaConfig用に新しく属性を追加
-            self.config.mm_vision_select_feature = "patch"
         
         # 他の設定属性を確実に設定
         self.config.image_aspect_ratio = "square"
@@ -229,260 +233,14 @@ class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
         
     def forward(self, *args, **kwargs):
         """
-        前方伝播処理。引数をモデルに渡します。
+        前方伝播処理。引数をLlama3.2 Visionモデルに渡します。
         """
-        # LISAForCausalLMでのモデル実行をサポートするために必要なメソッド
+        # Llama3.2 Visionモデルの呼び出し
+        if not hasattr(self, 'model'):
+            raise AttributeError("modelがLisaModelオブジェクトに設定されていません")
+        
         return self.model(*args, **kwargs)
-
-
-class LISAForCausalLM(nn.Module):
-    """
-    LISA model for Causal Language Modeling with Segment Anything
-    
-    Llama3.2 Vision (MllamaForConditionalGeneration) + SAM
-    """
-    def __init__(
-        self,
-        model_id="meta-llama/Llama-3.2-11B-Vision-Instruct",
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        train_mask_decoder=True,
-        out_dim=256,
-        ce_loss_weight=1.0,
-        dice_loss_weight=1.0,
-        bce_loss_weight=1.0,
-        seg_token_idx=None,
-        vision_pretrained=None,
-        vision_tower=None,
-        use_mm_start_end=True,
-        device_map=None,
-    ):
-        super().__init__()
         
-        # LISA構成設定
-        self.ce_loss_weight = ce_loss_weight
-        self.dice_loss_weight = dice_loss_weight
-        self.bce_loss_weight = bce_loss_weight
-        self.train_mask_decoder = train_mask_decoder
-        
-        try:
-            # モデルの初期化
-            print(f"Loading Llama3.2 Vision model: {model_id}")
-            print(f"  - torch_dtype: {torch_dtype}")
-            
-            # DeepSpeed環境ではdevice_mapをNoneに設定する必要がある
-            # 'meta'デバイスのテンソルはDeepSpeedの初期化時にエラーが発生するため
-            if device_map is not None:
-                print(f"  - 警告: DeepSpeed環境ではdevice_map={device_map}を使用できません")
-                print(f"  - device_map=Noneに設定します（DeepSpeedが自動的にデバイスを管理）")
-                device_map = None
-            
-            print(f"  - device_map: {device_map}")
-            
-            # Llama3.2 Visionモデルのロード
-            self.model = MllamaForConditionalGeneration.from_pretrained(
-                model_id,
-                torch_dtype=torch_dtype,
-                low_cpu_mem_usage=low_cpu_mem_usage,
-                device_map=device_map
-            )
-            
-            # config属性を追加（train_ds.pyでアクセスするため）
-            self.config = self.model.config
-            
-            # PEFT互換性のために重要: model_typeがdictではなくConfigオブジェクトであることを確認
-            # configが辞書の場合は、PretrainedConfigオブジェクトに変換
-            if isinstance(self.model.config, dict):
-                print("警告: configが辞書型です。PretrainedConfigオブジェクトに変換します。")
-                from transformers import PretrainedConfig
-                config_dict = self.model.config.copy()
-                self.model.config = PretrainedConfig()
-                for key, value in config_dict.items():
-                    setattr(self.model.config, key, value)
-            
-            # text_configやvision_configなどのサブ設定も変換
-            # Llama3.2 Visionモデルではこれらのサブ設定がネストされていることがある
-            for config_name in ['text_config', 'vision_config']:
-                if hasattr(self.model.config, config_name):
-                    sub_config = getattr(self.model.config, config_name)
-                    if isinstance(sub_config, dict):
-                        print(f"警告: {config_name}が辞書型です。PretrainedConfigオブジェクトに変換します。")
-                        sub_config_obj = PretrainedConfig()
-                        for key, value in sub_config.items():
-                            setattr(sub_config_obj, key, value)
-                        setattr(self.model.config, config_name, sub_config_obj)
-            
-            # model_type属性が必要（PEFT用）
-            if not hasattr(self.model.config, 'model_type'):
-                print("configにmodel_type属性を追加します（PEFT用）")
-                self.model.config.model_type = "mllama"
-            
-            # サブ設定にもmodel_type属性を追加
-            for config_name in ['text_config', 'vision_config']:
-                if hasattr(self.model.config, config_name):
-                    sub_config = getattr(self.model.config, config_name)
-                    if hasattr(sub_config, 'model_type') and sub_config.model_type is None:
-                        if config_name == 'text_config':
-                            sub_config.model_type = "llama"
-                        elif config_name == 'vision_config':
-                            sub_config.model_type = "vision_encoder"
-                    elif not hasattr(sub_config, 'model_type'):
-                        if config_name == 'text_config':
-                            sub_config.model_type = "llama"
-                        elif config_name == 'vision_config':
-                            sub_config.model_type = "vision_encoder"
-            
-            # Llama3.2 Vision用のプロセッサを初期化
-            self.processor = AutoProcessor.from_pretrained(model_id)
-            
-            # <SEG>トークンを追加
-            special_tokens = {"additional_special_tokens": ["<SEG>"]}
-            num_added_tokens = self.processor.tokenizer.add_special_tokens(special_tokens)
-            print(f"  - Added {num_added_tokens} special tokens: <SEG>")
-            
-            # トークナイザでSEGトークンのインデックスを保存
-            self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids("<SEG>")
-            print(f"  - <SEG> token index: {self.seg_token_idx}")
-            
-            # 埋め込みをリサイズ
-            # 入力埋め込みのリサイズ
-            # MllamaConfig対応: text_config.vocab_sizeから取得
-            if hasattr(self.model.config, 'vocab_size'):
-                orig_num_tokens = self.model.config.vocab_size
-            elif hasattr(self.model.config, 'text_config') and hasattr(self.model.config.text_config, 'vocab_size'):
-                # MllamaConfigではtext_config内に語彙サイズがある
-                orig_num_tokens = self.model.config.text_config.vocab_size
-                # 後続の処理で参照されるように設定
-                self.model.config.vocab_size = orig_num_tokens
-                print(f"  - MllamaConfig: text_config.vocab_sizeから語彙サイズを設定 ({orig_num_tokens})")
-            else:
-                # 最終手段: トークナイザーから直接サイズを取得
-                orig_num_tokens = len(self.processor.tokenizer) - num_added_tokens
-                self.model.config.vocab_size = orig_num_tokens
-                print(f"  - 警告: configにvocab_sizeがないため、トークナイザーから推定 ({orig_num_tokens})")
-            
-            new_num_tokens = len(self.processor.tokenizer)
-            print(f"  - Resizing embeddings from {orig_num_tokens} to {new_num_tokens}")
-            
-            # 入力埋め込みをリサイズ
-            self.model.resize_token_embeddings(new_num_tokens)
-            
-            # 出力埋め込みのリサイズ（手動）
-            try:
-                output_embeddings = self.model.get_output_embeddings()
-                
-                # メタデバイスチェック
-                if hasattr(output_embeddings, 'weight') and output_embeddings.weight.device.type == 'meta':
-                    print("警告: メタデバイス上の出力埋め込みを検出しました")
-                    print("DeepSpeed環境では通常の方法でリサイズできません")
-                    print("入力埋め込みのリサイズのみ完了。後で重み共有を行います")
-                else:
-                    # 通常のケース - 出力埋め込みが実デバイス上にある場合
-                    try:
-                        # まず_get_resized_lm_headメソッドを使用してみる (推奨アプローチ)
-                        if hasattr(self.model, '_get_resized_lm_head'):
-                            print("  - _get_resized_lm_headメソッドを使用して出力埋め込みをリサイズ")
-                            
-                            # デバッグ: _get_resized_lm_headメソッドの引数を確認
-                            import inspect
-                            if hasattr(self.model, '_get_resized_lm_head'):
-                                print("  - _get_resized_lm_head メソッドの引数情報:")
-                                sig = inspect.signature(self.model._get_resized_lm_head)
-                                print(f"    引数リスト: {list(sig.parameters.keys())}")
-                                print(f"    デフォルト値: {[p.default for p in sig.parameters.values() if p.default is not inspect.Parameter.empty]}")
-                            
-                            # mean_resizingが引数に含まれているか確認して条件分岐
-                            if 'mean_resizing' in inspect.signature(self.model._get_resized_lm_head).parameters:
-                                new_output_embeddings = self.model._get_resized_lm_head(
-                                    output_embeddings,
-                                    new_num_tokens=new_num_tokens,
-                                    mean_resizing=True
-                                )
-                            else:
-                                # mean_resizingがない場合は引数なしで呼び出し
-                                print("  - mean_resizing引数なしで_get_resized_lm_headを呼び出します")
-                                new_output_embeddings = self.model._get_resized_lm_head(
-                                    output_embeddings,
-                                    new_num_tokens=new_num_tokens
-                                )
-                            
-                            # 勾配設定を元に戻す
-                            new_output_embeddings.requires_grad_(output_embeddings.weight.requires_grad)
-                        else:
-                            # フォールバック: 手動で出力埋め込みをリサイズ
-                            print("  - 手動で出力埋め込みをリサイズ")
-                            new_output_embeddings = torch.nn.Linear(
-                                output_embeddings.in_features,
-                                new_num_tokens,
-                                bias=output_embeddings.bias is not None,
-                                device=output_embeddings.weight.device
-                            )
-                            
-                            with torch.no_grad():
-                                # 既存のトークンの埋め込みをコピー
-                                new_output_embeddings.weight.data[:orig_num_tokens, :] = output_embeddings.weight.data
-                                # 新しいトークンの埋め込みを小さな乱数で初期化
-                                new_output_embeddings.weight.data[orig_num_tokens:, :].normal_(mean=0.0, std=0.02)
-                                
-                                if output_embeddings.bias is not None:
-                                    new_output_embeddings.bias.data[:orig_num_tokens] = output_embeddings.bias.data
-                                    new_output_embeddings.bias.data[orig_num_tokens:] = 0
-                        
-                        # 新しい出力埋め込みを設定
-                        self.model.set_output_embeddings(new_output_embeddings)
-                        
-                        # 重み共有設定の確認
-                        if hasattr(self.model.config, 'tie_word_embeddings') and self.model.config.tie_word_embeddings:
-                            # 重み共有が有効な場合のみtie_weightsを実行
-                            print("入力/出力埋め込みの重みを共有（タイying）します")
-                            self.model.tie_weights()
-                        else:
-                            # Llama 3.2などの非共有モデルの場合
-                            print("このモデルは入出力埋め込み非共有モデル（tie_word_embeddings=False）です")
-                            print("出力埋め込みは手動で初期化されました")
-                        
-                    except Exception as e:
-                        print(f"警告: 出力埋め込みの初期化中にエラーが発生しました: {e}")
-                        print("DeepSpeed環境での処理中は正常なため、続行します")
-                
-            except Exception as e:
-                print(f"警告: 出力埋め込みの初期化中にエラーが発生しました: {e}")
-                print("DeepSpeed環境での処理中は正常なため、続行します")
-            
-        except Exception as e:
-            print(f"Error initializing model: {e}")
-            raise
-            
-        # 重要: モデル初期化後にLISA用の設定を行う
-        lisa_config = {
-            'train_mask_decoder': train_mask_decoder,
-            'out_dim': out_dim,
-            'vision_pretrained': vision_pretrained,
-            'vision_tower': vision_tower,
-            'initialize_sam': True  # SAMの初期化を明示的に実行
-        }
-        
-        # configがNoneの場合、モデルの設定を使用して新しいConfigオブジェクトを作成
-        # まずconfigを初期化する（model.configから取得）
-        if hasattr(self.model, 'config'):
-            config = self.model.config
-            # 必要な属性を追加
-            if not hasattr(config, "train_mask_decoder"):
-                config.train_mask_decoder = train_mask_decoder
-                config.out_dim = out_dim
-                config.vision_pretrained = vision_pretrained
-                config.vision_tower = vision_tower
-        else:
-            # モデルのconfigが存在しない場合、エラーを表示
-            print("エラー: モデルにconfig属性がありません。LISAモデルを初期化できません。")
-            raise ValueError("モデルの設定情報が見つかりません。")
-            
-        # Llama3VisionMetaModelとLisaMetaModelを継承したLisaModelを作成
-        self.lisa_model = LisaModel(config, **lisa_config)
-        
-        # LISAモデルの視覚モデルを共有
-        self.visual_model = self.lisa_model.visual_model
-
     def get_processor(self):
         """
         LISAモデル用のプロセッサを取得します
@@ -1043,14 +801,13 @@ class LISAForCausalLM(nn.Module):
         vision_x = None
         if processor_inputs is not None:
             try:
+                # cache_dataパラメータを削除し、Llama3.2 Visionモデルに対応
                 outputs = self.lisa_model.model(
                     input_ids=processor_inputs.get("input_ids"),
                     attention_mask=processor_inputs.get("attention_mask"),
                     pixel_values=processor_inputs.get("pixel_values", None),
-                    cache_data=None,
-                    input_vt_spi=None,
                     output_hidden_states=output_hidden_states,
-                    return_dict=True,
+                    return_dict=True
                 )
                 vision_x = outputs
             except Exception as e:
@@ -1415,26 +1172,43 @@ class LISAForCausalLM(nn.Module):
             # マスクがない場合は0を設定
             mask_loss = torch.tensor(0.0, device=device)
             
-        # 訓練時に勾配が必要な場合
-        if not inference and torch.is_tensor(ce_loss) and not ce_loss.requires_grad:
-            # テンソルの勾配追跡を有効にするためのコピーを作成
-            ce_loss = ce_loss.clone().requires_grad_(True)
+        # 訓練時に勾配計算が必要
+        if not inference:
+            # CEロスの勾配追跡確保
+            if torch.is_tensor(ce_loss):
+                if not ce_loss.requires_grad:
+                    ce_loss = ce_loss.clone().detach().requires_grad_(True)
+            else:
+                # CEロスがテンソルでない場合、0のテンソルを作成
+                ce_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                
+            # マスクロスの勾配追跡確保
+            if torch.is_tensor(mask_loss):
+                if not mask_loss.requires_grad:
+                    mask_loss = mask_loss.clone().detach().requires_grad_(True)
+            else:
+                # マスクロスがテンソルでない場合、0のテンソルを作成
+                mask_loss = torch.tensor(0.0, device=device, requires_grad=True)
             
-        if not inference and torch.is_tensor(mask_loss) and not mask_loss.requires_grad:
-            # テンソルの勾配追跡を有効にするためのコピーを作成
-            mask_loss = mask_loss.clone().requires_grad_(True)
-        
-        # 合計損失
-        if ce_loss.numel() > 0 and mask_loss.numel() > 0:
-            loss = ce_loss + mask_loss
-        elif ce_loss.numel() > 0:
-            loss = ce_loss
-        elif mask_loss.numel() > 0:
-            loss = mask_loss
+            # 損失合計の計算
+            if ce_loss.numel() > 0 and ce_loss > 0:
+                if mask_loss.numel() > 0 and mask_loss > 0:
+                    loss = ce_loss + mask_loss
+                else:
+                    loss = ce_loss
+            elif mask_loss.numel() > 0 and mask_loss > 0:
+                loss = mask_loss
+            else:
+                # どちらの損失も有効でない場合、ダミーの勾配付き損失を作成
+                loss = torch.tensor(1e-5, device=device, requires_grad=True)
         else:
-            # 両方の損失が使えない場合はダミー損失
-            if not inference:
-                loss = torch.tensor(0.0, device=device, requires_grad=True)
+            # 推論モードの場合は勾配は不要
+            if torch.is_tensor(ce_loss) and torch.is_tensor(mask_loss):
+                loss = ce_loss + mask_loss
+            elif torch.is_tensor(ce_loss):
+                loss = ce_loss
+            elif torch.is_tensor(mask_loss):
+                loss = mask_loss
             else:
                 loss = torch.tensor(0.0, device=device)
 
@@ -1519,3 +1293,137 @@ def compute_dice_loss(inputs, targets, smooth=1):
     dice = (2. * intersection + smooth) / (inputs.sum() + targets.sum() + smooth)
     
     return dice
+
+class LISAForCausalLM(nn.Module):
+    """
+    LISA model for Causal Language Modeling with Segment Anything
+    
+    Llama3.2 Vision (MllamaForConditionalGeneration) + SAM
+    """
+    def __init__(
+        self,
+        model_id="meta-llama/Llama-3.2-11B-Vision-Instruct",
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+        train_mask_decoder=True,
+        out_dim=256,
+        ce_loss_weight=1.0,
+        dice_loss_weight=1.0,
+        bce_loss_weight=1.0,
+        seg_token_idx=None,
+        vision_pretrained=None,
+        vision_tower=None,
+        use_mm_start_end=True,
+        device_map=None,
+    ):
+        super().__init__()
+        
+        # LISA構成設定
+        self.ce_loss_weight = ce_loss_weight
+        self.dice_loss_weight = dice_loss_weight
+        self.bce_loss_weight = bce_loss_weight
+        self.train_mask_decoder = train_mask_decoder
+        
+        try:
+            # モデルの初期化
+            print(f"Loading Llama3.2 Vision model: {model_id}")
+            print(f"  - torch_dtype: {torch_dtype}")
+            
+            # LisaModelの初期化
+            self.lisa_model = LisaModel(
+                model_cfg=None,
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=low_cpu_mem_usage,
+                vision_pretrained=vision_pretrained,
+                freeze_vision_model=True,
+                freeze_llm=False,
+                out_dim=out_dim,
+                train_mask_decoder=train_mask_decoder
+            )
+            
+            # 視覚モデルへの参照を設定
+            self.visual_model = self.lisa_model.visual_model
+            
+            # configへの参照を設定
+            self.config = self.lisa_model.config
+            
+            # Llama3.2 Vision用のプロセッサを初期化
+            self.processor = AutoProcessor.from_pretrained(model_id)
+            
+            # <SEG>トークンを追加
+            special_tokens = {"additional_special_tokens": ["<SEG>"]}
+            num_added_tokens = self.processor.tokenizer.add_special_tokens(special_tokens)
+            print(f"  - Added {num_added_tokens} special tokens: <SEG>")
+            
+            # トークナイザでSEGトークンのインデックスを保存
+            self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids("<SEG>")
+            print(f"  - <SEG> token index: {self.seg_token_idx}")
+            self.lisa_model.config.seg_token_idx = self.seg_token_idx
+            
+            # 埋め込みをリサイズ
+            new_num_tokens = len(self.processor.tokenizer)
+            
+            # Llama3.2 Visionモデルの埋め込みをリサイズ
+            self.lisa_model.model.resize_token_embeddings(new_num_tokens)
+            
+            # 出力埋め込みも更新
+            try:
+                # 出力埋め込みを取得
+                output_embeddings = self.lisa_model.model.get_output_embeddings()
+                input_embeddings = self.lisa_model.model.get_input_embeddings()
+                
+                if output_embeddings.weight.shape[0] != new_num_tokens:
+                    print(f"出力埋め込みをリサイズ: {output_embeddings.weight.shape[0]} -> {new_num_tokens}")
+                    
+                    # 新しい出力埋め込みを作成
+                    new_lm_head = nn.Linear(
+                        input_embeddings.weight.shape[1],
+                        new_num_tokens,
+                        bias=output_embeddings.bias is not None,
+                        device=output_embeddings.weight.device,
+                        dtype=output_embeddings.weight.dtype
+                    )
+                    
+                    # 既存の重みをコピー
+                    with torch.no_grad():
+                        new_lm_head.weight[:output_embeddings.weight.shape[0], :] = output_embeddings.weight
+                        if output_embeddings.bias is not None:
+                            new_lm_head.bias[:output_embeddings.bias.shape[0]] = output_embeddings.bias
+                    
+                    # 新しい埋め込みを設定
+                    self.lisa_model.model.set_output_embeddings(new_lm_head)
+            except Exception as e:
+                print(f"出力埋め込みのリサイズ中にエラーが発生しました: {e}")
+            
+        except Exception as e:
+            print(f"Error initializing model: {e}")
+            raise
+        
+    def get_processor(self):
+        """
+        モデルのプロセッサを取得します。
+        """
+        return self.processor
+        
+    def get_visual_embs(self, images, return_width_height=False):
+        """
+        SAMモデルを使用して画像から視覚的埋め込みを取得します。
+        
+        Args:
+            images (Tensor): 入力画像バッチ
+            return_width_height (bool): 幅と高さも返すかどうか
+            
+        Returns:
+            Tensor: 視覚的埋め込み
+        """
+        return self.lisa_model.get_visual_embs(images, return_width_height)
+    
+    def forward(self, **kwargs):
+        """
+        LISA CausalLMの前方伝播。
+        必要に応じてmodel_forwardを呼び出します。
+        """
+        if "past_key_values" in kwargs:
+            # 通常のLM生成モードの場合は標準のforwardに委譲
+            return self.lisa_model.forward(**kwargs)
+        return self.model_forward(**kwargs)
