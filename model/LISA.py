@@ -165,7 +165,8 @@ class LisaModel(nn.Module):
         device_map=None,
         torch_dtype=torch.float16,
         train_mask_decoder=True,
-        out_dim=256
+        out_dim=256,
+        vision_pretrained=None
     ):
         """
         SAMに基づいたLlama 3.2 Visionモデル。
@@ -178,6 +179,7 @@ class LisaModel(nn.Module):
             torch_dtype: モデルのデータ型
             train_mask_decoder: マスクデコーダーを訓練するかどうか
             out_dim: 出力次元
+            vision_pretrained: SAMモデルの事前学習済み重み
         """
         super().__init__()
         
@@ -186,6 +188,7 @@ class LisaModel(nn.Module):
         self.train_mask_decoder = train_mask_decoder
         self.out_dim = out_dim
         self.seg_token_idx = None
+        self.vision_pretrained = vision_pretrained
         
         # configオブジェクトを初期化
         try:
@@ -253,7 +256,7 @@ class LisaModel(nn.Module):
             print("SAMビジョンエンコーダーを初期化します")
             try:
                 from .segment_anything import build_sam_vit_h
-                vision_pretrained = kwargs.get("vision_pretrained", None)
+                vision_pretrained = self.vision_pretrained
                 if vision_pretrained:
                     print(f"SAMモデルをロード: {vision_pretrained}")
                     self.visual_model = build_sam_vit_h(checkpoint=vision_pretrained)
@@ -264,7 +267,7 @@ class LisaModel(nn.Module):
                 try:
                     # 別のインポートパスを試す
                     from model.segment_anything import build_sam_vit_h
-                    vision_pretrained = kwargs.get("vision_pretrained", None)
+                    vision_pretrained = self.vision_pretrained
                     if vision_pretrained:
                         print(f"SAMモデルをロード: {vision_pretrained}")
                         self.visual_model = build_sam_vit_h(checkpoint=vision_pretrained)
@@ -1181,8 +1184,8 @@ class LISAForCausalLM(nn.Module):
             torch_dtype=kwargs.get("torch_dtype", torch.float16),
             device_map=kwargs.get("device_map", None),
             train_mask_decoder=kwargs.get("train_mask_decoder", True),
-            out_dim=kwargs.get("out_dim", 256)
-        )
+            out_dim=kwargs.get("out_dim", 256),
+            vision_pretrained=kwargs.get("vision_pretrained", None))
         
         # オリジナルLISAとの互換性のために、model属性も追加
         self.model = self.lisa_model
@@ -1212,6 +1215,30 @@ class LISAForCausalLM(nn.Module):
                 print("警告: seg_token_idxがLISAForCausalLMで設定されていません")
                 self.seg_token_idx = -1  # デフォルト値（エラー時用）
 
+    def resize_token_embeddings(self, new_num_tokens):
+        """
+        トークン埋め込みのサイズを変更します。
+        LisaModelのresize_token_embeddingsメソッドに委譲します。
+        
+        Args:
+            new_num_tokens: 新しいトークンの数
+            
+        Returns:
+            リサイズされたモデル
+        """
+        print(f"LISAForCausalLM.resize_token_embeddings({new_num_tokens})を呼び出しました")
+        
+        if not hasattr(self.lisa_model, 'resize_token_embeddings'):
+            print("警告: lisa_modelにresize_token_embeddingsメソッドがありません")
+            # 代替策としてモデルに直接アクセス
+            if hasattr(self.lisa_model, 'model') and hasattr(self.lisa_model.model, 'resize_token_embeddings'):
+                return self.lisa_model.model.resize_token_embeddings(new_num_tokens)
+            else:
+                print("エラー: lisa_model.modelにresize_token_embeddingsメソッドもありません")
+                return None
+        
+        return self.lisa_model.resize_token_embeddings(new_num_tokens)
+        
     def get_processor(self):
         """processorを取得"""
         if hasattr(self.lisa_model, "processor"):
@@ -1231,3 +1258,12 @@ class LISAForCausalLM(nn.Module):
         モデルの順伝播
         """
         return self.lisa_model.forward(**kwargs)
+        
+    def tie_weights(self):
+        """
+        入力埋め込みと出力埋め込みを結合します。
+        """
+        if hasattr(self.lisa_model, 'model') and hasattr(self.lisa_model.model, 'tie_weights'):
+            self.lisa_model.model.tie_weights()
+        else:
+            print("警告: tie_weightsメソッドがllama3_2モデルに見つかりません")
