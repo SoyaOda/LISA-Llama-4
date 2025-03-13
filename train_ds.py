@@ -604,6 +604,7 @@ def main(args):
             writer,
             train_iter,
             args,
+            tokenizer,
         )
 
         if args.no_eval == False:
@@ -638,6 +639,7 @@ def train(
     writer,
     train_iter,
     args,
+    tokenizer,
 ):
     """Main training loop."""
     batch_time = AverageMeter("Time", ":6.3f")
