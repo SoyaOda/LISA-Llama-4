@@ -592,7 +592,7 @@ def main(args):
     best_score, cur_ciou = 0.0, 0.0
 
     if args.eval_only:
-        giou, ciou = validate(val_loader, model_engine, 0, writer, args)
+        giou, ciou = validate(val_loader, model_engine, 0, writer, args, tokenizer)
         exit()
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -607,7 +607,7 @@ def main(args):
         )
 
         if args.no_eval == False:
-            giou, ciou = validate(val_loader, model_engine, epoch, writer, args)
+            giou, ciou = validate(val_loader, model_engine, epoch, writer, args, tokenizer)
             is_best = giou > best_score
             best_score = max(giou, best_score)
             cur_ciou = ciou if is_best else cur_ciou
@@ -712,7 +712,7 @@ def train(
                             print(f"マスク {idx}: None")
 
             try:
-                output_dict = model(**input_dict)
+                output_dict = model(**input_dict, tokenizer=tokenizer)
             except Exception as e:
                 print(f"\n[エラー情報] モデル実行中にエラーが発生しました: {e}")
                 print("入力データの情報:")
@@ -801,7 +801,7 @@ def train(
     return train_iter
 
 
-def validate(val_loader, model_engine, epoch, writer, args):
+def validate(val_loader, model_engine, epoch, writer, args, tokenizer):
     intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
     union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
     acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
@@ -823,7 +823,7 @@ def validate(val_loader, model_engine, epoch, writer, args):
             input_dict["images_clip"] = input_dict["images_clip"].float()
 
         with torch.no_grad():
-            output_dict = model_engine(**input_dict)
+            output_dict = model_engine(**input_dict, tokenizer=tokenizer)
 
         pred_masks = output_dict["pred_masks"]
         masks_list = output_dict["gt_masks"][0].int()
