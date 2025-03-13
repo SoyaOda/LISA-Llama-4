@@ -1076,44 +1076,6 @@ class LisaModel(nn.Module):
                 "mask_loss": mask_loss,
             }
 
-    def prepare_inputs_for_generation(
-        self,
-        input_ids,
-        past_key_values=None,
-        attention_mask=None,
-        inputs_embeds=None,
-        images=None,
-        **kwargs
-    ):
-        """
-        Llama3.2 Visionを使用して生成するための入力を準備します。
-        """
-        if past_key_values is not None:
-            input_ids = input_ids[:, -1:]
-
-        # 生成のための画像入力を準備
-        batch_inputs = {}
-        if input_ids is not None:
-            batch_inputs["input_ids"] = input_ids
-        if past_key_values is not None:
-            batch_inputs["past_key_values"] = past_key_values
-        if attention_mask is not None:
-            batch_inputs["attention_mask"] = attention_mask
-        if inputs_embeds is not None:
-            batch_inputs["inputs_embeds"] = inputs_embeds
-        if images is not None:
-            # Llama 3.2 Visionでは'images'ではなく'pixel_values'を使用
-            batch_inputs["pixel_values"] = images
-            
-            # バッチサイズを取得
-            if isinstance(images, torch.Tensor):
-                batch_size = images.shape[0]
-                # aspect_ratio_idsを作成（デフォルトで0）
-                device = images.device
-                batch_inputs["aspect_ratio_ids"] = torch.zeros(batch_size, dtype=torch.long, device=device)
-
-        return batch_inputs
-
     def get_visual_embs(self, images):
         """
         SAMのvisual_modelを使用して画像埋め込みを取得します
@@ -1141,34 +1103,7 @@ class LisaModel(nn.Module):
             
         return image_embeddings
 
-def compute_dice_loss(inputs, targets, smooth=1):
-    """
-    Compute Dice損失（Sørensen-Dice係数に基づく）
-    
-    Args:
-        inputs: 予測値（シグモイド前のロジット）
-        targets: 正解マスク
-        smooth: 数値安定性のための平滑化係数
-        
-    Returns:
-        Dice係数（1に近いほど良い）
-    """
-    # シグモイド関数で確率値に変換
-    inputs = torch.sigmoid(inputs)
-    
-    # 平坦化
-    inputs = inputs.view(-1)
-    targets = targets.view(-1)
-    
-    # 交差部分
-    intersection = (inputs * targets).sum()
-    
-    # Dice係数の計算: 2*|X∩Y|/(|X|+|Y|)
-    dice = (2. * intersection + smooth) / (inputs.sum() + targets.sum() + smooth)
-    
-    return dice
-
-class LISAForCausalLM(nn.Module):
+class LISAForCausalLM(nn.Module, GenerationMixin):
     """
     LISA for Causal Language Modeling.
     Llama3.2 Vision (MllamaForConditionalGeneration) + SAM
@@ -1272,11 +1207,32 @@ class LISAForCausalLM(nn.Module):
             print("警告: processorが設定されていません")
             return None
             
-    def get_visual_embs(self, images, return_width_height=False):
+    def get_visual_embs(self, images):
         """
-        ビジュアルな埋め込みを取得
+        SAMのvisual_modelを使用して画像埋め込みを取得します
+        
+        Args:
+            images: 入力画像テンソル [batch_size, channels, height, width]
+            
+        Returns:
+            image_embeddings: SAM画像エンコーダからの特徴
         """
-        return self.lisa_model.get_visual_embs(images)
+        if images is None:
+            raise ValueError("入力画像がNoneです")
+            
+        if not hasattr(self, "visual_model") or self.visual_model is None:
+            raise ValueError("visual_modelが初期化されていません")
+            
+        # 画像をデバイスに移動
+        device = next(self.model.parameters()).device
+        if images.device != device:
+            images = images.to(device)
+            
+        with torch.no_grad():
+            # SAMイメージエンコーダを呼び出し
+            image_embeddings = self.visual_model.image_encoder(images)
+            
+        return image_embeddings
         
     def forward(self, **kwargs):
         """
@@ -1292,3 +1248,41 @@ class LISAForCausalLM(nn.Module):
             self.lisa_model.model.tie_weights()
         else:
             print("警告: tie_weightsメソッドがllama3_2モデルに見つかりません")
+            
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        images=None,
+        **kwargs
+    ):
+        """
+        生成のための入力を準備します。
+        """
+        if past_key_values is not None:
+            input_ids = input_ids[:, -1:]
+
+        # 生成のための画像入力を準備
+        batch_inputs = {}
+        if input_ids is not None:
+            batch_inputs["input_ids"] = input_ids
+        if past_key_values is not None:
+            batch_inputs["past_key_values"] = past_key_values
+        if attention_mask is not None:
+            batch_inputs["attention_mask"] = attention_mask
+        if inputs_embeds is not None:
+            batch_inputs["inputs_embeds"] = inputs_embeds
+        if images is not None:
+            # Llama 3.2 Visionでは'images'ではなく'pixel_values'を使用
+            batch_inputs["pixel_values"] = images
+            
+            # バッチサイズを取得
+            if isinstance(images, torch.Tensor):
+                batch_size = images.shape[0]
+                # aspect_ratio_idsを作成（デフォルトで0）
+                device = images.device
+                batch_inputs["aspect_ratio_ids"] = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+        return batch_inputs
