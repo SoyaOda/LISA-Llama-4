@@ -610,8 +610,24 @@ class LISAForCausalLM(nn.Module):
         return new_embeddings
 
     def get_visual_embs(self, pixel_values: torch.FloatTensor):
+        """
+        SAMビジュアルエンコーダーを使用して画像の特徴抽出を行う
+        
+        Args:
+            pixel_values: 入力画像 [batch_size, channels, height, width]
+            
+        Returns:
+            image_embeddings: SAMの画像埋め込み
+        """
         with torch.no_grad():
             # バッチサイズが大きい場合は分割処理
+            if pixel_values is None:
+                raise ValueError("入力画像 (pixel_values) がNoneです")
+            
+            # SAMのvisual_modelが存在するか確認
+            if not hasattr(self, "lisa_model") or not hasattr(self.lisa_model, "visual_model"):
+                raise AttributeError("visual_modelが見つかりません。SAMモデルが正しく初期化されていない可能性があります。")
+            
             batch_size = pixel_values.shape[0]
             max_batch_per_iter = 1  # GPUメモリに余裕がある場合は2や4に増やせます
             
@@ -623,6 +639,10 @@ class LISAForCausalLM(nn.Module):
             # 処理中に一時的にbf16/fp16に変換してメモリ使用量を削減
             original_dtype = pixel_values.dtype
             
+            # データ型チェック
+            if original_dtype == torch.bfloat16:
+                print(f"SAMエンコーダー: 入力画像がBFloat16形式です。処理前に変換を行います。")
+            
             for i in range(0, batch_size, max_batch_per_iter):
                 # 毎回明示的にキャッシュをクリア
                 torch.cuda.empty_cache()
@@ -631,19 +651,69 @@ class LISAForCausalLM(nn.Module):
                 end_idx = min(i + max_batch_per_iter, batch_size)
                 current_batch = pixel_values[i:end_idx]
                 
-                # bf16/fp16での処理（メモリ効率化）
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                    # SAMのイメージエンコーダーを実行
-                    image_embeddings = self.lisa_model.visual_model.image_encoder(current_batch)
-                    
-                    # 元の精度に戻す
-                    image_embeddings = image_embeddings.to(original_dtype)
-                    
-                    image_embeddings_list.append(image_embeddings)
+                # SAMエンコーダーはどのデータ型をサポートしているか確認
+                # PyTorchのコンバージョン互換性のために明示的にfloat32に変換
+                if hasattr(self.lisa_model.visual_model.image_encoder, "pixel_mean") and \
+                   hasattr(self.lisa_model.visual_model.image_encoder, "dtype"):
+                    # SAMエンコーダーの推奨データ型を取得
+                    target_dtype = getattr(self.lisa_model.visual_model.image_encoder, "dtype", torch.float32)
+                    if current_batch.dtype != target_dtype:
+                        print(f"SAMエンコーダー: 画像データを{current_batch.dtype}から{target_dtype}に変換します")
+                        current_batch = current_batch.to(target_dtype)
+                else:
+                    # SAMエンコーダーの仕様が不明な場合はfloat32を使用
+                    if current_batch.dtype != torch.float32:
+                        print(f"SAMエンコーダー: データ型が不明のため、画像データを{current_batch.dtype}からfloat32に変換します")
+                        current_batch = current_batch.to(torch.float32)
+                
+                try:
+                    # bf16/fp16での処理（メモリ効率化）
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                        # SAMのイメージエンコーダーを実行
+                        try:
+                            image_embeddings = self.lisa_model.visual_model.image_encoder(current_batch)
+                        except Exception as e:
+                            print(f"SAMイメージエンコーダーの実行中にエラーが発生しました: {e}")
+                            # 考えられる問題のデバッグ情報を出力
+                            print(f"現在のバッチ形状: {current_batch.shape}, データ型: {current_batch.dtype}")
+                            print(f"イメージエンコーダーのデバイス: {next(self.lisa_model.visual_model.image_encoder.parameters()).device}")
+                            print(f"入力データのデバイス: {current_batch.device}")
+                            
+                            # デバイスの不一致を修正して再試行
+                            encoder_device = next(self.lisa_model.visual_model.image_encoder.parameters()).device
+                            if current_batch.device != encoder_device:
+                                print(f"デバイスの不一致を修正: {current_batch.device} -> {encoder_device}")
+                                current_batch = current_batch.to(encoder_device)
+                                image_embeddings = self.lisa_model.visual_model.image_encoder(current_batch)
+                            else:
+                                # 他の理由でエラーが発生している場合は再度例外を発生
+                                raise
+                        
+                        # 元の精度に戻す
+                        image_embeddings = image_embeddings.to(original_dtype)
+                        
+                        image_embeddings_list.append(image_embeddings)
+                except RuntimeError as e:
+                    # メモリ不足などの実行時エラー
+                    if "out of memory" in str(e):
+                        print(f"メモリ不足のため、FP32で再試行します: {e}")
+                        # メモリ効率を犠牲にしてFP32で試行
+                        image_embeddings = self.lisa_model.visual_model.image_encoder(current_batch)
+                        image_embeddings = image_embeddings.to(original_dtype)
+                        image_embeddings_list.append(image_embeddings)
+                    else:
+                        # その他のランタイムエラー
+                        print(f"SAMエンコーダーの実行中にエラーが発生しました: {e}")
+                        raise
             
             # 最終的なバッチの結合
             torch.cuda.empty_cache()
-            image_embeddings = torch.cat(image_embeddings_list, 0)
+            if len(image_embeddings_list) == 1:
+                # 単一バッチの場合は結合の必要なし
+                image_embeddings = image_embeddings_list[0]
+            else:
+                # 複数バッチがある場合は結合
+                image_embeddings = torch.cat(image_embeddings_list, 0)
             
         return image_embeddings
 
@@ -667,6 +737,7 @@ class LISAForCausalLM(nn.Module):
         inputs_embeds=None,
         offset=None,
         resize_list=None,
+        original_size_list=None,
         inference=False,
         tokenizer=None,
         **kwargs
@@ -674,7 +745,8 @@ class LISAForCausalLM(nn.Module):
         # SAMの特徴を抽出
         image_embeddings = self.get_visual_embs(images)
         batch_size = image_embeddings.shape[0]
-        assert batch_size == len(offset) - 1
+        if offset is not None:
+            assert batch_size == len(offset) - 1, f"バッチサイズ {batch_size} とオフセット長 {len(offset)} が一致しません"
 
         # input_idsが1次元の場合、2次元に変換
         if input_ids.dim() == 1:
@@ -689,52 +761,6 @@ class LISAForCausalLM(nn.Module):
                 attention_masks = attention_masks.unsqueeze(0)
             if labels is not None and labels.dim() == 1:
                 labels = labels.unsqueeze(0)
-                
-        # <SEG>トークンのマスクを作成
-        seg_token_mask = input_ids[:, 1:] == self.seg_token_idx
-        seg_token_mask = torch.cat(
-            [
-                seg_token_mask,
-                torch.zeros((seg_token_mask.shape[0], 1)).bool().to(seg_token_mask.device),
-            ],
-            dim=1,
-        )
-
-        # <SEG>トークンの埋め込みを取得
-        # MllamaForConditionalGenerationモデルでは、text_modelからトークン埋め込みにアクセス
-        # オリジナルのLISAではself.model.llama_model.model.embed_tokensを使用していた
-        if hasattr(self.model, "text_model") and hasattr(self.model.text_model, "embed_tokens"):
-            embed_tokens_fn = self.model.text_model.embed_tokens
-        elif hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
-            embed_tokens_fn = self.model.model.embed_tokens
-        elif hasattr(self.model, "base_model") and hasattr(self.model.base_model, "embed_tokens"):
-            embed_tokens_fn = self.model.base_model.embed_tokens
-        else:
-            # フォールバック：get_input_embeddingsを使用
-            embed_tokens_fn = self.get_input_embeddings()
-            if not callable(embed_tokens_fn):
-                # get_input_embeddingsがモジュールの場合は、callableなオブジェクトを作成
-                _embed_tokens_fn = embed_tokens_fn
-                embed_tokens_fn = lambda x: _embed_tokens_fn(x)
-        
-        # 埋め込みトークンの取得
-        embedding_token_seg = None
-        # エラーに備えてトークン埋め込みの取得を試みる
-        try:
-            embedding_token_seg = torch.tensor([self.seg_token_idx], device=input_ids.device)
-            embedding_token_seg = embed_tokens_fn(embedding_token_seg)
-            embedding_token_seg = embedding_token_seg.squeeze(0)
-        except Exception as e:
-            print(f"警告: <SEG>トークンの埋め込み取得中にエラーが発生しました: {e}")
-            # 失敗した場合は、代替の埋め込みを生成（例：ランダムな埋め込み）
-            if hasattr(self.model, "text_model") and hasattr(self.model.text_model, "config"):
-                embed_dim = self.model.text_model.config.hidden_size
-            elif hasattr(self.model, "config") and hasattr(self.model.config, "hidden_size"):
-                embed_dim = self.model.config.hidden_size
-            else:
-                # デフォルト値
-                embed_dim = 4096
-            embedding_token_seg = torch.randn(embed_dim, device=input_ids.device) * 0.02
 
         processor = self.get_processor()
         
@@ -821,10 +847,61 @@ class LISAForCausalLM(nn.Module):
             else:
                 images_for_processor = images_clip
             
-            print(f"processorに渡す画像形状: {images_for_processor.shape}")
+            # BFloat16データ型の画像を扱う際にエラーが発生するため、float32に変換
+            if images_for_processor.dtype == torch.bfloat16:
+                print(f"画像データをBFloat16からfloat32に変換します")
+                images_for_processor = images_for_processor.to(torch.float32)
+                
+                # もし通常の変換が失敗する場合、PILライブラリを使った代替手段を試みる
+                try:
+                    # テスト変換 - これでNumPyへの変換ができるか確認
+                    test_np = images_for_processor[0].detach().cpu().numpy()
+                    print(f"NumPy変換テスト成功: shape={test_np.shape}, dtype={test_np.dtype}")
+                except Exception as e:
+                    print(f"警告: NumPy変換テストに失敗しました: {e}")
+                    print(f"PILを使った代替変換を試みます")
+                    try:
+                        import numpy as np
+                        from PIL import Image
+                        
+                        # PILを使った代替変換方法
+                        def tensor_to_pil_list(tensor):
+                            """テンソルをPILイメージのリストに変換"""
+                            tensor = tensor.cpu()
+                            if tensor.dtype == torch.bfloat16:
+                                tensor = tensor.to(torch.float32)
+                            
+                            # [batch, channels, height, width] → リストの [height, width, channels]
+                            images = []
+                            for i in range(tensor.shape[0]):
+                                # チャネルを最後に移動し、0-255の範囲に変換
+                                img_np = tensor[i].permute(1, 2, 0).numpy()
+                                img_np = np.clip(img_np * 255, 0, 255).astype(np.uint8)
+                                img_pil = Image.fromarray(img_np)
+                                images.append(img_pil)
+                            return images
+                        
+                        # テンソルをPILイメージのリストに変換
+                        images_for_processor = tensor_to_pil_list(images_for_processor)
+                        print(f"PILイメージリストに変換しました: {len(images_for_processor)}個の画像")
+                    except Exception as alt_e:
+                        print(f"PIL変換も失敗しました: {alt_e}")
+                        print(f"データ型変換が解決しないため、このまま処理を続行します")
+            
+            print(f"processorに渡す画像形状: {images_for_processor.shape if hasattr(images_for_processor, 'shape') else type(images_for_processor)}, データ型: {images_for_processor.dtype if hasattr(images_for_processor, 'dtype') else 'PIL Images'}")
         else:
             images_for_processor = None
             print("画像データなし")
+        
+        # <SEG>トークンのマスクを作成（元のLISAコードを参考にしているが、現時点では未使用）
+        seg_token_mask = input_ids[:, 1:] == self.seg_token_idx
+        seg_token_mask = torch.cat(
+            [
+                seg_token_mask,
+                torch.zeros((seg_token_mask.shape[0], 1)).bool().to(seg_token_mask.device),
+            ],
+            dim=1,
+        )
         
         # プロセッサで入力を準備
         try:
@@ -847,8 +924,28 @@ class LISAForCausalLM(nn.Module):
                 processor_inputs = {k: v.to(device) for k, v in processor_inputs.items()}
             
             print("プロセッサ実行成功")
+        except TypeError as e:
+            # データ型関連のエラーを詳細に表示
+            if "ScalarType" in str(e):
+                print(f"データ型エラー: {e}")
+                if images_for_processor is not None:
+                    print(f"画像データ型: {images_for_processor.dtype}")
+                    print(f"このエラーは通常、NumPyがサポートしていないデータ型（例えばbfloat16）が原因です。")
+                    print(f"images_for_processorをfloat32に変換してください。")
+            raise e
         except Exception as e:
+            # その他のエラー
             print(f"プロセッサエラー: {e}")
+            print(f"入力データ情報:")
+            print(f"  text_input: type={type(text_input)}")
+            if isinstance(text_input, list):
+                print(f"  text_input長さ: {len(text_input)}")
+                if len(text_input) > 0:
+                    print(f"  最初のアイテム: {text_input[0][:50]}..." if len(text_input[0]) > 50 else text_input[0])
+            
+            if images_for_processor is not None:
+                print(f"  images_for_processor: shape={images_for_processor.shape}, dtype={images_for_processor.dtype}")
+            
             raise e
         
         # 変換されたpixel_valuesとaspect_ratio_idsをデバッグ表示
@@ -866,8 +963,27 @@ class LISAForCausalLM(nn.Module):
         # 出力からhidden_statesを取得
         last_hidden_state = outputs.hidden_states[-1]
         
-        # <SEG>トークンの位置を特定して処理
-        # hidden_statesを処理してマスク生成に使用
+        # Llama3.2 Visionの出力からラベルを取得
+        if hasattr(outputs, 'logits'):
+            output_ids = torch.argmax(outputs.logits, dim=-1)
+        else:
+            # logtisがない場合はinput_idsを使用
+            output_ids = input_ids
+            print("警告: モデル出力からlogitsが見つかりません。input_idsをoutput_idsとして使用します")
+        
+        # <SEG>トークンの位置をマスクで特定
+        seg_token_mask = output_ids[:, 1:] == self.seg_token_idx
+        # プレフィックスに対応する部分（Llama3.2の場合は画像トークンの分）をパディング
+        device = output_ids.device
+        seg_token_mask = torch.cat(
+            [
+                torch.zeros((seg_token_mask.shape[0], 255)).bool().to(device),
+                seg_token_mask,
+            ],
+            dim=1,
+        )
+
+        # hidden_statesを処理
         hidden_states = []
         
         # text_hidden_fcsの取得（オリジナルのLISAでは直接self.model.text_hidden_fcsを参照）
@@ -881,22 +997,23 @@ class LISAForCausalLM(nn.Module):
             # text_hidden_fcsが見つからない場合は恒等関数を使用
             print("警告: text_hidden_fcsが見つかりません。恒等関数を使用します。")
             hidden_states.append(last_hidden_state)
-        
-        # すべての変換結果を集約
+
+        # hidden_statesを合成
         last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
         
-        # <SEG>トークンに対応する埋め込みを抽出
+        # <SEG>トークンに対応するhidden_stateを抽出
         pred_embeddings = last_hidden_state[seg_token_mask]
-        
-        # <SEG>トークンのカウントとオフセットを計算
+
+        # <SEG>トークンの数とオフセットを計算
         seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
         seg_token_offset = seg_token_counts.cumsum(-1)
         seg_token_offset = torch.cat(
-            [torch.zeros(1).long().to(seg_token_mask.device), seg_token_offset], dim=0
+            [torch.zeros(1).long().to(device), seg_token_offset], dim=0
         )
 
-        # オフセットに基づいてseg_token_offsetを調整
-        seg_token_offset = seg_token_offset[offset]
+        # offsetがNoneでなければ使用
+        if offset is not None:
+            seg_token_offset = seg_token_offset[offset]
 
         # 予測埋め込みを処理
         pred_embeddings_ = []
@@ -905,14 +1022,12 @@ class LISAForCausalLM(nn.Module):
             pred_embeddings_.append(pred_embeddings[start_i:end_i])
         pred_embeddings = pred_embeddings_
 
-        # 予測マスクを生成
+        # 各<SEG>トークンに対応するマスクを生成
         multimask_output = False
         pred_masks = []
         for i in range(len(pred_embeddings)):
-            # SAMのビジュアルモデルはLISAとLlama3.2 Visionのインテグレーションにより
-            # self.lisa_model.visual_modelで参照できる
+            # SAMのビジュアルモデルへの参照を取得
             try:
-                # SAMのプロンプトエンコーダを使用してスパース埋め込みを生成
                 if hasattr(self, "lisa_model") and hasattr(self.lisa_model, "visual_model"):
                     visual_model = self.lisa_model.visual_model
                 elif hasattr(self, "visual_model"):
@@ -920,7 +1035,7 @@ class LISAForCausalLM(nn.Module):
                 else:
                     raise AttributeError("visual_modelが見つかりません")
                 
-                # スパース埋め込みと密な埋め込みを取得
+                # スパース埋め込みと密埋め込みを取得
                 (
                     sparse_embeddings,
                     dense_embeddings,
@@ -930,11 +1045,11 @@ class LISAForCausalLM(nn.Module):
                     masks=None,
                     text_embeds=pred_embeddings[i].unsqueeze(1),
                 )
-                
-                # データ型を合わせる
+
+                # スパース埋め込みのデータ型を合わせる
                 sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
                 
-                # マスクデコーダを実行
+                # マスクを生成
                 low_res_masks, iou_predictions = visual_model.mask_decoder(
                     image_embeddings=image_embeddings[i].unsqueeze(0),
                     image_pe=visual_model.prompt_encoder.get_dense_pe(),
@@ -943,18 +1058,38 @@ class LISAForCausalLM(nn.Module):
                     multimask_output=multimask_output,
                 )
                 
-                # 予測マスクを後処理
-                # label_listの形状情報を使用
-                if label_list is not None and i < len(label_list):
-                    original_size = label_list[i].shape
-                else:
-                    original_size = (1024, 1024)  # デフォルトサイズ
-                    
-                pred_mask = visual_model.postprocess_masks(
-                    low_res_masks,
-                    input_size=resize_list[i],
-                    original_size=original_size,
-                )
+                # マスクを後処理
+                try:
+                    # original_size_listもresize_listも存在する場合
+                    if resize_list is not None and original_size_list is not None and i < len(resize_list) and i < len(original_size_list):
+                        pred_mask = visual_model.postprocess_masks(
+                            low_res_masks,
+                            input_size=resize_list[i],
+                            original_size=original_size_list[i],
+                        )
+                    # label_listから形状情報を取得できる場合
+                    elif label_list is not None and i < len(label_list):
+                        original_size = label_list[i].shape
+                        input_size = visual_model.image_encoder.img_size  # SAMのデフォルトサイズを使用
+                        pred_mask = visual_model.postprocess_masks(
+                            low_res_masks,
+                            input_size=input_size,
+                            original_size=original_size,
+                        )
+                    else:
+                        # デフォルトサイズを使用
+                        print("警告: マスクサイズ情報がありません。デフォルトサイズを使用します。")
+                        input_size = visual_model.image_encoder.img_size
+                        original_size = (1024, 1024)  # デフォルトサイズ
+                        pred_mask = visual_model.postprocess_masks(
+                            low_res_masks,
+                            input_size=input_size,
+                            original_size=original_size,
+                        )
+                except Exception as post_e:
+                    print(f"マスク後処理中にエラーが発生しました: {post_e}")
+                    # エラーの場合はlow_res_masksをそのまま使用
+                    pred_mask = low_res_masks
                 
                 pred_masks.append(pred_mask[:, 0])
                 
@@ -1029,184 +1164,6 @@ class LISAForCausalLM(nn.Module):
             "mask_dice_loss": mask_dice_loss,
             "mask_loss": mask_loss,
         }
-
-    def evaluate(
-        self,
-        images_clip,
-        images,
-        input_ids,
-        resize_list,
-        original_size_list,
-        max_new_tokens=32,
-        tokenizer=None,
-    ):
-        with torch.no_grad():
-            # テキスト入力の準備
-            if isinstance(input_ids, str):
-                # 文字列が直接渡された場合
-                if '<|image|>' not in input_ids:
-                    # <|image|>トークンがなければ追加
-                    user_prefix = "User: "
-                    if user_prefix in input_ids:
-                        pos = input_ids.find(user_prefix) + len(user_prefix)
-                        text_input = input_ids[:pos] + "<|image|> " + input_ids[pos:]
-                    else:
-                        text_input = "<|image|> " + input_ids
-                else:
-                    text_input = input_ids
-            elif tokenizer is not None and isinstance(input_ids, torch.Tensor):
-                # トークンIDからテキストにデコード
-                decoded_text = tokenizer.batch_decode(input_ids, skip_special_tokens=False)
-                text_input = []
-                for text in decoded_text:
-                    if '<|image|>' not in text:
-                        user_prefix = "User: "
-                        if user_prefix in text:
-                            pos = text.find(user_prefix) + len(user_prefix)
-                            text = text[:pos] + "<|image|> " + text[pos:]
-                        else:
-                            text = "<|image|> " + text
-                    text_input.append(text)
-            else:
-                # その他の場合はそのまま使用
-                text_input = input_ids
-            
-            # Llama3.2 vision用に入力を準備
-            processor = self.get_processor()
-            
-            # processorは'images'を'pixel_values'に内部的に変換してくれる
-            batch_inputs = processor(
-                text=text_input,
-                images=images_clip,
-                return_tensors="pt",
-                padding=True,
-            )
-            
-            # デバイスを合わせる（model.deviceを使用せず入力のデバイスから推測）
-            device = next(self.model.parameters()).device
-            batch_inputs = {k: v.to(device) for k, v in batch_inputs.items()}
-            
-            # 生成パラメータを設定
-            generation_config = {
-                "max_new_tokens": max_new_tokens,
-                "num_beams": 1,
-                "output_hidden_states": True,
-                "return_dict_in_generate": True,
-            }
-            
-            # テキスト生成を実行
-            outputs = self.model.generate(**batch_inputs, **generation_config)
-            output_hidden_states = outputs.hidden_states[-1]
-            output_ids = outputs.sequences
-
-            # <SEG>トークンの位置をマスクで特定
-            seg_token_mask = output_ids[:, 1:] == self.seg_token_idx
-            # プレフィックスに対応する部分（Llama3.2の場合は画像トークンの分）をパディング
-            seg_token_mask = torch.cat(
-                [
-                    torch.zeros((seg_token_mask.shape[0], 255)).bool().to(device),
-                    seg_token_mask,
-                ],
-                dim=1,
-            )
-
-            # hidden_statesを処理
-            hidden_states = []
-            
-            # text_hidden_fcsの取得（オリジナルのLISAでは直接self.model.text_hidden_fcsを参照）
-            # 現在の実装ではself.lisa_model.text_hidden_fcsに存在する
-            if hasattr(self, "lisa_model") and hasattr(self.lisa_model, "text_hidden_fcs"):
-                text_hidden_fcs = self.lisa_model.text_hidden_fcs
-                # 各変換関数を適用
-                for fc in text_hidden_fcs:
-                    hidden_states.append(fc(output_hidden_states))
-            else:
-                # text_hidden_fcsが見つからない場合は恒等関数を使用
-                print("警告: text_hidden_fcsが見つかりません。恒等関数を使用します。")
-                hidden_states.append(output_hidden_states)
-
-            # hidden_statesを合成
-            last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
-            
-            # <SEG>トークンに対応するhidden_stateを抽出
-            pred_embeddings = last_hidden_state[seg_token_mask]
-
-            # <SEG>トークンの数とオフセットを計算
-            seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
-            seg_token_offset = seg_token_counts.cumsum(-1)
-            seg_token_offset = torch.cat(
-                [torch.zeros(1).long().to(device), seg_token_offset], dim=0
-            )
-
-            # 予測埋め込みを処理
-            pred_embeddings_ = []
-            for i in range(len(seg_token_offset) - 1):
-                start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
-                pred_embeddings_.append(pred_embeddings[start_i:end_i])
-            pred_embeddings = pred_embeddings_
-
-            # SAMの画像埋め込みを取得
-            image_embeddings = self.get_visual_embs(images)
-
-            # 各<SEG>トークンに対応するマスクを生成
-            multimask_output = False
-            pred_masks = []
-            for i in range(len(pred_embeddings)):
-                # SAMのビジュアルモデルへの参照を取得
-                try:
-                    if hasattr(self, "lisa_model") and hasattr(self.lisa_model, "visual_model"):
-                        visual_model = self.lisa_model.visual_model
-                    elif hasattr(self, "visual_model"):
-                        visual_model = self.visual_model
-                    else:
-                        raise AttributeError("visual_modelが見つかりません")
-                    
-                    # スパース埋め込みと密埋め込みを取得
-                    (
-                        sparse_embeddings,
-                        dense_embeddings,
-                    ) = visual_model.prompt_encoder(
-                        points=None,
-                        boxes=None,
-                        masks=None,
-                        text_embeds=pred_embeddings[i].unsqueeze(1),
-                    )
-
-                    # スパース埋め込みのデータ型を合わせる
-                    sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
-                    
-                    # マスクを生成
-                    low_res_masks, iou_predictions = visual_model.mask_decoder(
-                        image_embeddings=image_embeddings[i].unsqueeze(0),
-                        image_pe=visual_model.prompt_encoder.get_dense_pe(),
-                        sparse_prompt_embeddings=sparse_embeddings,
-                        dense_prompt_embeddings=dense_embeddings,
-                        multimask_output=multimask_output,
-                    )
-                    
-                    # マスクを後処理
-                    pred_mask = visual_model.postprocess_masks(
-                        low_res_masks,
-                        input_size=resize_list[i],
-                        original_size=original_size_list[i],
-                    )
-                    pred_masks.append(pred_mask[:, 0])
-                    
-                except Exception as e:
-                    print(f"評価中にマスク生成でエラーが発生しました: {e}")
-                    # エラーが発生した場合は空のマスクを返す
-                    if original_size_list is not None and i < len(original_size_list):
-                        shape = original_size_list[i]
-                        if isinstance(shape, tuple) and len(shape) == 2:
-                            empty_mask = torch.zeros((1, *shape), device=pred_embeddings[i].device)
-                        else:
-                            empty_mask = torch.zeros((1, 100, 100), device=pred_embeddings[i].device)
-                    else:
-                        empty_mask = torch.zeros((1, 100, 100), device=pred_embeddings[i].device)
-                    pred_masks.append(empty_mask)
-                    print("警告: ダミーマスクを使用しています")
-
-        return output_ids, pred_masks
 
     def prepare_inputs_for_generation(
         self,
