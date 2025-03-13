@@ -1,5 +1,5 @@
 from typing import List
-
+import traceback
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,6 +24,7 @@ from safetensors import safe_open
 import collections.abc
 from transformers.utils import is_flash_attn_2_available
 import json
+from PIL import Image
 
 # llama3_2モジュールからのインポートパスを修正
 try:
@@ -851,69 +852,97 @@ class LISAForCausalLM(nn.Module):
             if images_for_processor.dtype == torch.bfloat16:
                 print(f"画像データをBFloat16からfloat32に変換します")
                 images_for_processor = images_for_processor.to(torch.float32)
+            
+            # テンソル形式の画像を0-1の範囲に正規化
+            try:
+                min_val = torch.min(images_for_processor).item()
+                max_val = torch.max(images_for_processor).item()
+                print(f"画像値の範囲（正規化前）: [{min_val}, {max_val}]")
                 
-                # もし通常の変換が失敗する場合、PILライブラリを使った代替手段を試みる
-                try:
-                    # テスト変換 - これでNumPyへの変換ができるか確認
-                    test_np = images_for_processor[0].detach().cpu().numpy()
-                    print(f"NumPy変換テスト成功: shape={test_np.shape}, dtype={test_np.dtype}")
-                except Exception as e:
-                    print(f"警告: NumPy変換テストに失敗しました: {e}")
-                    print(f"PILを使った代替変換を試みます")
-                    try:
-                        import numpy as np
-                        from PIL import Image
-                        
-                        # PILを使った代替変換方法
-                        def tensor_to_pil_list(tensor):
-                            """テンソルをPILイメージのリストに変換"""
-                            tensor = tensor.cpu()
-                            if tensor.dtype == torch.bfloat16:
-                                tensor = tensor.to(torch.float32)
-                            
-                            # [batch, channels, height, width] → リストの [height, width, channels]
-                            images = []
-                            for i in range(tensor.shape[0]):
-                                # チャネルを最後に移動し、0-255の範囲に変換
-                                img_np = tensor[i].permute(1, 2, 0).numpy()
-                                img_np = np.clip(img_np * 255, 0, 255).astype(np.uint8)
-                                img_pil = Image.fromarray(img_np)
-                                images.append(img_pil)
-                            return images
-                        
-                        # テンソルをPILイメージのリストに変換
-                        images_for_processor = tensor_to_pil_list(images_for_processor)
-                        print(f"PILイメージリストに変換しました: {len(images_for_processor)}個の画像")
-                    except Exception as alt_e:
-                        print(f"PIL変換も失敗しました: {alt_e}")
-                        print(f"データ型変換が解決しないため、このまま処理を続行します")
-            
-            # テンソル形式の画像を0-1の範囲に正規化（PILリストでない場合のみ）
-            if isinstance(images_for_processor, torch.Tensor):
-                try:
-                    # 現在の値の範囲を確認
-                    min_val = torch.min(images_for_processor).item()
-                    max_val = torch.max(images_for_processor).item()
-                    print(f"画像値の範囲（正規化前）: [{min_val}, {max_val}]")
+                if min_val < 0 or max_val > 1:
+                    # 値が0-1の範囲外の場合、正規化を行う
+                    if min_val == max_val:
+                        # すべての値が同じ場合（レアケース）
+                        images_for_processor = torch.zeros_like(images_for_processor)
+                    else:
+                        # min-max正規化を適用
+                        images_for_processor = (images_for_processor - min_val) / (max_val - min_val)
                     
-                    if min_val < 0 or max_val > 1:
-                        # 値が0-1の範囲外の場合、正規化を行う
-                        if min_val == max_val:
-                            # すべての値が同じ場合（レアケース）
-                            images_for_processor = torch.zeros_like(images_for_processor)
-                        else:
-                            # min-max正規化を適用
-                            images_for_processor = (images_for_processor - min_val) / (max_val - min_val)
+                    # 正規化後の範囲を確認
+                    new_min = torch.min(images_for_processor).item()
+                    new_max = torch.max(images_for_processor).item()
+                    print(f"画像値の範囲（正規化後）: [{new_min}, {new_max}]")
+            except Exception as e:
+                print(f"画像正規化中にエラーが発生しました: {e}")
+                print(f"エラーの詳細情報:")
+                traceback.print_exc()
+                # PILへの変換に失敗した場合、元のテンソルを使用（エラーを出すことで問題診断が可能）
+                # エラー回避はしない
+
+            # テンソルからPILイメージに変換（これは常に行う）
+            try:
+                # テンソルをPILイメージのリストに変換する関数
+                def tensor_to_pil_images(tensor):
+                    """テンソルをPILイメージのリストに変換"""
+                    if tensor.dim() < 3:
+                        raise ValueError(f"画像テンソルは少なくとも3次元必要です。現在の形状: {tensor.shape}")
+                    
+                    # CPUに移動しておく
+                    tensor = tensor.detach().cpu()
+                    
+                    # バッチ処理
+                    if tensor.dim() == 4:  # [batch, channels, height, width]
+                        pil_images = []
+                        for i in range(tensor.shape[0]):
+                            # チャネルを最後に移動 [channels, height, width] -> [height, width, channels]
+                            img_np = tensor[i].permute(1, 2, 0).numpy()
+                            
+                            # 値が[0,1]の範囲外の場合は、クリッピング
+                            img_np = np.clip(img_np, 0, 1)
+                            
+                            # [0,1]から[0,255]へスケーリング
+                            img_np = (img_np * 255).astype(np.uint8)
+                            
+                            # NumPyからPILへ変換
+                            img_pil = Image.fromarray(img_np)
+                            pil_images.append(img_pil)
+                        return pil_images
+                    elif tensor.dim() == 3:  # 単一画像 [channels, height, width]
+                        # チャネルを最後に移動 [channels, height, width] -> [height, width, channels]
+                        img_np = tensor.permute(1, 2, 0).numpy()
                         
-                        # 正規化後の範囲を確認
-                        new_min = torch.min(images_for_processor).item()
-                        new_max = torch.max(images_for_processor).item()
-                        print(f"画像値の範囲（正規化後）: [{new_min}, {new_max}]")
-                except Exception as e:
-                    print(f"画像正規化中にエラーが発生しました: {e}")
-                    # エラーが発生しても処理を続行
+                        # 値が[0,1]の範囲外の場合は、クリッピング
+                        img_np = np.clip(img_np, 0, 1)
+                        
+                        # [0,1]から[0,255]へスケーリング
+                        img_np = (img_np * 255).astype(np.uint8)
+                        
+                        # NumPyからPILへ変換
+                        img_pil = Image.fromarray(img_np)
+                        return [img_pil]
+                    else:
+                        raise ValueError(f"サポートされていないテンソル形状: {tensor.shape}")
+                
+                # テンソルをPILイメージに変換
+                pil_images = tensor_to_pil_images(images_for_processor)
+                print(f"画像をPILイメージに変換しました: {len(pil_images)}個の画像")
+                
+                # 複数の画像がある場合、各画像の情報を表示
+                if len(pil_images) > 0:
+                    print(f"最初のPIL画像サイズ: {pil_images[0].size}, モード: {pil_images[0].mode}")
+                
+                # PILイメージをプロセッサに渡すために格納
+                images_for_processor = pil_images
+            except Exception as e:
+                print(f"PILへの変換中にエラーが発生しました: {e}")
+                print(f"エラーの詳細情報:")
+                traceback.print_exc()
+                # PILへの変換に失敗した場合、元のテンソルを使用（エラーを出すことで問題診断が可能）
+                # エラー回避はしない
             
-            print(f"processorに渡す画像形状: {images_for_processor.shape if hasattr(images_for_processor, 'shape') else type(images_for_processor)}, データ型: {images_for_processor.dtype if hasattr(images_for_processor, 'dtype') else 'PIL Images'}")
+            print(f"processorに渡す画像形式: {type(images_for_processor)}")
+            if isinstance(images_for_processor, list) and len(images_for_processor) > 0:
+                print(f"  最初の要素の型: {type(images_for_processor[0])}")
         else:
             images_for_processor = None
             print("画像データなし")
@@ -928,215 +957,109 @@ class LISAForCausalLM(nn.Module):
             dim=1,
         )
         
-        # プロセッサで入力を準備
+        # プロセッサ呼び出し部分
         try:
-            if images_for_processor is not None:
+            if processor is not None and images_for_processor is not None:
+                # プロンプトにimage tokenを追加
+                if isinstance(text_input, str):
+                    # 単一のテキスト入力の場合、リストに変換
+                    text_input = [f"<|image|> {text_input}"]
+                elif isinstance(text_input, list):
+                    # リスト内の各テキストを処理
+                    for i in range(len(text_input)):
+                        if not text_input[i].startswith("<|image|>"):
+                            text_input[i] = f"<|image|> {text_input[i]}"
+                
+                print(f"入力データ情報:")
+                print(f"  text_input: type={type(text_input)}")
+                if isinstance(text_input, list):
+                    print(f"  text_input長さ: {len(text_input)}")
+                    if len(text_input) > 0:
+                        print(f"  最初のアイテム: {text_input[0][:50]}...")
+                
+                if isinstance(images_for_processor, list):
+                    print(f"  images_for_processor: リスト（PILイメージ）長さ={len(images_for_processor)}")
+                else:
+                    print(f"  images_for_processor: shape={images_for_processor.shape if hasattr(images_for_processor, 'shape') else 'unknown'}, dtype={images_for_processor.dtype if hasattr(images_for_processor, 'dtype') else 'unknown'}")
+                
+                # Llama3.2 Visionモデルのプロセッサを使用して入力を処理
                 processor_inputs = processor(
                     text=text_input,
                     images=images_for_processor,
                     return_tensors="pt",
-                    padding=True,
+                    padding=True
                 )
+                
+                # デバイスを合わせる
+                if device is not None and processor_inputs is not None:
+                    processor_inputs = {k: v.to(device) for k, v in processor_inputs.items()}
+                
+                # 必要に応じてプロセッサの出力の形状を表示
+                if processor_inputs is not None and all(key in processor_inputs for key in ["input_ids", "attention_mask"]):
+                    print(f"processor出力: input_ids={processor_inputs['input_ids'].shape}, attention_mask={processor_inputs['attention_mask'].shape}")
+                    if "pixel_values" in processor_inputs:
+                        print(f"  pixel_values={processor_inputs['pixel_values'].shape}")
             else:
-                processor_inputs = processor(
-                    text=text_input,
-                    return_tensors="pt",
-                    padding=True,
-                )
-            
-            # デバイスを合わせる
-            if device is not None:
-                processor_inputs = {k: v.to(device) for k, v in processor_inputs.items()}
-            
-            print("プロセッサ実行成功")
-        except TypeError as e:
-            # データ型関連のエラーを詳細に表示
-            if "ScalarType" in str(e):
-                print(f"データ型エラー: {e}")
-                if images_for_processor is not None:
-                    print(f"画像データ型: {images_for_processor.dtype}")
-                    print(f"このエラーは通常、NumPyがサポートしていないデータ型（例えばbfloat16）が原因です。")
-                    print(f"images_for_processorをfloat32に変換してください。")
-            raise e
+                processor_inputs = None
+                print("プロセッサまたは画像データが利用できません")
         except Exception as e:
-            # その他のエラー
+            processor_inputs = None
             print(f"プロセッサエラー: {e}")
             print(f"入力データ情報:")
             print(f"  text_input: type={type(text_input)}")
             if isinstance(text_input, list):
                 print(f"  text_input長さ: {len(text_input)}")
                 if len(text_input) > 0:
-                    print(f"  最初のアイテム: {text_input[0][:50]}..." if len(text_input[0]) > 50 else text_input[0])
+                    print(f"  最初のアイテム: {text_input[0][:50]}...")
             
-            if images_for_processor is not None:
-                print(f"  images_for_processor: shape={images_for_processor.shape}, dtype={images_for_processor.dtype}")
-            
-            raise e
+            if isinstance(images_for_processor, list):
+                print(f"  images_for_processor: リスト長さ={len(images_for_processor)}")
+            else:
+                print(f"  images_for_processor: shape={images_for_processor.shape if hasattr(images_for_processor, 'shape') else type(images_for_processor)}, dtype={images_for_processor.dtype if hasattr(images_for_processor, 'dtype') else 'unknown'}")
         
-        # 変換されたpixel_valuesとaspect_ratio_idsをデバッグ表示
-        if "pixel_values" in processor_inputs:
-            print(f"変換されたpixel_values形状: {processor_inputs['pixel_values'].shape}")
-        if "aspect_ratio_ids" in processor_inputs:
-            print(f"aspect_ratio_ids: {processor_inputs['aspect_ratio_ids']}")
-            
         # 出力のhidden statesを要求
-        processor_inputs["output_hidden_states"] = True
+        output_hidden_states = True if seg_token_idx is not None else False
         
-        # 必要なパラメータでモデルを呼び出す
-        outputs = self.model(**processor_inputs)
-        
-        # 出力からhidden_statesを取得
-        last_hidden_state = outputs.hidden_states[-1]
-        
-        # Llama3.2 Visionの出力からラベルを取得
-        if hasattr(outputs, 'logits'):
-            output_ids = torch.argmax(outputs.logits, dim=-1)
-        else:
-            # logtisがない場合はinput_idsを使用
-            output_ids = input_ids
-            print("警告: モデル出力からlogitsが見つかりません。input_idsをoutput_idsとして使用します")
-        
-        # <SEG>トークンの位置をマスクで特定
-        seg_token_mask = output_ids[:, 1:] == self.seg_token_idx
-        # プレフィックスに対応する部分（Llama3.2の場合は画像トークンの分）をパディング
-        device = output_ids.device
-        seg_token_mask = torch.cat(
-            [
-                torch.zeros((seg_token_mask.shape[0], 255)).bool().to(device),
-                seg_token_mask,
-            ],
-            dim=1,
-        )
-
-        # hidden_statesを処理
-        hidden_states = []
-        
-        # text_hidden_fcsの取得（オリジナルのLISAでは直接self.model.text_hidden_fcsを参照）
-        # 現在の実装ではself.lisa_model.text_hidden_fcsに存在する
-        if hasattr(self, "lisa_model") and hasattr(self.lisa_model, "text_hidden_fcs"):
-            text_hidden_fcs = self.lisa_model.text_hidden_fcs
-            # 各変換関数を適用
-            for fc in text_hidden_fcs:
-                hidden_states.append(fc(last_hidden_state))
-        else:
-            # text_hidden_fcsが見つからない場合は恒等関数を使用
-            print("警告: text_hidden_fcsが見つかりません。恒等関数を使用します。")
-            hidden_states.append(last_hidden_state)
-
-        # hidden_statesを合成
-        last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
-        
-        # <SEG>トークンに対応するhidden_stateを抽出
-        pred_embeddings = last_hidden_state[seg_token_mask]
-
-        # <SEG>トークンの数とオフセットを計算
-        seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
-        seg_token_offset = seg_token_counts.cumsum(-1)
-        seg_token_offset = torch.cat(
-            [torch.zeros(1).long().to(device), seg_token_offset], dim=0
-        )
-
-        # offsetがNoneでなければ使用
-        if offset is not None:
-            seg_token_offset = seg_token_offset[offset]
-
-        # 予測埋め込みを処理
-        pred_embeddings_ = []
-        for i in range(len(seg_token_offset) - 1):
-            start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
-            pred_embeddings_.append(pred_embeddings[start_i:end_i])
-        pred_embeddings = pred_embeddings_
-
-        # 各<SEG>トークンに対応するマスクを生成
-        multimask_output = False
-        pred_masks = []
-        for i in range(len(pred_embeddings)):
-            # SAMのビジュアルモデルへの参照を取得
+        # モデル実行
+        vision_x = None
+        if processor_inputs is not None:
             try:
-                if hasattr(self, "lisa_model") and hasattr(self.lisa_model, "visual_model"):
-                    visual_model = self.lisa_model.visual_model
-                elif hasattr(self, "visual_model"):
-                    visual_model = self.visual_model
-                else:
-                    raise AttributeError("visual_modelが見つかりません")
-                
-                # スパース埋め込みと密埋め込みを取得
-                (
-                    sparse_embeddings,
-                    dense_embeddings,
-                ) = visual_model.prompt_encoder(
-                    points=None,
-                    boxes=None,
-                    masks=None,
-                    text_embeds=pred_embeddings[i].unsqueeze(1),
+                outputs = self.lisa_model.model(
+                    input_ids=processor_inputs.get("input_ids"),
+                    attention_mask=processor_inputs.get("attention_mask"),
+                    pixel_values=processor_inputs.get("pixel_values", None),
+                    cache_data=None,
+                    input_vt_spi=None,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=True,
                 )
-
-                # スパース埋め込みのデータ型を合わせる
-                sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
-                
-                # マスクを生成
-                low_res_masks, iou_predictions = visual_model.mask_decoder(
-                    image_embeddings=image_embeddings[i].unsqueeze(0),
-                    image_pe=visual_model.prompt_encoder.get_dense_pe(),
-                    sparse_prompt_embeddings=sparse_embeddings,
-                    dense_prompt_embeddings=dense_embeddings,
-                    multimask_output=multimask_output,
-                )
-                
-                # マスクを後処理
-                try:
-                    # original_size_listもresize_listも存在する場合
-                    if resize_list is not None and original_size_list is not None and i < len(resize_list) and i < len(original_size_list):
-                        pred_mask = visual_model.postprocess_masks(
-                            low_res_masks,
-                            input_size=resize_list[i],
-                            original_size=original_size_list[i],
-                        )
-                    # label_listから形状情報を取得できる場合
-                    elif label_list is not None and i < len(label_list):
-                        original_size = label_list[i].shape
-                        input_size = visual_model.image_encoder.img_size  # SAMのデフォルトサイズを使用
-                        pred_mask = visual_model.postprocess_masks(
-                            low_res_masks,
-                            input_size=input_size,
-                            original_size=original_size,
-                        )
-                    else:
-                        # デフォルトサイズを使用
-                        print("警告: マスクサイズ情報がありません。デフォルトサイズを使用します。")
-                        input_size = visual_model.image_encoder.img_size
-                        original_size = (1024, 1024)  # デフォルトサイズ
-                        pred_mask = visual_model.postprocess_masks(
-                            low_res_masks,
-                            input_size=input_size,
-                            original_size=original_size,
-                        )
-                except Exception as post_e:
-                    print(f"マスク後処理中にエラーが発生しました: {post_e}")
-                    # エラーの場合はlow_res_masksをそのまま使用
-                    pred_mask = low_res_masks
-                
-                pred_masks.append(pred_mask[:, 0])
-                
+                vision_x = outputs
             except Exception as e:
-                print(f"マスク生成中にエラーが発生しました: {e}")
-                # エラーが発生した場合は空のマスクを返す（デバッグ用）
-                if label_list is not None and i < len(label_list):
-                    shape = label_list[i].shape
-                    empty_mask = torch.zeros((1, *shape), device=pred_embeddings[i].device)
-                    pred_masks.append(empty_mask)
-                else:
-                    # 形状情報がない場合はダミーマスクを返す
-                    dummy_mask = torch.zeros((1, 100, 100), device=pred_embeddings[i].device)
-                    pred_masks.append(dummy_mask)
-                    print("警告: ダミーマスク (100x100) を使用しています")
-
-        # 推論モードの場合は予測マスクを返す
-        if inference:
-            return {
-                "pred_masks": pred_masks,
-                "gt_masks": masks_list,
-            }
+                print(f"[エラー情報] モデル実行中にエラーが発生しました: {e}")
+                print(f"入力データの情報:")
+                
+                # 入力データの詳細情報を表示
+                def print_tensor_info(name, tensor):
+                    if isinstance(tensor, torch.Tensor):
+                        print(f"  {name}: shape={tensor.shape}, dtype={tensor.dtype}")
+                    elif isinstance(tensor, list):
+                        print(f"  {name}: list of {len(tensor)} items")
+                        if len(tensor) > 0:
+                            print(f"    先頭アイテム: {type(tensor[0])}")
+                            if hasattr(tensor[0], 'shape'):
+                                print(f"    shape={tensor[0].shape}, dtype={tensor[0].dtype}")
+                    else:
+                        print(f"  {name}: type={type(tensor)}")
+                
+                # 全ての入力パラメータを表示
+                for key, value in kwargs.items():
+                    print_tensor_info(key, value)
+                
+                # モデル実行エラー時はNoneを返す
+                vision_x = None
+        else:
+            print("プロセッサの出力がありません。モデルは実行されません。")
+            vision_x = None
 
         # 損失計算のためのモデル出力と正解マスク
         model_output = outputs
