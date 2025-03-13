@@ -251,9 +251,32 @@ class LisaModel(nn.Module):
             print("提供されたSAMビジョンエンコーダーを使用します")
         else:
             print("SAMビジョンエンコーダーを初期化します")
-            # 何らかのデフォルトビジョンモデルをここで初期化
-            # ただし、実際の実装ではユーザーが事前に初期化したエンコーダーを提供することが望ましい
-            self.visual_model = None
+            try:
+                from .segment_anything import build_sam_vit_h
+                vision_pretrained = kwargs.get("vision_pretrained", None)
+                if vision_pretrained:
+                    print(f"SAMモデルをロード: {vision_pretrained}")
+                    self.visual_model = build_sam_vit_h(checkpoint=vision_pretrained)
+                else:
+                    print("警告: SAMモデルのチェックポイントが指定されていません")
+                    self.visual_model = None
+            except ImportError:
+                try:
+                    # 別のインポートパスを試す
+                    from model.segment_anything import build_sam_vit_h
+                    vision_pretrained = kwargs.get("vision_pretrained", None)
+                    if vision_pretrained:
+                        print(f"SAMモデルをロード: {vision_pretrained}")
+                        self.visual_model = build_sam_vit_h(checkpoint=vision_pretrained)
+                    else:
+                        print("警告: SAMモデルのチェックポイントが指定されていません")
+                        self.visual_model = None
+                except Exception as e:
+                    print(f"SAMビジョンエンコーダーの初期化中にエラーが発生しました: {e}")
+                    self.visual_model = None
+            except Exception as e:
+                print(f"SAMビジョンエンコーダーの初期化中にエラーが発生しました: {e}")
+                self.visual_model = None
         
         # マスクデコーダーの初期化または設定
         print("マスクデコーダーを設定中...")
@@ -338,9 +361,19 @@ class LisaModel(nn.Module):
             return None
 
     def forward(self, **kwargs):
+        """
+        モデルの前方伝播。
+        """
+        # past_key_valuesが含まれている場合は直接モデルに渡す
         if "past_key_values" in kwargs:
-            # Llama3.2 visionモデルの標準forward
             return self.model(**kwargs)
+            
+        # すべての要素が含まれているか確認
+        required_elements = ["input_ids", "attention_mask", "images"]
+        missing_elements = [elem for elem in required_elements if elem not in kwargs]
+        if missing_elements:
+            print(f"警告: 以下の要素が不足しています: {missing_elements}")
+            
         return self.model_forward(**kwargs)
 
     def model_forward(
@@ -566,12 +599,11 @@ class LisaModel(nn.Module):
             images_for_processor = None
             print("画像データなし")
         
-        # <SEG>トークンのマスクを作成（元のLISAコードを参考にしているが、現時点では未使用）
         # seg_token_idxにアクセスする前にチェック
         seg_token_idx = getattr(self, 'seg_token_idx', None)
         if seg_token_idx is None:
             # LisaModelからの取得を試みる
-            seg_token_idx = getattr(self.lisa_model, 'seg_token_idx', None)
+            seg_token_idx = getattr(self.model, 'seg_token_idx', None)
             if seg_token_idx is None:
                 # どちらにも存在しない場合は警告を出す
                 print("警告: seg_token_idxが設定されていません")
@@ -628,7 +660,7 @@ class LisaModel(nn.Module):
                 
                 # cache_dataパラメータを削除（Llama3.2 Visionモデルは対応していない）
                 # モデルを実行してテキスト表現を取得
-                outputs = self.lisa_model.model(
+                outputs = self.model.model(
                     **processor_inputs,
                     output_hidden_states=True,
                     return_dict=True
@@ -1079,6 +1111,33 @@ class LisaModel(nn.Module):
 
         return batch_inputs
 
+    def get_visual_embs(self, images):
+        """
+        SAMのvisual_modelを使用して画像埋め込みを取得します
+        
+        Args:
+            images: 入力画像テンソル [batch_size, channels, height, width]
+            
+        Returns:
+            image_embeddings: SAM画像エンコーダからの特徴
+        """
+        if images is None:
+            raise ValueError("入力画像がNoneです")
+            
+        if not hasattr(self, "visual_model") or self.visual_model is None:
+            raise ValueError("visual_modelが初期化されていません")
+            
+        # 画像をデバイスに移動
+        device = next(self.model.parameters()).device
+        if images.device != device:
+            images = images.to(device)
+            
+        with torch.no_grad():
+            # SAMイメージエンコーダを呼び出し
+            image_embeddings = self.visual_model.image_encoder(images)
+            
+        return image_embeddings
+
 def compute_dice_loss(inputs, targets, smooth=1):
     """
     Compute Dice損失（Sørensen-Dice係数に基づく）
@@ -1114,13 +1173,19 @@ class LISAForCausalLM(nn.Module):
     def __init__(self, **kwargs):
         super().__init__()
         
+        # train_ds.pyから渡されるパラメータを正しく処理
         self.lisa_model = LisaModel(
-            model_id="meta-llama/Llama-3.2-11B-Vision-Instruct",
-            sam_vision_encoder=kwargs.get("sam_encoder", None),
+            model_id=kwargs.get("model_id", "meta-llama/Llama-3.2-11B-Vision-Instruct"),
+            sam_vision_encoder=kwargs.get("sam_vision_encoder", kwargs.get("sam_encoder", None)),
             mask_decoder=kwargs.get("mask_decoder", None),
             torch_dtype=kwargs.get("torch_dtype", torch.float16),
             device_map=kwargs.get("device_map", None),
+            train_mask_decoder=kwargs.get("train_mask_decoder", True),
+            out_dim=kwargs.get("out_dim", 256)
         )
+        
+        # オリジナルLISAとの互換性のために、model属性も追加
+        self.model = self.lisa_model
         
         # 各種パラメータを設定
         self.device = kwargs.get("device", "cuda" if torch.cuda.is_available() else "cpu")
@@ -1129,11 +1194,23 @@ class LISAForCausalLM(nn.Module):
         self.bce_loss_weight = kwargs.get("bce_loss_weight", 1.0)
         self.dice_loss_weight = kwargs.get("dice_loss_weight", 1.0)
         
-        # seg_token_idxをLisaModelから取得
-        self.seg_token_idx = getattr(self.lisa_model, "seg_token_idx", None)
-        if self.seg_token_idx is None:
-            print("警告: seg_token_idxがLISAForCausalLMで設定されていません")
-            self.seg_token_idx = -1  # デフォルト値（エラー時用）
+        # vision_pretrained、low_cpu_mem_usageなどのパラメータも保存
+        self.vision_pretrained = kwargs.get("vision_pretrained", None)
+        self.vision_tower = kwargs.get("vision_tower", None)
+        self.use_mm_start_end = kwargs.get("use_mm_start_end", True)
+        self.low_cpu_mem_usage = kwargs.get("low_cpu_mem_usage", True)
+        
+        # seg_token_idxをLisaModelから取得、または直接設定
+        if "seg_token_idx" in kwargs and kwargs["seg_token_idx"] is not None:
+            self.seg_token_idx = kwargs["seg_token_idx"]
+            # LisaModelにも伝える
+            if hasattr(self.model, "seg_token_idx"):
+                self.model.seg_token_idx = self.seg_token_idx
+        else:
+            self.seg_token_idx = getattr(self.lisa_model, "seg_token_idx", None)
+            if self.seg_token_idx is None:
+                print("警告: seg_token_idxがLISAForCausalLMで設定されていません")
+                self.seg_token_idx = -1  # デフォルト値（エラー時用）
 
     def get_processor(self):
         """processorを取得"""
