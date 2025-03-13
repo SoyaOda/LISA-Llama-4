@@ -4,6 +4,7 @@ import shutil
 import sys
 import time
 from functools import partial
+import json
 
 import deepspeed
 import numpy as np
@@ -118,6 +119,13 @@ def main(args):
         writer = SummaryWriter(args.log_dir)
     else:
         writer = None
+
+    # DeepSpeedのCUDA拡張コンパイルをスキップする環境変数を設定
+    os.environ["DS_BUILD_CPU_ADAM"] = "0"  # CPU Adamビルドを無効化
+    os.environ["DS_BUILD_FUSED_ADAM"] = "0"  # 融合Adamビルドを無効化
+    os.environ["DS_BUILD_UTILS"] = "0"      # Utilsビルドを無効化
+    os.environ["DS_BUILD_TRANSFORMER"] = "0" # Transformerカーネルビルドを無効化
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"  # 接続数を制限して互換性を向上
 
     # NCCL環境変数を設定
     os.environ["NCCL_DEBUG"] = "INFO"  # NCCLのデバッグ情報を表示
@@ -398,7 +406,7 @@ def main(args):
         "train_micro_batch_size_per_gpu": args.batch_size,
         "gradient_accumulation_steps": args.grad_accumulation_steps,
         "optimizer": {
-            "type": "AdamW",
+            "type": "AdamW",  # DeepSpeedCPUAdamではなく標準のAdamWを使用
             "params": {
                 "lr": args.lr,
                 "weight_decay": 0.0,
@@ -423,22 +431,16 @@ def main(args):
         },
         "gradient_clipping": 1.0,
         "zero_optimization": {
-            "stage": 3,
+            "stage": 2,  # ステージを2に下げて複雑さを軽減
             "contiguous_gradients": True,
             "overlap_comm": True,
             "reduce_scatter": True,
             "reduce_bucket_size": 5e8,
-            "allgather_bucket_size": 5e8,
-            "offload_optimizer": {
-                "device": "cpu",
-                "pin_memory": True
-            },
-            "offload_param": {
-                "device": "cpu",
-                "pin_memory": True
-            },
-            "stage3_prefetch_bucket_size": 5e8,
-            "stage3_param_persistence_threshold": 1e6
+            "allgather_bucket_size": 5e8
+        },
+        # JITコンパイル無効化
+        "jit": {
+            "enabled": False
         },
         "communication_data_type": "fp32",
         "prescale_gradients": False,
@@ -507,8 +509,43 @@ def main(args):
                 ),
                 config=ds_config,
             )
+        elif "CUDA version" in str(e) or "CUDAMismatchException" in str(e):
+            print("\n" + "="*80)
+            print("CUDAバージョン不一致エラーが発生しました。DeepSpeedのCUDA拡張コンパイルをスキップします。")
+            print("エラー詳細:", str(e))
+            print("="*80 + "\n")
+            
+            # DeepSpeedのCUDA拡張コンパイルをスキップするための追加設定
+            os.environ["DS_BUILD_OPS"] = "0"  # すべてのカスタム操作のビルドを無効化
+            
+            # Zero-2の標準PyTorch最適化器を使用する設定
+            ds_config["zero_optimization"]["stage"] = 1  # ステージを1に下げる
+            ds_config["optimizer"]["type"] = "torch.optim.AdamW"  # 標準PyTorch最適化器を使用
+            
+            # planner無効化（速度は落ちるがCUDA拡張に依存しない）
+            if "activation_checkpointing" not in ds_config:
+                ds_config["activation_checkpointing"] = {}
+            ds_config["activation_checkpointing"]["partition_activations"] = False
+            
+            print("修正したDeepSpeed設定:", json.dumps(ds_config, indent=2))
+            
+            # 再試行
+            model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
+                model=model,
+                model_parameters=model.parameters(),
+                training_data=train_dataset,
+                collate_fn=partial(
+                    collate_fn,
+                    tokenizer=tokenizer,
+                    conv_type=args.conv_type,
+                    use_mm_start_end=args.use_mm_start_end,
+                    local_rank=args.local_rank,
+                    processor=processor,
+                ),
+                config=ds_config,
+            )
         else:
-            # NCCLエラー以外は再発生
+            # その他のエラーは再発生
             raise
 
     if args.auto_resume and len(args.resume) == 0:
