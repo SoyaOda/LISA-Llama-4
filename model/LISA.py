@@ -888,6 +888,31 @@ class LISAForCausalLM(nn.Module):
                         print(f"PIL変換も失敗しました: {alt_e}")
                         print(f"データ型変換が解決しないため、このまま処理を続行します")
             
+            # テンソル形式の画像を0-1の範囲に正規化（PILリストでない場合のみ）
+            if isinstance(images_for_processor, torch.Tensor):
+                try:
+                    # 現在の値の範囲を確認
+                    min_val = torch.min(images_for_processor).item()
+                    max_val = torch.max(images_for_processor).item()
+                    print(f"画像値の範囲（正規化前）: [{min_val}, {max_val}]")
+                    
+                    if min_val < 0 or max_val > 1:
+                        # 値が0-1の範囲外の場合、正規化を行う
+                        if min_val == max_val:
+                            # すべての値が同じ場合（レアケース）
+                            images_for_processor = torch.zeros_like(images_for_processor)
+                        else:
+                            # min-max正規化を適用
+                            images_for_processor = (images_for_processor - min_val) / (max_val - min_val)
+                        
+                        # 正規化後の範囲を確認
+                        new_min = torch.min(images_for_processor).item()
+                        new_max = torch.max(images_for_processor).item()
+                        print(f"画像値の範囲（正規化後）: [{new_min}, {new_max}]")
+                except Exception as e:
+                    print(f"画像正規化中にエラーが発生しました: {e}")
+                    # エラーが発生しても処理を続行
+            
             print(f"processorに渡す画像形状: {images_for_processor.shape if hasattr(images_for_processor, 'shape') else type(images_for_processor)}, データ型: {images_for_processor.dtype if hasattr(images_for_processor, 'dtype') else 'PIL Images'}")
         else:
             images_for_processor = None
