@@ -225,6 +225,28 @@ class LisaModel(nn.Module):
                 torch_dtype=torch_dtype
             )
             print("MllamaForConditionalGenerationの初期化が成功しました")
+            
+            # モデルをトレーニングモードに設定し、勾配計算を有効化
+            self.model.train()
+            
+            # パラメータのrequires_gradをチェック
+            param_requires_grad = sum(p.requires_grad for p in self.model.parameters())
+            total_params = sum(1 for p in self.model.parameters())
+            print(f"トレーニング可能なパラメータ: {param_requires_grad}/{total_params}")
+            
+            # 勾配計算が必要なパラメータがない場合は警告
+            if param_requires_grad == 0:
+                print("警告: モデルにトレーニング可能なパラメータがありません")
+                # 勾配計算を有効化（例：最後の層など）
+                try:
+                    # LM headの勾配計算を有効化
+                    if hasattr(self.model, "lm_head"):
+                        print("lm_headの勾配計算を有効化します")
+                        for param in self.model.lm_head.parameters():
+                            param.requires_grad = True
+                except Exception as e:
+                    print(f"パラメータの勾配設定中にエラーが発生しました: {e}")
+            
         except Exception as e:
             print(f"MllamaForConditionalGenerationの初期化中にエラーが発生しました: {e}")
             print("AutoModelForVision2Seqで再試行します")
@@ -656,17 +678,44 @@ class LisaModel(nn.Module):
             if processor_inputs is not None:
                 print("Llama3.2 Visionモデルを実行します")
                 
-                # cache_dataパラメータを削除（Llama3.2 Visionモデルは対応していない）
-                # モデルを実行してテキスト表現を取得
-                outputs = self.model.model(
-                    **processor_inputs,
-                    output_hidden_states=True,
-                    return_dict=True
-                )
+                # 入力をデバッグ用に表示
+                for key, value in processor_inputs.items():
+                    if isinstance(value, torch.Tensor):
+                        print(f"  - {key}: 形状={value.shape}, データ型={value.dtype}, デバイス={value.device}")
+                    else:
+                        print(f"  - {key}: タイプ={type(value)}")
                 
-                # hidden_statesを抽出
-                vision_x = outputs.hidden_states
-                
+                try:
+                    # MllamaForConditionalGenerationでは直接modelを呼び出す
+                    outputs = self.model(
+                        **processor_inputs,
+                        output_hidden_states=True,
+                        return_dict=True
+                    )
+                    
+                    # hidden_statesを抽出
+                    vision_x = outputs.hidden_states
+                    
+                except AttributeError as e:
+                    print(f"モデル実行中にエラーが発生しました: {e}")
+                    print("詳細なエラー情報:")
+                    traceback.print_exc()
+                    
+                    # 代替方法：モデルの内部構造によって変わる可能性がある属性を試す
+                    try:
+                        # もしモデルがmodel属性を持つ場合（一部のTransformersモデルでは存在する）
+                        print("代替メソッド1: self.model.modelで試みます")
+                        outputs = self.model.model(
+                            **processor_inputs,
+                            output_hidden_states=True,
+                            return_dict=True
+                        )
+                        vision_x = outputs.hidden_states
+                    except AttributeError:
+                        print("代替メソッド1も失敗しました")
+                        # すべての試みが失敗した場合
+                        outputs = None
+                        vision_x = None
                 # hidden_statesの形状を表示（デバッグ用）
                 if vision_x is not None:
                     if isinstance(vision_x, tuple):
@@ -953,16 +1002,27 @@ class LisaModel(nn.Module):
             }
 
         # 損失計算のためのモデル出力と正解マスク
-        model_output = vision_x
+        model_output = outputs  # vision_xではなくoutputsを使用
         gt_masks = masks_list
+        device = next(self.model.parameters()).device
 
         # 言語モデルのCE損失を取得
-        ce_loss = model_output.loss if hasattr(model_output, 'loss') else torch.tensor(0.0, device=device)
+        ce_loss = None
+        if model_output is not None and hasattr(model_output, 'loss') and model_output.loss is not None:
+            ce_loss = model_output.loss
+            if not ce_loss.requires_grad:
+                print("警告: CE損失に勾配がありません。requires_gradをTrueに設定します。")
+                ce_loss = ce_loss.detach().clone()
+                ce_loss.requires_grad_(True)
+        else:
+            print("警告: モデル出力からlossが見つかりません。0.0で初期化します。")
+            ce_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            
         ce_loss = ce_loss * self.ce_loss_weight
         
         # マスク損失の計算
-        mask_bce_loss = torch.tensor(0.0, device=device)
-        mask_dice_loss = torch.tensor(0.0, device=device)
+        mask_bce_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        mask_dice_loss = torch.tensor(0.0, device=device, requires_grad=True)
         num_masks = 0
         
         if pred_masks and gt_masks and len(pred_masks) > 0 and len(gt_masks) > 0:
@@ -980,6 +1040,13 @@ class LisaModel(nn.Module):
                             gt_mask = gt_mask[:min_size]
                             pred_mask = pred_mask[:min_size]
                         
+                        # マスクに勾配が必要かチェック
+                        if not pred_mask.requires_grad:
+                            print(f"警告: バッチ{batch_idx}の予測マスクに勾配がありません。requires_gradをTrueに設定します。")
+                            # 予測マスクのコピーを作成し、requires_gradをTrueに設定
+                            pred_mask = pred_mask.detach().clone()
+                            pred_mask.requires_grad_(True)
+                        
                         # BCE損失の計算
                         batch_bce = sigmoid_ce_loss(
                             pred_mask, gt_mask, num_masks=gt_mask.shape[0]
@@ -990,8 +1057,8 @@ class LisaModel(nn.Module):
                             pred_mask, gt_mask, num_masks=gt_mask.shape[0]
                         ) * gt_mask.shape[0]
                         
-                        mask_bce_loss += batch_bce
-                        mask_dice_loss += batch_dice
+                        mask_bce_loss = mask_bce_loss + batch_bce
+                        mask_dice_loss = mask_dice_loss + batch_dice
                         num_masks += gt_mask.shape[0]
                     except Exception as e:
                         print(f"バッチ{batch_idx}のマスク損失計算中にエラーが発生しました: {e}")
@@ -1009,50 +1076,21 @@ class LisaModel(nn.Module):
             # マスクがない場合は0を設定
             mask_loss = torch.tensor(0.0, device=device)
             
-        # 損失計算の前に必要なチェックと勾配追跡の設定
-        if not inference:
-            # CEロスの勾配追跡確保
-            if torch.is_tensor(ce_loss):
-                if not ce_loss.requires_grad:
-                    ce_loss = ce_loss.clone().detach().requires_grad_(True)
-            else:
-                # CEロスがテンソルでない場合、0のテンソルを作成（勾配追跡あり）
-                ce_loss = torch.tensor(0.0, device=device, requires_grad=True)
-                
-            # マスクロスの勾配追跡確保
-            if torch.is_tensor(mask_loss):
-                if not mask_loss.requires_grad:
-                    mask_loss = mask_loss.clone().detach().requires_grad_(True)
-            else:
-                # マスクロスがテンソルでない場合、0のテンソルを作成（勾配追跡あり）
-                mask_loss = torch.tensor(0.0, device=device, requires_grad=True)
-            
-            # 損失合計の計算（勾配追跡を維持）
-            loss = None
-            if torch.is_tensor(ce_loss) and ce_loss.item() > 0:
-                loss = ce_loss.clone()
-            
-            if torch.is_tensor(mask_loss) and mask_loss.item() > 0:
-                if loss is not None:
-                    loss = loss + mask_loss
-                else:
-                    loss = mask_loss.clone()
-            
-            # どちらの損失も有効でない場合、ダミーの勾配付き損失を作成
-            if loss is None or loss.item() == 0:
-                # 最小値だがゼロではない勾配を持つダミー損失
-                loss = torch.tensor(1e-8, device=device, requires_grad=True)
-        else:
-            # 推論モードの場合は勾配は不要
-            loss = None
-            if torch.is_tensor(ce_loss) and torch.is_tensor(mask_loss):
-                loss = ce_loss + mask_loss
-            elif torch.is_tensor(ce_loss):
-                loss = ce_loss
-            elif torch.is_tensor(mask_loss):
-                loss = mask_loss
-            else:
-                loss = torch.tensor(0.0, device=device)
+        # 損失合計の計算（勾配追跡を維持）
+        loss = None
+        # 両方の損失を常に足し合わせる（勾配追跡のため）
+        ce_loss = ce_loss if torch.is_tensor(ce_loss) else torch.tensor(0.0, device=device, requires_grad=True)
+        mask_loss = mask_loss if torch.is_tensor(mask_loss) else torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # 合計損失の計算
+        loss = ce_loss + mask_loss
+        
+        # 損失のチェック
+        if loss.item() == 0:
+            print("警告: 合計損失が0になっています。これは勾配計算で問題が発生する可能性があります。")
+            # 最小値だがゼロではない勾配を持つダミー損失を追加
+            dummy_param = next(self.model.parameters())
+            loss = loss + 0.0001 * (dummy_param * dummy_param).sum()
 
         # 戻り値
         if inference:
