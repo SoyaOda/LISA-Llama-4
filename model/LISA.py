@@ -173,6 +173,18 @@ class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
         LisaMetaModel.__init__(self, config, **kwargs)
         Llama3VisionMetaModel.__init__(self, config, **kwargs)
         
+        # 必要なモデル属性を追加
+        model_id = kwargs.get("model_id", "meta-llama/Llama-3.2-11B-Vision-Instruct")
+        torch_dtype = kwargs.get("torch_dtype", torch.bfloat16)
+        
+        # モデルインスタンスを作成
+        self.model = MllamaForConditionalGeneration.from_pretrained(
+            model_id,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=kwargs.get("low_cpu_mem_usage", True),
+            device_map=kwargs.get("device_map", None),
+        )
+        
         # SAMモデルが正しく初期化されたか確認
         if not hasattr(self, 'visual_model'):
             print("警告: visual_model属性が見つかりません。SAMモデルを初期化します。")
@@ -214,6 +226,13 @@ class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
         self.config.mm_use_im_patch_token = False
 
         print("LisaModelの初期化: 成功しました")
+        
+    def forward(self, *args, **kwargs):
+        """
+        前方伝播処理。引数をモデルに渡します。
+        """
+        # LISAForCausalLMでのモデル実行をサポートするために必要なメソッド
+        return self.model(*args, **kwargs)
 
 
 class LISAForCausalLM(nn.Module):
@@ -1093,13 +1112,24 @@ class LISAForCausalLM(nn.Module):
             else:
                 # 入力も利用できない場合
                 print("警告: モデル出力とinput_idsどちらもありません。処理を続行できません。")
-                return {
-                    "loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
-                    "ce_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
-                    "mask_bce_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
-                    "mask_dice_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
-                    "mask_loss": torch.tensor(0.0, device=device) if device else torch.tensor(0.0),
-                }
+                # 訓練中は損失を返す必要がある
+                if not inference:
+                    dummy_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                    return {
+                        "loss": dummy_loss,
+                        "ce_loss": dummy_loss,
+                        "mask_bce_loss": dummy_loss,
+                        "mask_dice_loss": dummy_loss,
+                        "mask_loss": dummy_loss,
+                    }
+                else:
+                    return {
+                        "loss": torch.tensor(0.0, device=device),
+                        "ce_loss": torch.tensor(0.0, device=device),
+                        "mask_bce_loss": torch.tensor(0.0, device=device),
+                        "mask_dice_loss": torch.tensor(0.0, device=device),
+                        "mask_loss": torch.tensor(0.0, device=device),
+                    }
         
         # <SEG>トークンの位置をマスクで特定
         # 出力トークンの次の位置から検索（LISAでは出力に<SEG>が含まれる）
@@ -1380,25 +1410,50 @@ class LISAForCausalLM(nn.Module):
         if num_masks > 0:
             mask_bce_loss = self.bce_loss_weight * mask_bce_loss / num_masks
             mask_dice_loss = self.dice_loss_weight * mask_dice_loss / num_masks
+            mask_loss = mask_bce_loss + mask_dice_loss
         else:
-            # マスクがない場合はゼロ
-            mask_bce_loss = torch.tensor(0.0, device=device)
-            mask_dice_loss = torch.tensor(0.0, device=device)
-        
-        # 合計マスク損失
-        mask_loss = mask_bce_loss + mask_dice_loss
+            # マスクがない場合は0を設定
+            mask_loss = torch.tensor(0.0, device=device)
+            
+        # 訓練時に勾配が必要な場合
+        if not inference and torch.is_tensor(ce_loss) and not ce_loss.requires_grad:
+            # テンソルの勾配追跡を有効にするためのコピーを作成
+            ce_loss = ce_loss.clone().requires_grad_(True)
+            
+        if not inference and torch.is_tensor(mask_loss) and not mask_loss.requires_grad:
+            # テンソルの勾配追跡を有効にするためのコピーを作成
+            mask_loss = mask_loss.clone().requires_grad_(True)
         
         # 合計損失
-        loss = ce_loss + mask_loss
-        
-        # 損失辞書を返す
-        return {
-            "loss": loss,
-            "ce_loss": ce_loss,
-            "mask_bce_loss": mask_bce_loss,
-            "mask_dice_loss": mask_dice_loss,
-            "mask_loss": mask_loss,
-        }
+        if ce_loss.numel() > 0 and mask_loss.numel() > 0:
+            loss = ce_loss + mask_loss
+        elif ce_loss.numel() > 0:
+            loss = ce_loss
+        elif mask_loss.numel() > 0:
+            loss = mask_loss
+        else:
+            # 両方の損失が使えない場合はダミー損失
+            if not inference:
+                loss = torch.tensor(0.0, device=device, requires_grad=True)
+            else:
+                loss = torch.tensor(0.0, device=device)
+
+        # 戻り値
+        if inference:
+            return {
+                "masks": pred_masks,
+                "low_res_masks": low_res_pred_masks,
+                "iou_scores": iou_scores,
+                "seg_token_counts": seg_token_counts,
+            }
+        else:
+            return {
+                "loss": loss,
+                "ce_loss": ce_loss,
+                "mask_bce_loss": mask_bce_loss,
+                "mask_dice_loss": mask_dice_loss,
+                "mask_loss": mask_loss,
+            }
 
     def prepare_inputs_for_generation(
         self,
