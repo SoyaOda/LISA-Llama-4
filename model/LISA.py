@@ -115,10 +115,10 @@ class LisaMetaModel:
             self.config.out_dim = kwargs.get("out_dim", 256)
             
         # vision_pretrained設定を取得
-        self.vision_pretrained = kwargs.get("vision_pretrained", None)
+            self.vision_pretrained = kwargs.get("vision_pretrained", None)
         
         # オリジナルLISAコードと同様に常にSAMを初期化
-        self.initialize_lisa_modules(self.config)
+            self.initialize_lisa_modules(self.config)
 
     def initialize_lisa_modules(self, config):
         # SAM
@@ -196,13 +196,13 @@ class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
         # MllamaConfigではmm_接頭辞がない可能性がある属性の対応
         # vision_tower
         if hasattr(self.config, "mm_vision_tower"):
-            self.config.vision_tower = self.config.mm_vision_tower
+        self.config.vision_tower = self.config.mm_vision_tower
         # 既にvision_towerが設定されている場合は何もしない（MllamaConfigの場合）
         
         # vision_select_feature
         if not hasattr(self.config, "mm_vision_select_feature"):
             # MllamaConfig用に新しく属性を追加
-            self.config.mm_vision_select_feature = "patch"
+        self.config.mm_vision_select_feature = "patch"
         
         # 他の設定属性を確実に設定
         self.config.image_aspect_ratio = "square"
@@ -211,7 +211,7 @@ class LisaModel(LisaMetaModel, Llama3VisionMetaModel):
         self.config.freeze_mm_mlp_adapter = True
         self.config.pretrain_mm_mlp_adapter = None
         self.config.mm_use_im_patch_token = False
-        
+
         print("LisaModelの初期化: 成功しました")
 
 
@@ -646,57 +646,34 @@ class LISAForCausalLM(nn.Module):
         tokenizer=None,
         **kwargs
     ):
-        """LISA/VLオブジェクトの前方伝播処理と損失計算を行う。
-        
-        注意: Llama 3.2 Visionモデル（MllamaForConditionalGeneration）では、
-        画像入力は'images'ではなく'pixel_values'パラメータとして渡す必要があります。
-        このメソッドでは内部的にimages_clipを'pixel_values'として渡します。
-        
-        理想的には以下の方法で入力を準備するとよいでしょう:
-        ```
-        processor = AutoProcessor.from_pretrained("meta-llama/Llama-3.2-11B-Vision-Instruct")
-        inputs = processor(text=text_prompt, images=image, return_tensors="pt")
-        outputs = model(**inputs)
-        ```
-        
-        processorは画像を適切な形式に変換し、<|image|>トークンを処理します。
+        # SAMの特徴を抽出
+        image_embeddings = self.get_visual_embs(images)
+        batch_size = image_embeddings.shape[0]
+        assert batch_size == len(offset) - 1
 
-        Args:
-            input_ids (torch.Tensor): 入力トークンのID
-            attention_mask (torch.Tensor, optional): アテンションマスク
-            attention_masks (torch.Tensor, optional): 互換性のためのアテンションマスク
-            labels (torch.Tensor, optional): ラベルデータ。デフォルトはNone。
-            images (list, optional): 画像のリスト。デフォルトはNone。
-            images_clip (list, optional): CLIP形式の画像のリスト。デフォルトはNone。
-            masks_list (list, optional): マスクのリスト。デフォルトはNone。
-            label_masks_list (list, optional): ラベルのマスクのリスト。デフォルトはNone。
-            label_list (list, optional): 互換性のためのラベルマスクのリスト。
-            inputs_embeds (torch.Tensor, optional): 入力埋め込み。デフォルトはNone。
-            offset (torch.Tensor, optional): オフセット値。デフォルトはNone。
-            resize_list (list, optional): リサイズリスト。デフォルトはNone。
-            inference (bool, optional): 推論モードかどうか。デフォルトはFalse。
+        # <SEG>トークンのマスクを作成
+        seg_token_mask = input_ids[:, 1:] == self.seg_token_idx
+        seg_token_mask = torch.cat(
+            [
+                seg_token_mask,
+                torch.zeros((seg_token_mask.shape[0], 1)).bool().to(seg_token_mask.device),
+            ],
+            dim=1,
+        )
 
-        Returns:
-            dict: 計算された損失と出力値を含む辞書
-        """
-        # パラメータの互換性処理
-        if attention_mask is None and attention_masks is not None:
-            attention_mask = attention_masks
-            
-        if label_masks_list is None and label_list is not None:
-            label_masks_list = label_list
-            
-        # オリジナルのLISAとの互換性のためにoffsetを処理
-        batch_size = len(input_ids) if isinstance(input_ids, list) else input_ids.shape[0]
-            
-        # SEGトークンの埋め込みを取得
-        with torch.no_grad():
-            # self.deviceがないので、代わりにモデルの現在のデバイスを取得
-            device = next(self.parameters()).device
-            embedding_token_seg = self.get_input_embeddings()(torch.tensor([[self.seg_token_idx]], device=device))
+        # <SEG>トークンの埋め込みを取得
+        embedding_token_seg = getattr(
+            self.model.llama_model.model.embed_tokens,
+            "embedding_token_seg",
+            None,
+        )
+        if embedding_token_seg is None:
+            # もし埋め込みが初期化されていなければ新しく作成
+            embedding_token_seg = self.model.llama_model.model.embed_tokens(
+                torch.tensor([self.seg_token_idx], device=self.model.device)
+            )
             embedding_token_seg = embedding_token_seg.squeeze(0)
-        
-        # processorはpixel_valuesとaspect_ratio_idsを自動的に生成
+
         processor = self.get_processor()
         
         # テキスト入力の準備: Llama3.2 Vision processorは文字列または文字列のリストを期待する
@@ -709,11 +686,52 @@ class LISAForCausalLM(nn.Module):
                     "tokenizerを提供するか、文字列または文字列のリスト形式のテキストを渡してください。"
                 )
             # トークンIDをテキストにデコード
-            text_input = tokenizer.batch_decode(input_ids, skip_special_tokens=False)
-            print(f"デコードされたテキスト（デバッグ用）: {text_input[:2]}")  # 最初の2つのみ表示
+            raw_text_input = tokenizer.batch_decode(input_ids, skip_special_tokens=False)
+            print(f"デコードされたテキスト（デバッグ用）: {raw_text_input[:2]}")  # 最初の2つのみ表示
+            
+            # <|image|>トークンを追加して各テキストを整形
+            text_input = []
+            for text in raw_text_input:
+                # Llama3.2 Visionは各テキスト内に<|image|>トークンが必要
+                # 適切な位置に<|image|>トークンを挿入（通常は先頭に近い位置）
+                if '<|image|>' not in text:
+                    # ユーザーとシステムの区切りを探す（Llama3.2の形式に合わせる）
+                    user_prefix = "User: "
+                    if user_prefix in text:
+                        # ユーザープレフィックスの直後に<|image|>を挿入
+                        pos = text.find(user_prefix) + len(user_prefix)
+                        text = text[:pos] + "<|image|> " + text[pos:]
+                    else:
+                        # フォールバック: テキストの先頭に追加
+                        text = "<|image|> " + text
+                text_input.append(text)
         else:
             # すでに文字列または文字列のリストの場合はそのまま使用
-            text_input = input_ids
+            raw_text_input = input_ids
+            
+            # <|image|>トークンの追加を確認
+            if isinstance(raw_text_input, list):
+                text_input = []
+                for text in raw_text_input:
+                    if '<|image|>' not in text:
+                        # ユーザーとシステムの区切りを探す
+                        user_prefix = "User: "
+                        if user_prefix in text:
+                            pos = text.find(user_prefix) + len(user_prefix)
+                            text = text[:pos] + "<|image|> " + text[pos:]
+                        else:
+                            text = "<|image|> " + text
+                    text_input.append(text)
+            else:
+                text_input = raw_text_input
+                if '<|image|>' not in text_input:
+                    # 単一文字列の場合
+                    user_prefix = "User: "
+                    if user_prefix in text_input:
+                        pos = text_input.find(user_prefix) + len(user_prefix)
+                        text_input = text_input[:pos] + "<|image|> " + text_input[pos:]
+                    else:
+                        text_input = "<|image|> " + text_input
             
         if not isinstance(text_input, (str, list)):
             # 文字列または文字列のリストでない場合はエラー
@@ -771,10 +789,6 @@ class LISAForCausalLM(nn.Module):
             print(f"プロセッサエラー: {e}")
             raise e
         
-        # ラベルを追加（存在する場合）
-        if labels is not None:
-            processor_inputs["labels"] = labels
-
         # 変換されたpixel_valuesとaspect_ratio_idsをデバッグ表示
         if "pixel_values" in processor_inputs:
             print(f"変換されたpixel_values形状: {processor_inputs['pixel_values'].shape}")
@@ -790,15 +804,126 @@ class LISAForCausalLM(nn.Module):
         # 出力からhidden_statesを取得
         last_hidden_state = outputs.hidden_states[-1]
         
-        # 以下はオリジナルのLISAと同様の処理を続行
-        # <SEG>トークンの位置を特定
-        # ... existing code ...
+        # <SEG>トークンの位置を特定して処理
+        # hidden_statesを処理してマスク生成に使用
+        hidden_states = []
+        hidden_states.append(
+            getattr(self.model, "text_hidden_fcs", [lambda x: x])[0](last_hidden_state)
+        )
+
+        last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+        pred_embeddings = last_hidden_state[seg_token_mask]
+        
+        # <SEG>トークンのカウントとオフセットを計算
+        seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
+        seg_token_offset = seg_token_counts.cumsum(-1)
+        seg_token_offset = torch.cat(
+            [torch.zeros(1).long().to(seg_token_mask.device), seg_token_offset], dim=0
+        )
+
+        # オフセットに基づいてseg_token_offsetを調整
+        seg_token_offset = seg_token_offset[offset]
+
+        # 予測埋め込みを処理
+        pred_embeddings_ = []
+        for i in range(len(seg_token_offset) - 1):
+            start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
+            pred_embeddings_.append(pred_embeddings[start_i:end_i])
+        pred_embeddings = pred_embeddings_
+
+        # 予測マスクを生成
+        multimask_output = False
+        pred_masks = []
+        for i in range(len(pred_embeddings)):
+            # SAMのプロンプトエンコーダを使用してスパース埋め込みを生成
+            (
+                sparse_embeddings,
+                dense_embeddings,
+            ) = self.model.visual_model.prompt_encoder(
+                points=None,
+                boxes=None,
+                masks=None,
+                text_embeds=pred_embeddings[i].unsqueeze(1),
+            )
+            
+            # データ型を合わせる
+            sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
+            
+            # マスクデコーダを実行
+            low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
+                image_embeddings=image_embeddings[i].unsqueeze(0),
+                image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=multimask_output,
+            )
+            
+            # 予測マスクを後処理
+            pred_mask = self.model.visual_model.postprocess_masks(
+                low_res_masks,
+                input_size=resize_list[i],
+                original_size=label_list[i].shape,
+            )
+            
+            pred_masks.append(pred_mask[:, 0])
+
+        # 推論モードの場合は予測マスクを返す
+        if inference:
+            return {
+                "pred_masks": pred_masks,
+                "gt_masks": masks_list,
+            }
+
+        # 損失計算のためのモデル出力と正解マスク
+        model_output = outputs
+        gt_masks = masks_list
+
+        # 言語モデルのCE損失を取得
+        ce_loss = model_output.loss if hasattr(model_output, 'loss') else torch.tensor(0.0).to(device)
+        ce_loss = ce_loss * self.ce_loss_weight
+        
+        # マスク損失（BCE, Dice）の初期化
+        mask_bce_loss = 0
+        mask_dice_loss = 0
+        num_masks = 0
+        
+        # バッチ内の各サンプルに対して損失を計算
+        for batch_idx in range(len(pred_masks)):
+            gt_mask = gt_masks[batch_idx]
+            pred_mask = pred_masks[batch_idx]
+
+            # マスクの形状を確認
+            assert (
+                gt_mask.shape[0] == pred_mask.shape[0]
+            ), "gt_mask.shape: {}, pred_mask.shape: {}".format(
+                gt_mask.shape, pred_mask.shape
+            )
+            
+            # BCE損失とDice損失を計算
+            mask_bce_loss += (
+                sigmoid_ce_loss(pred_mask, gt_mask, num_masks=gt_mask.shape[0])
+                * gt_mask.shape[0]
+            )
+            mask_dice_loss += (
+                dice_loss(pred_mask, gt_mask, num_masks=gt_mask.shape[0])
+                * gt_mask.shape[0]
+            )
+            num_masks += gt_mask.shape[0]
+
+        # 損失を正規化
+        mask_bce_loss = self.bce_loss_weight * mask_bce_loss / (num_masks + 1e-8)
+        mask_dice_loss = self.dice_loss_weight * mask_dice_loss / (num_masks + 1e-8)
+        mask_loss = mask_bce_loss + mask_dice_loss
+
+        # 最終的な損失
+        loss = ce_loss + mask_loss
 
         return {
             "loss": loss,
             "ce_loss": ce_loss,
+            "mask_bce_loss": mask_bce_loss,
             "mask_dice_loss": mask_dice_loss,
-            "mask_bce_loss": mask_bce_loss
+            "mask_loss": mask_loss,
         }
 
     def evaluate(
@@ -812,11 +937,42 @@ class LISAForCausalLM(nn.Module):
         tokenizer=None,
     ):
         with torch.no_grad():
+            # テキスト入力の準備
+            if isinstance(input_ids, str):
+                # 文字列が直接渡された場合
+                if '<|image|>' not in input_ids:
+                    # <|image|>トークンがなければ追加
+                    user_prefix = "User: "
+                    if user_prefix in input_ids:
+                        pos = input_ids.find(user_prefix) + len(user_prefix)
+                        text_input = input_ids[:pos] + "<|image|> " + input_ids[pos:]
+                    else:
+                        text_input = "<|image|> " + input_ids
+                else:
+                    text_input = input_ids
+            elif tokenizer is not None and isinstance(input_ids, torch.Tensor):
+                # トークンIDからテキストにデコード
+                decoded_text = tokenizer.batch_decode(input_ids, skip_special_tokens=False)
+                text_input = []
+                for text in decoded_text:
+                    if '<|image|>' not in text:
+                        user_prefix = "User: "
+                        if user_prefix in text:
+                            pos = text.find(user_prefix) + len(user_prefix)
+                            text = text[:pos] + "<|image|> " + text[pos:]
+                        else:
+                            text = "<|image|> " + text
+                    text_input.append(text)
+            else:
+                # その他の場合はそのまま使用
+                text_input = input_ids
+            
             # Llama3.2 vision用に入力を準備
             processor = self.get_processor()
+            
             # processorは'images'を'pixel_values'に内部的に変換してくれる
             batch_inputs = processor(
-                text=input_ids,
+                text=text_input,
                 images=images_clip,
                 return_tensors="pt",
                 padding=True,
@@ -833,79 +989,80 @@ class LISAForCausalLM(nn.Module):
                 "return_dict_in_generate": True,
             }
             
-            # 生成を実行
+            # テキスト生成を実行
             outputs = self.model.generate(**batch_inputs, **generation_config)
-            
-            # 出力を取得
-            # 最後のレイヤーの隠れ状態を取得
-            # Llama3.2では生成中に全レイヤーの隠れ状態を保存するが、
-            # 必要なのは最終デコーダレイヤーの隠れ状態のみ
-            output_hidden_states = outputs.hidden_states[-1][-1]  # 最後のトークンの最後のレイヤー
+            output_hidden_states = outputs.hidden_states[-1]
             output_ids = outputs.sequences
-            
-            # 生成されたテキストを表示（デバッグ用）
-            if tokenizer:
-                print("生成されたテキスト:", tokenizer.batch_decode(output_ids, skip_special_tokens=False))
 
-            # <SEG>トークンの位置を特定
-            # 生成された出力の中から<SEG>トークンの位置を検出
-            seg_token_mask = output_ids == self.seg_token_idx
+            # <SEG>トークンの位置をマスクで特定
+            seg_token_mask = output_ids[:, 1:] == self.seg_token_idx
+            # プレフィックスに対応する部分（Llama3.2の場合は画像トークンの分）をパディング
+            seg_token_mask = torch.cat(
+                [
+                    torch.zeros((seg_token_mask.shape[0], 255)).bool().to(self.model.device),
+                    seg_token_mask,
+                ],
+                dim=1,
+            )
 
-            # 以下はオリジナルのLISAと同様の処理
+            # hidden_statesを処理
             hidden_states = []
+            hidden_states.append(
+                getattr(self.model, "text_hidden_fcs", [lambda x: x])[0](output_hidden_states)
+            )
 
-            assert len(self.lisa_model.text_hidden_fcs) == 1
-            hidden_states.append(self.lisa_model.text_hidden_fcs[0](output_hidden_states))
-
+            # hidden_statesを合成
             last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
             
-            # <SEG>トークンの位置が見つからない場合の処理
-            if not seg_token_mask.any():
-                print("警告: 生成されたテキストに<SEG>トークンが見つかりません。空のマスクを返します。")
-                return {
-                    "pred_masks": [torch.zeros_like(image[0]) for image in images],
-                    "output_text": processor.tokenizer.batch_decode(output_ids, skip_special_tokens=False),
-                }
-                
-            # <SEG>トークンのembeddingを抽出
+            # <SEG>トークンに対応するhidden_stateを抽出
             pred_embeddings = last_hidden_state[seg_token_mask]
 
+            # <SEG>トークンの数とオフセットを計算
             seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
             seg_token_offset = seg_token_counts.cumsum(-1)
             seg_token_offset = torch.cat(
-                [torch.zeros(1).long().cuda(), seg_token_offset], dim=0
+                [torch.zeros(1).long().to(self.model.device), seg_token_offset], dim=0
             )
 
+            # 予測埋め込みを処理
             pred_embeddings_ = []
             for i in range(len(seg_token_offset) - 1):
                 start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
                 pred_embeddings_.append(pred_embeddings[start_i:end_i])
             pred_embeddings = pred_embeddings_
 
+            # SAMの画像埋め込みを取得
             image_embeddings = self.get_visual_embs(images)
 
+            # 各<SEG>トークンに対応するマスクを生成
             multimask_output = False
             pred_masks = []
             for i in range(len(pred_embeddings)):
+                # スパース埋め込みと密埋め込みを取得
                 (
                     sparse_embeddings,
                     dense_embeddings,
-                ) = self.lisa_model.visual_model.prompt_encoder(
+                ) = self.model.visual_model.prompt_encoder(
                     points=None,
                     boxes=None,
                     masks=None,
                     text_embeds=pred_embeddings[i].unsqueeze(1),
                 )
 
+                # スパース埋め込みのデータ型を合わせる
                 sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
-                low_res_masks, iou_predictions = self.lisa_model.visual_model.mask_decoder(
+                
+                # マスクを生成
+                low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
                     image_embeddings=image_embeddings[i].unsqueeze(0),
-                    image_pe=self.lisa_model.visual_model.prompt_encoder.get_dense_pe(),
+                    image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
                     sparse_prompt_embeddings=sparse_embeddings,
                     dense_prompt_embeddings=dense_embeddings,
                     multimask_output=multimask_output,
                 )
-                pred_mask = self.lisa_model.visual_model.postprocess_masks(
+                
+                # マスクを後処理
+                pred_mask = self.model.visual_model.postprocess_masks(
                     low_res_masks,
                     input_size=resize_list[i],
                     original_size=original_size_list[i],
