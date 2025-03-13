@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional, Dict, Any, Union, Tuple
 import traceback
 import torch
 import torch.nn as nn
@@ -9,7 +9,8 @@ from transformers import (
     AutoModelForVision2Seq, 
     AutoConfig, 
     GenerationMixin,
-    MllamaForConditionalGeneration
+    MllamaForConditionalGeneration,
+    MllamaConfig
 )
 
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
@@ -165,6 +166,7 @@ class LisaModel(nn.Module):
         freeze_vision_model=True,
         freeze_llm=False,
         out_dim=256,
+        train_mask_decoder=True,
         *args, **kwargs
     ):
         """
@@ -182,8 +184,16 @@ class LisaModel(nn.Module):
         super().__init__()
         
         # 設定初期化
+        from transformers import MllamaConfig, MllamaForConditionalGeneration
+        
         if model_cfg is None:
-            self.config = MllamaConfig()
+            # デフォルト設定を使用
+            try:
+                self.config = MllamaConfig.from_pretrained("meta-llama/Llama-3.2-11B-Vision-Instruct")
+            except Exception as e:
+                print(f"MllamaConfigの初期化エラー: {e}")
+                from transformers import AutoConfig
+                self.config = AutoConfig.from_pretrained("meta-llama/Llama-3.2-11B-Vision-Instruct")
         else:
             self.config = model_cfg
         
@@ -191,11 +201,18 @@ class LisaModel(nn.Module):
         self.freeze_llm = freeze_llm
         
         # Llama3.2 Visionモデルの初期化
-        self.model = MllamaForConditionalGeneration.from_pretrained(
-            "meta-llama/Llama-3.2-11B-Vision-Instruct",
-            torch_dtype=torch_dtype,
-            low_cpu_mem_usage=low_cpu_mem_usage,
-        )
+        try:
+            print(f"Llama3.2 Visionモデルの初期化: meta-llama/Llama-3.2-11B-Vision-Instruct")
+            print(f"  - torch_dtype: {torch_dtype}")
+            
+            self.model = MllamaForConditionalGeneration.from_pretrained(
+                "meta-llama/Llama-3.2-11B-Vision-Instruct",
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=low_cpu_mem_usage,
+            )
+        except Exception as e:
+            print(f"モデル初期化エラー: {e}")
+            raise
         
         # セグメンテーション関連
         self.config.seg_token_idx = None
@@ -207,11 +224,13 @@ class LisaModel(nn.Module):
                 self.visual_model = build_sam(checkpoint=vision_pretrained)
                 
                 # 視覚モデルの凍結制御
-                for param in self.visual_model.image_encoder.parameters():
-                    param.requires_grad = not freeze_vision_model
-                for param in self.visual_model.prompt_encoder.parameters():
-                    param.requires_grad = True
-                if train_mask_decoder:
+                if hasattr(self.visual_model, 'image_encoder'):
+                    for param in self.visual_model.image_encoder.parameters():
+                        param.requires_grad = not freeze_vision_model
+                if hasattr(self.visual_model, 'prompt_encoder'):
+                    for param in self.visual_model.prompt_encoder.parameters():
+                        param.requires_grad = True
+                if hasattr(self.visual_model, 'mask_decoder') and train_mask_decoder:
                     for param in self.visual_model.mask_decoder.parameters():
                         param.requires_grad = True
             except Exception as e:
@@ -229,6 +248,20 @@ class LisaModel(nn.Module):
         self.config.pretrain_mm_mlp_adapter = None
         self.config.mm_use_im_patch_token = False
 
+        # 投影層
+        in_dim = 4096  # Llama3.2 11Bの隠れ層サイズ
+        self.out_dim = out_dim
+        text_fc = [
+            nn.Linear(in_dim, in_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_dim, out_dim),
+            nn.Dropout(0.0),
+        ]
+        self.text_hidden_fcs = nn.ModuleList([nn.Sequential(*text_fc)])
+        
+        for param in self.text_hidden_fcs.parameters():
+            param.requires_grad = True
+            
         print("LisaModelの初期化: 成功しました")
         
     def forward(self, *args, **kwargs):
@@ -332,60 +365,40 @@ class LisaModel(nn.Module):
         if output_embeddings is not None:
             self.set_output_embeddings(self.get_input_embeddings())
             
-    def resize_token_embeddings(self, new_num_tokens=None):
+    def resize_token_embeddings(self, new_num_tokens):
         """
-        モデルのトークン埋め込みのサイズを変更します。
-        
-        Args:
-            new_num_tokens (int, optional): 新しいトークン数
-            
-        Returns:
-            torch.nn.Embedding: 新しいトークン埋め込み層
+        トークン埋め込みをリサイズします。
         """
-        # まず、モデルが直接resize_token_embeddingsを持っているか確認
-        if hasattr(self.model, "resize_token_embeddings"):
-            return self.model.resize_token_embeddings(new_num_tokens)
+        # 入力埋め込みのリサイズ
+        self.model.resize_token_embeddings(new_num_tokens)
         
-        # 内部実装：
-        old_embeddings = self.get_input_embeddings()
-        old_num_tokens = old_embeddings.num_embeddings
-        
-        if new_num_tokens == old_num_tokens:
-            return old_embeddings
+        # 出力埋め込みのリサイズ（入出力が分離している場合）
+        try:
+            output_embeddings = self.model.get_output_embeddings()
+            input_embeddings = self.model.get_input_embeddings()
             
-        # 新しい埋め込み層を作成
-        new_embeddings = self._get_resized_embeddings(old_embeddings, new_num_tokens)
-        
-        # モデルに新しい埋め込み層を設定
-        self.set_input_embeddings(new_embeddings)
-        
-        # もし入力と出力の埋め込みが同じなら、出力も更新
-        if self.get_output_embeddings() is not None and not getattr(self, "_tied_weights_keys", []):
-            self.set_output_embeddings(new_embeddings)
-            
-        return new_embeddings
-    
-    def _get_resized_embeddings(self, old_embeddings, new_num_tokens=None):
-        """
-        リサイズされた埋め込み層を取得します。
-        """
-        if new_num_tokens is None:
-            return old_embeddings
-            
-        old_num_tokens = old_embeddings.num_embeddings
-        old_embedding_dim = old_embeddings.embedding_dim
-        
-        # 新しい埋め込み層を作成
-        new_embeddings = nn.Embedding(new_num_tokens, old_embedding_dim)
-        new_embeddings.to(old_embeddings.weight.device, 
-                        dtype=old_embeddings.weight.dtype)
-        
-        # 既存の埋め込みをコピー
-        with torch.no_grad():
-            num_tokens_to_copy = min(old_num_tokens, new_num_tokens)
-            new_embeddings.weight.data[:num_tokens_to_copy, :] = old_embeddings.weight.data[:num_tokens_to_copy, :]
-            
-        return new_embeddings
+            if output_embeddings is not None and output_embeddings.weight.shape[0] != new_num_tokens:
+                print(f"出力埋め込みをリサイズ: {output_embeddings.weight.shape[0]} -> {new_num_tokens}")
+                
+                # 新しい出力埋め込みを作成
+                new_lm_head = nn.Linear(
+                    input_embeddings.weight.shape[1],
+                    new_num_tokens,
+                    bias=output_embeddings.bias is not None,
+                    device=output_embeddings.weight.device,
+                    dtype=output_embeddings.weight.dtype
+                )
+                
+                # 既存の重みをコピー
+                with torch.no_grad():
+                    new_lm_head.weight[:output_embeddings.weight.shape[0], :] = output_embeddings.weight
+                    if output_embeddings.bias is not None:
+                        new_lm_head.bias[:output_embeddings.bias.shape[0]] = output_embeddings.bias
+                
+                # 新しい埋め込みを設定
+                self.model.set_output_embeddings(new_lm_head)
+        except Exception as e:
+            print(f"出力埋め込みのリサイズ中にエラーが発生しました: {e}")
 
     def get_visual_embs(self, pixel_values: torch.FloatTensor):
         """
@@ -802,7 +815,7 @@ class LisaModel(nn.Module):
         if processor_inputs is not None:
             try:
                 # cache_dataパラメータを削除し、Llama3.2 Visionモデルに対応
-                outputs = self.lisa_model.model(
+                outputs = self.model(
                     input_ids=processor_inputs.get("input_ids"),
                     attention_mask=processor_inputs.get("attention_mask"),
                     pixel_values=processor_inputs.get("pixel_values", None),
@@ -924,8 +937,8 @@ class LisaModel(nn.Module):
             last_hidden_state = vision_x.hidden_states[-1]
             
             # text_hidden_fcsがあれば適用
-            if hasattr(self.lisa_model, "text_hidden_fcs"):
-                for fc in self.lisa_model.text_hidden_fcs:
+            if hasattr(self, "text_hidden_fcs"):
+                for fc in self.text_hidden_fcs:
                     hidden_states.append(fc(last_hidden_state))
             else:
                 # fcがなければそのまま使用
@@ -1002,9 +1015,7 @@ class LisaModel(nn.Module):
             
             # visual_modelを取得
             visual_model = None
-            if hasattr(self.lisa_model, "visual_model"):
-                visual_model = self.lisa_model.visual_model
-            elif hasattr(self, "visual_model"):
+            if hasattr(self, "visual_model"):
                 visual_model = self.visual_model
             else:
                 raise AttributeError("visual_modelが見つかりません")
@@ -1172,14 +1183,14 @@ class LisaModel(nn.Module):
             # マスクがない場合は0を設定
             mask_loss = torch.tensor(0.0, device=device)
             
-        # 訓練時に勾配計算が必要
+        # 損失計算の前に必要なチェックと勾配追跡の設定
         if not inference:
             # CEロスの勾配追跡確保
             if torch.is_tensor(ce_loss):
                 if not ce_loss.requires_grad:
                     ce_loss = ce_loss.clone().detach().requires_grad_(True)
             else:
-                # CEロスがテンソルでない場合、0のテンソルを作成
+                # CEロスがテンソルでない場合、0のテンソルを作成（勾配追跡あり）
                 ce_loss = torch.tensor(0.0, device=device, requires_grad=True)
                 
             # マスクロスの勾配追跡確保
@@ -1187,22 +1198,27 @@ class LisaModel(nn.Module):
                 if not mask_loss.requires_grad:
                     mask_loss = mask_loss.clone().detach().requires_grad_(True)
             else:
-                # マスクロスがテンソルでない場合、0のテンソルを作成
+                # マスクロスがテンソルでない場合、0のテンソルを作成（勾配追跡あり）
                 mask_loss = torch.tensor(0.0, device=device, requires_grad=True)
             
-            # 損失合計の計算
-            if ce_loss.numel() > 0 and ce_loss > 0:
-                if mask_loss.numel() > 0 and mask_loss > 0:
-                    loss = ce_loss + mask_loss
+            # 損失合計の計算（勾配追跡を維持）
+            loss = None
+            if torch.is_tensor(ce_loss) and ce_loss.item() > 0:
+                loss = ce_loss.clone()
+            
+            if torch.is_tensor(mask_loss) and mask_loss.item() > 0:
+                if loss is not None:
+                    loss = loss + mask_loss
                 else:
-                    loss = ce_loss
-            elif mask_loss.numel() > 0 and mask_loss > 0:
-                loss = mask_loss
-            else:
-                # どちらの損失も有効でない場合、ダミーの勾配付き損失を作成
-                loss = torch.tensor(1e-5, device=device, requires_grad=True)
+                    loss = mask_loss.clone()
+            
+            # どちらの損失も有効でない場合、ダミーの勾配付き損失を作成
+            if loss is None or loss.item() == 0:
+                # 最小値だがゼロではない勾配を持つダミー損失
+                loss = torch.tensor(1e-8, device=device, requires_grad=True)
         else:
             # 推論モードの場合は勾配は不要
+            loss = None
             if torch.is_tensor(ce_loss) and torch.is_tensor(mask_loss):
                 loss = ce_loss + mask_loss
             elif torch.is_tensor(ce_loss):
@@ -1296,8 +1312,7 @@ def compute_dice_loss(inputs, targets, smooth=1):
 
 class LISAForCausalLM(nn.Module):
     """
-    LISA model for Causal Language Modeling with Segment Anything
-    
+    LISA for Causal Language Modeling.
     Llama3.2 Vision (MllamaForConditionalGeneration) + SAM
     """
     def __init__(
@@ -1318,112 +1333,67 @@ class LISAForCausalLM(nn.Module):
     ):
         super().__init__()
         
-        # LISA構成設定
         self.ce_loss_weight = ce_loss_weight
         self.dice_loss_weight = dice_loss_weight
         self.bce_loss_weight = bce_loss_weight
-        self.train_mask_decoder = train_mask_decoder
         
+        # LisaModelの初期化
         try:
-            # モデルの初期化
-            print(f"Loading Llama3.2 Vision model: {model_id}")
-            print(f"  - torch_dtype: {torch_dtype}")
-            
-            # LisaModelの初期化
             self.lisa_model = LisaModel(
-                model_cfg=None,
+                model_id,
                 torch_dtype=torch_dtype,
                 low_cpu_mem_usage=low_cpu_mem_usage,
                 vision_pretrained=vision_pretrained,
-                freeze_vision_model=True,
-                freeze_llm=False,
+                train_mask_decoder=train_mask_decoder,
                 out_dim=out_dim,
-                train_mask_decoder=train_mask_decoder
             )
+        except Exception as e:
+            print(f"LisaModelの初期化中にエラーが発生しました: {e}")
+            traceback.print_exc()
+            raise
             
-            # 視覚モデルへの参照を設定
-            self.visual_model = self.lisa_model.visual_model
-            
-            # configへの参照を設定
-            self.config = self.lisa_model.config
-            
-            # Llama3.2 Vision用のプロセッサを初期化
+        # セグメンテーショントークンの設定
+        self.seg_token_idx = seg_token_idx
+        
+        # プロセッサの初期化
+        try:
             self.processor = AutoProcessor.from_pretrained(model_id)
             
-            # <SEG>トークンを追加
-            special_tokens = {"additional_special_tokens": ["<SEG>"]}
-            num_added_tokens = self.processor.tokenizer.add_special_tokens(special_tokens)
-            print(f"  - Added {num_added_tokens} special tokens: <SEG>")
-            
-            # トークナイザでSEGトークンのインデックスを保存
-            self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids("<SEG>")
-            print(f"  - <SEG> token index: {self.seg_token_idx}")
-            self.lisa_model.config.seg_token_idx = self.seg_token_idx
-            
-            # 埋め込みをリサイズ
-            new_num_tokens = len(self.processor.tokenizer)
-            
-            # Llama3.2 Visionモデルの埋め込みをリサイズ
-            self.lisa_model.model.resize_token_embeddings(new_num_tokens)
-            
-            # 出力埋め込みも更新
-            try:
-                # 出力埋め込みを取得
-                output_embeddings = self.lisa_model.model.get_output_embeddings()
-                input_embeddings = self.lisa_model.model.get_input_embeddings()
+            # <SEG>トークンをプロセッサに追加
+            if "<SEG>" not in self.processor.tokenizer.get_vocab():
+                print("<SEG>トークンを追加します")
+                num_added_tokens = self.processor.tokenizer.add_special_tokens(
+                    {"additional_special_tokens": ["<SEG>"]}
+                )
+                vocab = self.processor.tokenizer.get_vocab()
+                self.seg_token_idx = vocab.get("<SEG>")
+                print(f"<SEG>トークンのIDは {self.seg_token_idx} です")
                 
-                if output_embeddings.weight.shape[0] != new_num_tokens:
-                    print(f"出力埋め込みをリサイズ: {output_embeddings.weight.shape[0]} -> {new_num_tokens}")
-                    
-                    # 新しい出力埋め込みを作成
-                    new_lm_head = nn.Linear(
-                        input_embeddings.weight.shape[1],
-                        new_num_tokens,
-                        bias=output_embeddings.bias is not None,
-                        device=output_embeddings.weight.device,
-                        dtype=output_embeddings.weight.dtype
-                    )
-                    
-                    # 既存の重みをコピー
-                    with torch.no_grad():
-                        new_lm_head.weight[:output_embeddings.weight.shape[0], :] = output_embeddings.weight
-                        if output_embeddings.bias is not None:
-                            new_lm_head.bias[:output_embeddings.bias.shape[0]] = output_embeddings.bias
-                    
-                    # 新しい埋め込みを設定
-                    self.lisa_model.model.set_output_embeddings(new_lm_head)
-            except Exception as e:
-                print(f"出力埋め込みのリサイズ中にエラーが発生しました: {e}")
-            
+                # モデルの埋め込みとヘッドを拡張
+                self.lisa_model.resize_token_embeddings(len(self.processor.tokenizer))
+            else:
+                # すでに存在する場合はIDを取得
+                vocab = self.processor.tokenizer.get_vocab()
+                self.seg_token_idx = vocab.get("<SEG>")
+                print(f"既存の<SEG>トークンのIDは {self.seg_token_idx} です")
         except Exception as e:
-            print(f"Error initializing model: {e}")
+            print(f"プロセッサの初期化中にエラーが発生しました: {e}")
             raise
-        
+            
     def get_processor(self):
         """
-        モデルのプロセッサを取得します。
+        プロセッサを取得
         """
         return self.processor
         
     def get_visual_embs(self, images, return_width_height=False):
         """
-        SAMモデルを使用して画像から視覚的埋め込みを取得します。
-        
-        Args:
-            images (Tensor): 入力画像バッチ
-            return_width_height (bool): 幅と高さも返すかどうか
-            
-        Returns:
-            Tensor: 視覚的埋め込み
+        ビジュアルな埋め込みを取得
         """
-        return self.lisa_model.get_visual_embs(images, return_width_height)
-    
+        return self.lisa_model.get_visual_embs(images)
+        
     def forward(self, **kwargs):
         """
-        LISA CausalLMの前方伝播。
-        必要に応じてmodel_forwardを呼び出します。
+        モデルの順伝播
         """
-        if "past_key_values" in kwargs:
-            # 通常のLM生成モードの場合は標準のforwardに委譲
-            return self.lisa_model.forward(**kwargs)
-        return self.model_forward(**kwargs)
+        return self.lisa_model.forward(**kwargs)
