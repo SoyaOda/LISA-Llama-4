@@ -1137,21 +1137,13 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
         """
         print(f"LISAForCausalLM.resize_token_embeddings({new_num_tokens})を呼び出しました")
         
-        if not hasattr(self.model, 'resize_token_embeddings'):
-            print("警告: lisa_modelにresize_token_embeddingsメソッドがありません")
-            # 代替策としてモデルに直接アクセス
-            if hasattr(self.model, 'model') and hasattr(self.model.model, 'resize_token_embeddings'):
-                return self.model.model.resize_token_embeddings(new_num_tokens)
-            else:
-                print("エラー: lisa_model.modelにresize_token_embeddingsメソッドもありません")
-                return None
-        
-        return self.model.resize_token_embeddings(new_num_tokens)
+        # MLlamaモデルのメソッドを直接呼び出す
+        return super().resize_token_embeddings(new_num_tokens)
         
     def get_processor(self):
         """processorを取得"""
-        if hasattr(self.model, "processor"):
-            return self.model.processor
+        if hasattr(self, "processor"):
+            return self.processor
         else:
             print("警告: processorが設定されていません")
             return None
@@ -1173,7 +1165,7 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
             raise ValueError("visual_modelが初期化されていません")
             
         # 画像をデバイスに移動
-        device = next(self.model.parameters()).device
+        device = next(self.parameters()).device
         if images.device != device:
             images = images.to(device)
             
@@ -1192,16 +1184,17 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
         """
         モデルの順伝播
         """
-        return self.model.forward(**kwargs)
+        # 親クラスのforwardを呼び出す
+        return super().forward(**kwargs)
         
     def tie_weights(self):
         """
         入力埋め込みと出力埋め込みを結合します。
+        MllamaForConditionalGenerationの機能を適切に継承します。
         """
-        if hasattr(self.model, 'model') and hasattr(self.model.model, 'tie_weights'):
-            self.model.model.tie_weights()
-        else:
-            print("警告: tie_weightsメソッドがllama3_2モデルに見つかりません")
+        # 親クラスのtie_weightsメソッドを呼び出す
+        super().tie_weights()
+        print("親クラスのtie_weightsメソッドを呼び出しました")
             
     def prepare_inputs_for_generation(
         self,
@@ -1216,22 +1209,14 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
         生成のための入力を準備します。
         Llama 3.2 Visionモデルでは、pixel_valuesとaspect_ratio_idsが必要です。
         """
-        # 基本的な入力を準備
-        batch_inputs = {}
-        
-        # past_key_valuesが存在する場合は、input_idsの最後のトークンのみを使用
-        if past_key_values is not None:
-            input_ids = input_ids[:, -1:]
-
-        # 標準入力を設定
-        if input_ids is not None:
-            batch_inputs["input_ids"] = input_ids
-        if past_key_values is not None:
-            batch_inputs["past_key_values"] = past_key_values
-        if attention_mask is not None:
-            batch_inputs["attention_mask"] = attention_mask
-        if inputs_embeds is not None:
-            batch_inputs["inputs_embeds"] = inputs_embeds
+        # 基本的には親クラスのメソッドを呼び出し、必要に応じて拡張する
+        batch_inputs = super().prepare_inputs_for_generation(
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            **kwargs
+        )
             
         # 画像処理部分
         if images is not None:
@@ -1297,7 +1282,7 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
                     print(f"プロセッサに渡す - テキスト: {len(text_prompts)}個, 画像: {len(images_for_processor)}枚")
                     
                     # プロセッサ実行
-                    device = next(self.model.parameters()).device
+                    device = next(self.parameters()).device
                     processor_outputs = processor(
                         text=text_prompts,
                         images=images_for_processor,
@@ -1322,7 +1307,7 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
                     batch_size = images.shape[0] if len(images.shape) >= 4 else 1
                     
                     # aspect_ratio_idsを設定
-                    device = images.device if hasattr(images, 'device') else next(self.model.parameters()).device
+                    device = images.device if hasattr(images, 'device') else next(self.parameters()).device
                     batch_inputs["aspect_ratio_ids"] = torch.zeros(batch_size, dtype=torch.long, device=device)
             except Exception as e:
                 print(f"画像処理エラー: {e}")
