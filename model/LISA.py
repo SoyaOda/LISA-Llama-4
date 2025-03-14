@@ -1016,80 +1016,87 @@ class LisaModel(nn.Module):
             traceback.print_exc()
             raise
 
-class LISAForCausalLM(nn.Module, GenerationMixin):
+class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
     """
     LISA for Causal Language Modeling.
-    Llama3.2 Vision (MllamaForConditionalGeneration) + SAM
+    Llama3.2 Vision + SAMを直接統合したシンプルな実装
     """
     def __init__(self, **kwargs):
-        super().__init__()
+        config = kwargs.pop("config", None)
+        if config is None:
+            # configがなければモデルIDから作成
+            model_id = kwargs.get("model_id", "meta-llama/Llama-3.2-11B-Vision-Instruct")
+            from transformers import AutoConfig
+            config = AutoConfig.from_pretrained(model_id)
         
-        # train_ds.pyから渡されるパラメータを正しく処理
-        self.lisa_model = LisaModel(
-            model_id=kwargs.get("model_id", "meta-llama/Llama-3.2-11B-Vision-Instruct"),
-            sam_vision_encoder=kwargs.get("sam_vision_encoder", kwargs.get("sam_encoder", None)),
-            mask_decoder=kwargs.get("mask_decoder", None),
-            torch_dtype=kwargs.get("torch_dtype", torch.float16),
-            device_map=kwargs.get("device_map", None),
-            train_mask_decoder=kwargs.get("train_mask_decoder", True),
-            out_dim=kwargs.get("out_dim", 256),
-            vision_pretrained=kwargs.get("vision_pretrained", None),
-            load_in_8bit=kwargs.get("load_in_8bit", False),  # 8ビット量子化オプション
-            load_in_4bit=kwargs.get("load_in_4bit", False)   # 4ビット量子化オプション
+        # セグメンテーション関連の設定
+        self.seg_token_idx = kwargs.pop("seg_token_idx", None)
+        self.ce_loss_weight = kwargs.pop("ce_loss_weight", 1.0)
+        self.bce_loss_weight = kwargs.pop("bce_loss_weight", 1.0)
+        self.dice_loss_weight = kwargs.pop("dice_loss_weight", 1.0)
+        
+        # 省メモリ設定
+        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
+        device_map = kwargs.pop("device_map", "auto")
+        
+        # 量子化設定
+        load_in_8bit = kwargs.pop("load_in_8bit", False)
+        load_in_4bit = kwargs.pop("load_in_4bit", False)
+        quantization_config = None
+        if load_in_8bit or load_in_4bit:
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=load_in_8bit,
+                load_in_4bit=load_in_4bit,
+                bnb_4bit_compute_dtype=torch_dtype,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4"
+            )
+            
+        # 親クラス初期化
+        super().__init__(
+            config, 
+            torch_dtype=torch_dtype, 
+            device_map=device_map,
+            quantization_config=quantization_config
         )
         
-        # オリジナルLISAとの互換性のために、model属性も追加
-        self.model = self.lisa_model
-        
-        # オリジナルLISAとの互換性のためにconfigを追加
-        if hasattr(self.lisa_model, 'config'):
-            # LisaModelからconfigを取得
-            self.config = self.lisa_model.config
-        elif hasattr(self.lisa_model, 'model') and hasattr(self.lisa_model.model, 'config'):
-            # モデルからconfigを取得
-            self.config = self.lisa_model.model.config
-        else:
-            # configがなければ作成
-            print("警告: lisa_modelからconfigが見つからないため、新しいconfigを作成します")
-            from transformers import PretrainedConfig
-            self.config = PretrainedConfig()
-            # 基本的な属性を設定
-            self.config.model_type = "mllama"
-            
-        # 必要な属性をconfigに追加
-        if not hasattr(self.config, 'train_mask_decoder'):
-            self.config.train_mask_decoder = kwargs.get("train_mask_decoder", True)
-        if not hasattr(self.config, 'out_dim'):
-            self.config.out_dim = kwargs.get("out_dim", 256)
-        if not hasattr(self.config, 'vision_tower'):
-            self.config.vision_tower = kwargs.get("vision_tower", kwargs.get("model_id", "meta-llama/Llama-3.2-11B-Vision-Instruct"))
-        if not hasattr(self.config, 'mm_vision_tower'):
-            self.config.mm_vision_tower = self.config.vision_tower
-        
-        # 各種パラメータを設定
-        self.device = kwargs.get("device", "cuda" if torch.cuda.is_available() else "cpu")
-        
-        self.ce_loss_weight = kwargs.get("ce_loss_weight", 1.0)
-        self.bce_loss_weight = kwargs.get("bce_loss_weight", 1.0)
-        self.dice_loss_weight = kwargs.get("dice_loss_weight", 1.0)
-        
-        # vision_pretrained、low_cpu_mem_usageなどのパラメータも保存
-        self.vision_pretrained = kwargs.get("vision_pretrained", None)
-        self.vision_tower = kwargs.get("vision_tower", None)
-        self.use_mm_start_end = kwargs.get("use_mm_start_end", True)
-        self.low_cpu_mem_usage = kwargs.get("low_cpu_mem_usage", True)
-        
-        # seg_token_idxをLisaModelから取得、または直接設定
-        if "seg_token_idx" in kwargs and kwargs["seg_token_idx"] is not None:
-            self.seg_token_idx = kwargs["seg_token_idx"]
-            # LisaModelにも伝える
-            if hasattr(self.model, "seg_token_idx"):
-                self.model.seg_token_idx = self.seg_token_idx
-        else:
-            self.seg_token_idx = getattr(self.lisa_model, "seg_token_idx", None)
-            if self.seg_token_idx is None:
-                print("警告: seg_token_idxがLISAForCausalLMで設定されていません")
-                self.seg_token_idx = -1  # デフォルト値（エラー時用）
+        # SAM初期化
+        vision_pretrained = kwargs.pop("vision_pretrained", None)
+        if vision_pretrained:
+            try:
+                self.visual_model = build_sam_vit_h(checkpoint=vision_pretrained)
+                # SAMパラメータをfreeze
+                for param in self.visual_model.parameters():
+                    param.requires_grad = False
+                    
+                # マスクデコーダーは学習対象にする
+                if kwargs.get("train_mask_decoder", True) and hasattr(self.visual_model, "mask_decoder"):
+                    for param in self.visual_model.mask_decoder.parameters():
+                        param.requires_grad = True
+                        
+                # テキスト埋め込みからSAMプロンプト埋め込みへの変換層
+                prompt_embed_dim = 256  # SAMデフォルト値
+                hidden_size = getattr(config, "hidden_size", 4096)
+                if hasattr(config, 'text_config') and hasattr(config.text_config, 'hidden_size'):
+                    hidden_size = config.text_config.hidden_size
+                    
+                self.text_hidden_fcs = nn.ModuleList([
+                    nn.Sequential(
+                        nn.Linear(hidden_size, hidden_size),
+                        nn.ReLU(inplace=True),
+                        nn.Linear(hidden_size, prompt_embed_dim),
+                        nn.Dropout(0.0),
+                    )
+                ])
+                
+                # プロセッサを初期化
+                self.processor = AutoProcessor.from_pretrained(model_id)
+                
+            except Exception as e:
+                print(f"SAM初期化エラー: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
 
     def resize_token_embeddings(self, new_num_tokens):
         """
@@ -1104,21 +1111,21 @@ class LISAForCausalLM(nn.Module, GenerationMixin):
         """
         print(f"LISAForCausalLM.resize_token_embeddings({new_num_tokens})を呼び出しました")
         
-        if not hasattr(self.lisa_model, 'resize_token_embeddings'):
+        if not hasattr(self.model, 'resize_token_embeddings'):
             print("警告: lisa_modelにresize_token_embeddingsメソッドがありません")
             # 代替策としてモデルに直接アクセス
-            if hasattr(self.lisa_model, 'model') and hasattr(self.lisa_model.model, 'resize_token_embeddings'):
-                return self.lisa_model.model.resize_token_embeddings(new_num_tokens)
+            if hasattr(self.model, 'model') and hasattr(self.model.model, 'resize_token_embeddings'):
+                return self.model.model.resize_token_embeddings(new_num_tokens)
             else:
                 print("エラー: lisa_model.modelにresize_token_embeddingsメソッドもありません")
                 return None
         
-        return self.lisa_model.resize_token_embeddings(new_num_tokens)
+        return self.model.resize_token_embeddings(new_num_tokens)
         
     def get_processor(self):
         """processorを取得"""
-        if hasattr(self.lisa_model, "processor"):
-            return self.lisa_model.processor
+        if hasattr(self.model, "processor"):
+            return self.model.processor
         else:
             print("警告: processorが設定されていません")
             return None
@@ -1159,14 +1166,14 @@ class LISAForCausalLM(nn.Module, GenerationMixin):
         """
         モデルの順伝播
         """
-        return self.lisa_model.forward(**kwargs)
+        return self.model.forward(**kwargs)
         
     def tie_weights(self):
         """
         入力埋め込みと出力埋め込みを結合します。
         """
-        if hasattr(self.lisa_model, 'model') and hasattr(self.lisa_model.model, 'tie_weights'):
-            self.lisa_model.model.tie_weights()
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'tie_weights'):
+            self.model.model.tie_weights()
         else:
             print("警告: tie_weightsメソッドがllama3_2モデルに見つかりません")
             
