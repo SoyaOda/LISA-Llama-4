@@ -1021,29 +1021,30 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
     LISA for Causal Language Modeling.
     Llama3.2 Vision + SAMを直接統合したシンプルな実装
     """
-    def __init__(self, **kwargs):
-        config = kwargs.pop("config", None)
+    def __init__(self, config=None, **kwargs):
+        # configがなければモデルIDから作成
+        model_id = kwargs.pop("model_id", "meta-llama/Llama-3.2-11B-Vision-Instruct")
+        
         if config is None:
-            # configがなければモデルIDから作成
-            model_id = kwargs.get("model_id", "meta-llama/Llama-3.2-11B-Vision-Instruct")
             from transformers import AutoConfig
             config = AutoConfig.from_pretrained(model_id)
         
-        # セグメンテーション関連の設定
+        # MllamaForConditionalGenerationに存在しないパラメータを取り除く
+        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
+        device_map = kwargs.pop("device_map", "auto")
+        
+        # セグメンテーション関連の設定を保存
         self.seg_token_idx = kwargs.pop("seg_token_idx", None)
         self.ce_loss_weight = kwargs.pop("ce_loss_weight", 1.0)
         self.bce_loss_weight = kwargs.pop("bce_loss_weight", 1.0)
         self.dice_loss_weight = kwargs.pop("dice_loss_weight", 1.0)
-        
-        # 省メモリ設定
-        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
-        device_map = kwargs.pop("device_map", "auto")
         
         # 量子化設定
         load_in_8bit = kwargs.pop("load_in_8bit", False)
         load_in_4bit = kwargs.pop("load_in_4bit", False)
         quantization_config = None
         if load_in_8bit or load_in_4bit:
+            from transformers import BitsAndBytesConfig
             quantization_config = BitsAndBytesConfig(
                 load_in_8bit=load_in_8bit,
                 load_in_4bit=load_in_4bit,
@@ -1051,32 +1052,61 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4"
             )
-            
-        # 親クラス初期化
-        super().__init__(
-            config, 
-            torch_dtype=torch_dtype, 
+        
+        # まず親クラスを初期化（MllamaForConditionalGenerationのコンストラクタを呼び出す）
+        # このときtorch_dtypeは渡さない
+        MllamaForConditionalGeneration.__init__(self, config)
+        
+        # 以下の処理でfrom_pretrainedを使って重みを読み込み、適用する
+        # これにより、MllamaForConditionalGenerationの__init__を回避しつつ初期化できる
+        from transformers import MllamaForConditionalGeneration
+        pretrained_model = MllamaForConditionalGeneration.from_pretrained(
+            model_id, 
+            config=config,
             device_map=device_map,
-            quantization_config=quantization_config
+            torch_dtype=torch_dtype,
+            quantization_config=quantization_config,
+            **kwargs
         )
         
+        # 事前学習済みモデルから重みをコピー
+        pretrained_model_dict = pretrained_model.state_dict()
+        
+        # 現在のモデルに適用可能な重みだけをロード
+        # (サイズの不一致があると失敗するため)
+        model_dict = self.state_dict()
+        for name, param in pretrained_model_dict.items():
+            if name in model_dict and model_dict[name].shape == param.shape:
+                model_dict[name].copy_(param)
+        
+        # 事前学習済みモデルからプロセッサをコピー
+        try:
+            from transformers import AutoProcessor
+            self.processor = AutoProcessor.from_pretrained(model_id)
+        except Exception as e:
+            print(f"プロセッサの初期化エラー: {e}")
+            self.processor = None
+                
         # SAM初期化
-        vision_pretrained = kwargs.pop("vision_pretrained", None)
+        vision_pretrained = kwargs.pop("vision_pretrained", None) if "vision_pretrained" in kwargs else None
         if vision_pretrained:
             try:
+                from model.segment_anything import build_sam_vit_h
                 self.visual_model = build_sam_vit_h(checkpoint=vision_pretrained)
                 # SAMパラメータをfreeze
                 for param in self.visual_model.parameters():
                     param.requires_grad = False
                     
                 # マスクデコーダーは学習対象にする
-                if kwargs.get("train_mask_decoder", True) and hasattr(self.visual_model, "mask_decoder"):
+                train_mask_decoder = kwargs.pop("train_mask_decoder", True) if "train_mask_decoder" in kwargs else True
+                if train_mask_decoder and hasattr(self.visual_model, "mask_decoder"):
+                    self.visual_model.mask_decoder.train()
                     for param in self.visual_model.mask_decoder.parameters():
                         param.requires_grad = True
                         
                 # テキスト埋め込みからSAMプロンプト埋め込みへの変換層
                 prompt_embed_dim = 256  # SAMデフォルト値
-                hidden_size = getattr(config, "hidden_size", 4096)
+                hidden_size = getattr(config, 'hidden_size', 4096)
                 if hasattr(config, 'text_config') and hasattr(config.text_config, 'hidden_size'):
                     hidden_size = config.text_config.hidden_size
                     
@@ -1088,9 +1118,6 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
                         nn.Dropout(0.0),
                     )
                 ])
-                
-                # プロセッサを初期化
-                self.processor = AutoProcessor.from_pretrained(model_id)
                 
             except Exception as e:
                 print(f"SAM初期化エラー: {e}")
