@@ -1062,28 +1062,31 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
         # 親クラスを初期化 - SAM関連のパラメータは除外済み
         super(LISAForCausalLM, self).__init__(config)
         
-        # オリジナルLISAコードとの互換性のため、self.modelをselfへの参照として設定
-        # train_ds.pyなどで参照するmodel.modelのためのハック
-        self.model = self
+        # オリジナルのLISAコードとの互換性のために、base_modelを設定
+        # train_ds.pyがmodel.modelにアクセスするため必要
+        self.base_model = None  # 後でプロパティを通じてアクセスできるようにする
         
         # 事前学習済みモデルをロード
-        pretrained_model = AutoModelForVision2Seq.from_pretrained(
-            model_id, 
-            config=config,
-            device_map=device_map,
-            torch_dtype=torch_dtype,
-            quantization_config=quantization_config,
-            **kwargs  # 残りのパラメータ
-        )
-        
-        # 事前学習済みモデルから重みをコピー
-        pretrained_model_dict = pretrained_model.state_dict()
-        
-        # 現在のモデルに適用可能な重みだけをロード
-        model_dict = self.state_dict()
-        for name, param in pretrained_model_dict.items():
-            if name in model_dict and model_dict[name].shape == param.shape:
-                model_dict[name].copy_(param)
+        try:
+            from transformers import AutoModelForVision2Seq
+            print(f"base_modelを初期化: {model_id}")
+            # モデルを直接ロード
+            self.base_model = AutoModelForVision2Seq.from_pretrained(
+                model_id, 
+                config=config,
+                device_map=device_map,
+                torch_dtype=torch_dtype,
+                quantization_config=quantization_config,
+                **kwargs  # 残りのパラメータ
+            )
+            print("base_modelの初期化完了")
+            
+            # 重みはコピーせず、base_modelを直接参照して使用する
+            # これによりstate_dictによる無限再帰を回避
+        except Exception as e:
+            print(f"ベースモデルのロード中にエラーが発生しました: {e}")
+            import traceback
+            traceback.print_exc()
         
         # プロセッサを初期化
         try:
@@ -1128,11 +1131,57 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
                 import traceback
                 traceback.print_exc()
                 raise
-
+    
+    @property
+    def model(self):
+        """
+        train_ds.pyとの互換性のためのプロパティ。
+        model.modelにアクセスするときにベースモデルを返します。
+        """
+        # オリジナルのLISAでは、model.modelがLisaModelインスタンスを参照していた
+        # ここでは、base_modelを通じて事前学習済みの言語モデルにアクセスできるようにする
+        # ただし、base_model自体が持っているメソッドと属性だけではなく、
+        # selfが持っているメソッドや属性もアクセスできるようにする必要がある
+        
+        class ModelProxy:
+            """
+            モデルプロキシクラス - 自身（LISAForCausalLM）とbase_modelを組み合わせたアクセスを提供
+            """
+            def __init__(self, lisa_model, base_model):
+                self.lisa_model = lisa_model  # LISAForCausalLMインスタンス
+                self.base_model = base_model  # AutoModelForVision2Seqインスタンス
+                
+            def __getattr__(self, name):
+                # 最初にbase_modelで属性を探す
+                if self.base_model is not None and hasattr(self.base_model, name):
+                    return getattr(self.base_model, name)
+                
+                # なければlisa_modelで探す
+                if hasattr(self.lisa_model, name):
+                    return getattr(self.lisa_model, name)
+                    
+                # どちらにもなければAttributeError
+                raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+                
+            def to(self, device):
+                # toメソッドの特別な処理（train_ds.pyで使用）
+                if self.base_model is not None:
+                    self.base_model.to(device)
+                return self
+                
+            @property
+            def config(self):
+                # configプロパティの特別な処理（train_ds.pyで使用）
+                if self.base_model is not None and hasattr(self.base_model, "config"):
+                    return self.base_model.config
+                return self.lisa_model.config
+        
+        return ModelProxy(self, self.base_model)
+    
     def resize_token_embeddings(self, new_num_tokens):
         """
         トークン埋め込みのサイズを変更します。
-        LisaModelのresize_token_embeddingsメソッドに委譲します。
+        親クラスのresize_token_embeddingsメソッドに委譲します。
         
         Args:
             new_num_tokens: 新しいトークンの数
@@ -1142,7 +1191,7 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
         """
         print(f"LISAForCausalLM.resize_token_embeddings({new_num_tokens})を呼び出しました")
         
-        # MLlamaモデルのメソッドを直接呼び出す
+        # MllamaForConditionalGenerationのメソッドを直接呼び出す
         return super().resize_token_embeddings(new_num_tokens)
         
     def get_processor(self):
@@ -1152,7 +1201,7 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
         else:
             print("警告: processorが設定されていません")
             return None
-            
+    
     def get_visual_embs(self, images):
         """
         SAMの画像エンコーダーを使用して視覚的特徴を抽出します。
@@ -1184,7 +1233,7 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
             print(f"SAM画像エンコーダの実行中にエラーが発生しました: {e}")
             traceback.print_exc()
             raise
-        
+            
     def forward(self, **kwargs):
         """
         モデルの順伝播
@@ -1226,11 +1275,8 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
         # 画像処理部分
         if images is not None:
             try:
-                # プロセッサの準備
-                processor = None
-                if hasattr(self, "get_processor"):
-                    processor = self.get_processor()
-                    
+                # プロセッサを使用して画像を処理
+                processor = self.get_processor()
                 if processor is not None:
                     # テンソル型かどうかで処理を分岐
                     if isinstance(images, torch.Tensor):
@@ -1238,55 +1284,30 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
                         import numpy as np
                         from PIL import Image
                         
-                        print(f"推論用画像形状: {images.shape}")
-                        
-                        # 6次元テンソルの処理 (例: [batch, slot, num_img, ch, h, w])
-                        if images.dim() == 6:
-                            print("6次元テンソルを検出。単一画像形式に変換します")
-                            print(f"元形状: {images.shape}")
-                            
-                            batch_size = images.shape[0]
-                            channels = images.shape[3]
-                            height = images.shape[4]
-                            width = images.shape[5]
-                            
-                            # 各バッチの最初の画像を選択
-                            images = images[:, 0, 0].reshape(batch_size, channels, height, width)
-                            print(f"変換後形状: {images.shape}")
-                        
-                        # PILイメージのリストに変換
-                        images_for_processor = []
-                        
-                        # バッチサイズを決定
+                        # バッチサイズの決定
                         if len(images.shape) == 4:  # [batch, ch, h, w]
-                            batch_size = images.shape[0]
-                            for i in range(batch_size):
-                                # BFloat16をfloat32に変換してからNumPy配列に変換
+                            images_for_processor = []
+                            for i in range(images.shape[0]):
+                                # 画像テンソルをPILイメージに変換
                                 img_np = images[i].to(torch.float32).permute(1, 2, 0).cpu().numpy()
                                 img_np = np.clip(img_np, 0, 1)
                                 img_np = (img_np * 255).astype(np.uint8)
                                 images_for_processor.append(Image.fromarray(img_np))
-                        else:  # 単一画像 [ch, h, w]
-                            # BFloat16をfloat32に変換してからNumPy配列に変換
+                        else:
+                            # 単一画像の場合
                             img_np = images.to(torch.float32).permute(1, 2, 0).cpu().numpy()
                             img_np = np.clip(img_np, 0, 1)
                             img_np = (img_np * 255).astype(np.uint8)
                             images_for_processor = [Image.fromarray(img_np)]
-                            batch_size = 1
-                            
-                        print(f"PILイメージへの変換完了: {len(images_for_processor)}枚")
                     else:
                         # すでにPILイメージかリスト形式の場合
                         images_for_processor = images if isinstance(images, list) else [images]
-                        batch_size = len(images_for_processor)
-                        print(f"既存のイメージフォーマットを使用: {len(images_for_processor)}枚")
                     
-                    # テキストの準備 - 各画像に対応する<|image|>トークンを含むテキスト
+                    # 各画像に対応するテキストを準備（<|image|>トークンのみ）
+                    batch_size = len(images_for_processor)
                     text_prompts = ["<|image|>"] * batch_size
                     
-                    print(f"プロセッサに渡す - テキスト: {len(text_prompts)}個, 画像: {len(images_for_processor)}枚")
-                    
-                    # プロセッサ実行
+                    # プロセッサで処理
                     device = next(self.parameters()).device
                     processor_outputs = processor(
                         text=text_prompts,
@@ -1303,32 +1324,16 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
                     # バッチ入力に追加
                     for k, v in processor_outputs.items():
                         batch_inputs[k] = v
-                else:
-                    # プロセッサがない場合は直接テンソルを使用
-                    print("プロセッサなし: 画像を直接pixel_valuesとして設定")
-                    batch_inputs["pixel_values"] = images
                     
-                    # バッチサイズを推定
-                    batch_size = images.shape[0] if len(images.shape) >= 4 else 1
-                    
-                    # aspect_ratio_idsを設定
-                    device = images.device if hasattr(images, 'device') else next(self.parameters()).device
-                    batch_inputs["aspect_ratio_ids"] = torch.zeros(batch_size, dtype=torch.long, device=device)
+                    # aspect_ratio_idsの確認と追加
+                    if "pixel_values" in batch_inputs and "aspect_ratio_ids" not in batch_inputs:
+                        batch_inputs["aspect_ratio_ids"] = torch.zeros(
+                            batch_inputs["pixel_values"].shape[0],
+                            dtype=torch.long,
+                            device=device
+                        )
             except Exception as e:
                 print(f"画像処理エラー: {e}")
-                import traceback
-                traceback.print_exc()
-                print("警告: 画像処理をスキップし、テキストのみで続行します")
-                # エラーが発生しても処理を続行
+                # エラーが発生してもクラッシュせず処理を続行
         
-        # aspect_ratio_idsの確認
-        if "pixel_values" in batch_inputs and "aspect_ratio_ids" not in batch_inputs:
-            print("aspect_ratio_idsを追加します")
-            device = batch_inputs["pixel_values"].device
-            batch_inputs["aspect_ratio_ids"] = torch.zeros(
-                batch_inputs["pixel_values"].shape[0], 
-                dtype=torch.long, 
-                device=device
-            )
-
         return batch_inputs
