@@ -483,13 +483,15 @@ class LisaModel(nn.Module):
                             images_for_processor = []
                             for i in range(images_clip.shape[0]):
                                 # [channels, height, width] -> [height, width, channels]
-                                img_np = images_clip[i].permute(1, 2, 0).cpu().numpy()
+                                # BFloat16をfloat32に変換してからNumPy配列に変換
+                                img_np = images_clip[i].to(torch.float32).permute(1, 2, 0).cpu().numpy()
                                 img_np = np.clip(img_np, 0, 1)
                                 img_np = (img_np * 255).astype(np.uint8)
                                 images_for_processor.append(Image.fromarray(img_np))
                         else:
                             # 単一画像の場合
-                            img_np = images_clip.permute(1, 2, 0).cpu().numpy()
+                            # BFloat16をfloat32に変換してからNumPy配列に変換
+                            img_np = images_clip.to(torch.float32).permute(1, 2, 0).cpu().numpy()
                             img_np = np.clip(img_np, 0, 1)
                             img_np = (img_np * 255).astype(np.uint8)
                             images_for_processor = [Image.fromarray(img_np)]
@@ -1232,13 +1234,15 @@ class LISAForCausalLM(nn.Module, GenerationMixin):
                         if len(images.shape) == 4:  # [batch, channels, height, width]
                             for i in range(batch_size):
                                 # チャネルを最後に移動
-                                img_np = images[i].permute(1, 2, 0).cpu().numpy()
+                                # BFloat16をfloat32に変換してからNumPy配列に変換
+                                img_np = images[i].to(torch.float32).permute(1, 2, 0).cpu().numpy()
                                 img_np = np.clip(img_np, 0, 1)
                                 img_np = (img_np * 255).astype(np.uint8)
                                 pil_images.append(Image.fromarray(img_np))
                         else:
                             # 単一画像の場合
-                            img_np = images.permute(1, 2, 0).cpu().numpy()
+                            # BFloat16をfloat32に変換してからNumPy配列に変換
+                            img_np = images.to(torch.float32).permute(1, 2, 0).cpu().numpy()
                             img_np = np.clip(img_np, 0, 1)
                             img_np = (img_np * 255).astype(np.uint8)
                             pil_images = [Image.fromarray(img_np)]
@@ -1254,34 +1258,6 @@ class LISAForCausalLM(nn.Module, GenerationMixin):
                         
                         # デバイスを確認
                         device = images.device if hasattr(images, 'device') else "cuda" if torch.cuda.is_available() else "cpu"
-                        image_inputs = processor(text=text, images=pil_images, return_tensors="pt", padding=True)
-                        
-                        # デバイスを合わせる
-                        for k, v in image_inputs.items():
-                            if isinstance(v, torch.Tensor):
-                                image_inputs[k] = v.to(device)
-                                
-                        # バッチ入力に追加
-                        for k, v in image_inputs.items():
-                            batch_inputs[k] = v
-                            
-                        # 入力の形状とデータ型を表示（デバッグ用）
-                        for key, value in batch_inputs.items():
-                            if isinstance(value, torch.Tensor):
-                                print(f"  - {key}: 形状={value.shape}, データ型={value.dtype}, デバイス={value.device}")
-                            else:
-                                print(f"  - {key}: タイプ={type(value)}")
-                    else:
-                        print("警告: 画像がテンソル形式ではありません。直接処理します。")
-                        # 直接PILイメージとして処理
-                        pil_images = images if isinstance(images, list) else [images]
-                        batch_size = len(pil_images)
-                        
-                        # テキスト入力を用意
-                        text = ["<|image|>"] * batch_size
-                        
-                        # プロセッサを使用
-                        device = "cuda" if torch.cuda.is_available() else "cpu"
                         image_inputs = processor(text=text, images=pil_images, return_tensors="pt", padding=True)
                         
                         # デバイスを合わせる
