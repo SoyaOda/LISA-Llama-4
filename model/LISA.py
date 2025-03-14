@@ -244,12 +244,12 @@ class LisaModel(nn.Module):
                 torch_dtype=torch_dtype,
                 quantization_config=quantization_config
             )
-            print("モデルのロードに成功しました")
+            print(f"モデルのロードに成功しました")
             
             # プロセッサを初期化
             try:
                 print(f"プロセッサを初期化します: {model_id}")
-            self.processor = AutoProcessor.from_pretrained(model_id)
+                self.processor = AutoProcessor.from_pretrained(model_id)
                 print("プロセッサの初期化に成功しました")
             except Exception as e:
                 print(f"プロセッサの初期化中にエラーが発生しました: {e}")
@@ -268,7 +268,7 @@ class LisaModel(nn.Module):
         if sam_vision_encoder is not None:
             self.visual_model = sam_vision_encoder
             print("提供されたSAMビジョンエンコーダーを使用します")
-            else:
+        else:
             # SAMビジョンエンコーダーを構築
             try:
                 if vision_pretrained:
@@ -279,7 +279,7 @@ class LisaModel(nn.Module):
                 else:
                     print("警告: vision_pretrainedが指定されていないため、SAMビジョンエンコーダーを初期化していません")
                     self.visual_model = None
-                    except Exception as e:
+            except Exception as e:
                 print(f"SAMビジョンエンコーダーの初期化中にエラーが発生しました: {e}")
                 traceback.print_exc()
                 self.visual_model = None
@@ -418,7 +418,7 @@ class LisaModel(nn.Module):
 
         # プロセッサを取得
         try:
-        processor = self.get_processor()
+            processor = self.get_processor()
             if processor is None:
                 raise ValueError("processorが初期化されていません。model_forwardメソッドを実行できません。")
         except AttributeError as e:
@@ -433,11 +433,11 @@ class LisaModel(nn.Module):
                 print("プロセッサを使用して入力を処理します")
                 
                 # テキスト入力の準備
-        if isinstance(input_ids, torch.Tensor):
-            if tokenizer is None:
+                if isinstance(input_ids, torch.Tensor):
+                    if tokenizer is None:
                         raise ValueError("テンソル形式のinput_idsに対してtokenizerが必要です")
                     
-            # トークンIDをテキストにデコード
+                    # トークンIDをテキストにデコード
                     decoded_texts = tokenizer.batch_decode(input_ids, skip_special_tokens=False)
                     
                     # 各テキストに画像トークンが含まれているか確認し、なければ追加
@@ -445,11 +445,11 @@ class LisaModel(nn.Module):
                     for text in decoded_texts:
                         # 画像トークンがない場合は、テキストの先頭に追加
                         if "<|image|>" not in text:
-                        text = "<|image|> " + text
+                            text = "<|image|> " + text
                         processed_texts.append(text)
                     
                     text_input = processed_texts
-                        else:
+                else:
                     # すでに文字列または文字列のリストの場合
                     text_input = []
                     if isinstance(input_ids, str):
@@ -458,7 +458,7 @@ class LisaModel(nn.Module):
                     for text in input_ids:
                         if "<|image|>" not in text:
                             text = "<|image|> " + text
-                    text_input.append(text)
+                        text_input.append(text)
                 
                 # 画像入力の準備
                 images_for_processor = None
@@ -468,8 +468,8 @@ class LisaModel(nn.Module):
                         import numpy as np
                         
                         # 画像の形状を確認
-            print(f"images_clip形状: {images_clip.shape}")
-            
+                        print(f"images_clip形状: {images_clip.shape}")
+                        
                         # 6次元の場合の処理（特殊なケース）
                         if images_clip.dim() == 6:
                             print("6次元の画像テンソルを検出しました。形状を調整します。")
@@ -497,15 +497,6 @@ class LisaModel(nn.Module):
                                 img_np = np.clip(img_np, 0, 1)
                                 img_np = (img_np * 255).astype(np.uint8)
                                 images_for_processor.append(Image.fromarray(img_np))
-            else:
-                            # 単一画像の場合
-                            # BFloat16をfloat32に変換してからNumPy配列に変換
-                            img_np = images_clip.to(torch.float32).permute(1, 2, 0).cpu().numpy()
-                            img_np = np.clip(img_np, 0, 1)
-                            img_np = (img_np * 255).astype(np.uint8)
-                            images_for_processor = [Image.fromarray(img_np)]
-                            
-                        print(f"画像をPIL形式に変換しました: {len(images_for_processor)}枚")
                     except Exception as e:
                         print(f"画像変換中にエラーが発生しました: {e}")
                         traceback.print_exc()
@@ -524,7 +515,7 @@ class LisaModel(nn.Module):
                             print("テキスト数が足りないため、テキストを複製します")
                             text_input = text_input * (num_images // num_texts + 1)
                             text_input = text_input[:num_images]
-        else:
+                        else:
                             # テキスト数が多い場合は、ダミー画像を追加
                             print("画像数が足りないため、ダミー画像を追加します")
                             # ダミー画像を作成（黒い画像）
@@ -579,8 +570,8 @@ class LisaModel(nn.Module):
                             **processor_inputs,
                             output_hidden_states=True,
                             return_dict=True
-                )
-            else:
+                        )
+                else:
                     outputs = self.model(
                         **processor_inputs,
                         output_hidden_states=True,
@@ -719,14 +710,14 @@ class LisaModel(nn.Module):
 
         # offsetがNoneでなければ使用
         if offset is not None:
-        seg_token_offset = seg_token_offset[offset]
+            seg_token_offset = seg_token_offset[offset]
 
         # 予測埋め込みを処理
         pred_embeddings_ = []
         for i in range(len(seg_token_offset) - 1):
             start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
             if start_i < end_i:  # 開始と終了が同じではないことを確認
-            pred_embeddings_.append(pred_embeddings[start_i:end_i])
+                pred_embeddings_.append(pred_embeddings[start_i:end_i])
             else:
                 print(f"警告: セグメントインデックス {i} の範囲が無効です (start={start_i}, end={end_i})")
                 # 空のエンベディングを追加（処理を続行するため）
@@ -771,43 +762,43 @@ class LisaModel(nn.Module):
                 raise AttributeError("visual_modelが見つかりません")
             
             # 各<SEG>トークンに対応するマスクを生成
-        for i in range(len(pred_embeddings)):
+            for i in range(len(pred_embeddings)):
                 try:
                     # バッチインデックスの調整
                     batch_idx = min(i, len(image_embeddings) - 1)
                     
                     # SAMのプロンプトエンコーダーにテキスト埋め込みを渡す
-            (
-                sparse_embeddings,
-                dense_embeddings,
+                    (
+                        sparse_embeddings,
+                        dense_embeddings,
                     ) = visual_model.prompt_encoder(
-                points=None,
-                boxes=None,
-                masks=None,
-                text_embeds=pred_embeddings[i].unsqueeze(1),
-            )
-            
-            # データ型を合わせる
-            sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
-            
+                        points=None,
+                        boxes=None,
+                        masks=None,
+                        text_embeds=pred_embeddings[i].unsqueeze(1),
+                    )
+                    
+                    # データ型を合わせる
+                    sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
+                    
                     # マスクデコーダーを使用してマスクを生成
                     low_res_masks, iou_predictions = visual_model.mask_decoder(
                         image_embeddings=image_embeddings[batch_idx].unsqueeze(0),
                         image_pe=visual_model.prompt_encoder.get_dense_pe(),
-                sparse_prompt_embeddings=sparse_embeddings,
-                dense_prompt_embeddings=dense_embeddings,
-                multimask_output=multimask_output,
-            )
-            
+                        sparse_prompt_embeddings=sparse_embeddings,
+                        dense_prompt_embeddings=dense_embeddings,
+                        multimask_output=multimask_output,
+                    )
+                    
                     # マスクの後処理
                     try:
                         # resize_listとlabel_listの両方がある場合
                         if resize_list is not None and i < len(resize_list) and label_list is not None and i < len(label_list):
                             pred_mask = visual_model.postprocess_masks(
-                low_res_masks,
-                input_size=resize_list[i],
-                original_size=label_list[i].shape,
-            )
+                                low_res_masks,
+                                input_size=resize_list[i],
+                                original_size=label_list[i].shape,
+                            )
                         # label_listからサイズを取得
                         elif label_list is not None and i < len(label_list):
                             original_size = label_list[i].shape
@@ -833,7 +824,7 @@ class LisaModel(nn.Module):
                         pred_mask = low_res_masks
                     
                     # マスクを追加（最初のマスクのみ使用）
-            pred_masks.append(pred_mask[:, 0])
+                    pred_masks.append(pred_mask[:, 0])
                     
                 except Exception as mask_e:
                     print(f"マスク生成中にエラーが発生しました: {mask_e}")
@@ -904,8 +895,8 @@ class LisaModel(nn.Module):
             try:
                 for batch_idx in range(min(len(pred_masks), len(gt_masks))):
                     try:
-            gt_mask = gt_masks[batch_idx]
-            pred_mask = pred_masks[batch_idx]
+                        gt_mask = gt_masks[batch_idx]
+                        pred_mask = pred_masks[batch_idx]
 
                         # 形状が一致するか確認
                         if gt_mask.shape[0] != pred_mask.shape[0]:
@@ -934,7 +925,7 @@ class LisaModel(nn.Module):
                         
                         mask_bce_loss = mask_bce_loss + batch_bce
                         mask_dice_loss = mask_dice_loss + batch_dice
-            num_masks += gt_mask.shape[0]
+                        num_masks += gt_mask.shape[0]
                     except Exception as e:
                         print(f"バッチ{batch_idx}のマスク損失計算中にエラーが発生しました: {e}")
                         # このバッチをスキップ
@@ -946,7 +937,7 @@ class LisaModel(nn.Module):
         if num_masks > 0:
             mask_bce_loss = self.bce_loss_weight * mask_bce_loss / num_masks
             mask_dice_loss = self.dice_loss_weight * mask_dice_loss / num_masks
-        mask_loss = mask_bce_loss + mask_dice_loss
+            mask_loss = mask_bce_loss + mask_dice_loss
         else:
             # マスクがない場合は0を設定
             mask_loss = torch.tensor(0.0, device=device)
@@ -976,13 +967,13 @@ class LisaModel(nn.Module):
                 "seg_token_counts": seg_token_counts,
             }
         else:
-        return {
-            "loss": loss,
-            "ce_loss": ce_loss,
-            "mask_bce_loss": mask_bce_loss,
-            "mask_dice_loss": mask_dice_loss,
-            "mask_loss": mask_loss,
-        }
+            return {
+                "loss": loss,
+                "ce_loss": ce_loss,
+                "mask_bce_loss": mask_bce_loss,
+                "mask_dice_loss": mask_dice_loss,
+                "mask_loss": mask_loss,
+            }
 
     def get_visual_embs(self, images):
         """
@@ -1006,7 +997,7 @@ class LisaModel(nn.Module):
             images = images.to(device)
             
         try:
-        with torch.no_grad():
+            with torch.no_grad():
                 # SAMイメージエンコーダを呼び出し
                 image_embeddings = self.visual_model.image_encoder(images)
                 
@@ -1393,7 +1384,7 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
                 processor = self.get_processor()
                 if processor is not None:
                     # テンソル型かどうかで処理を分岐
-            if isinstance(images, torch.Tensor):
+                    if isinstance(images, torch.Tensor):
                         # PILイメージに変換
                         import numpy as np
                         from PIL import Image
