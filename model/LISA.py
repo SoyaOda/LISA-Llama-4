@@ -1053,14 +1053,13 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
                 bnb_4bit_quant_type="nf4"
             )
         
-        # まず親クラスを初期化（MllamaForConditionalGenerationのコンストラクタを呼び出す）
-        # このときtorch_dtypeは渡さない
-        MllamaForConditionalGeneration.__init__(self, config)
+        # まず親クラスを初期化
+        # エラー修正: ローカル変数を再定義する前に親クラスの初期化
+        super(LISAForCausalLM, self).__init__(config)
         
         # 以下の処理でfrom_pretrainedを使って重みを読み込み、適用する
-        # これにより、MllamaForConditionalGenerationの__init__を回避しつつ初期化できる
-        from transformers import MllamaForConditionalGeneration
-        pretrained_model = MllamaForConditionalGeneration.from_pretrained(
+        # トップレベルのインポートを使用し、ローカル変数の再定義を避ける
+        pretrained_model = AutoModelForVision2Seq.from_pretrained(
             model_id, 
             config=config,
             device_map=device_map,
