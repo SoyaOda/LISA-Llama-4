@@ -1029,15 +1029,21 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
             from transformers import AutoConfig
             config = AutoConfig.from_pretrained(model_id)
         
-        # MllamaForConditionalGenerationに存在しないパラメータを取り除く
-        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
-        device_map = kwargs.pop("device_map", "auto")
-        
-        # セグメンテーション関連の設定を保存
+        # SAM関連のパラメータを保存（MllamaForConditionalGenerationには渡さない）
         self.seg_token_idx = kwargs.pop("seg_token_idx", None)
         self.ce_loss_weight = kwargs.pop("ce_loss_weight", 1.0)
         self.bce_loss_weight = kwargs.pop("bce_loss_weight", 1.0)
         self.dice_loss_weight = kwargs.pop("dice_loss_weight", 1.0)
+        self.train_mask_decoder = kwargs.pop("train_mask_decoder", True)
+        self.out_dim = kwargs.pop("out_dim", 256)
+        self.vision_pretrained = kwargs.pop("vision_pretrained", None)
+        # その他のLISA固有パラメータも取り除く
+        kwargs.pop("vision_tower", None)
+        kwargs.pop("use_mm_start_end", None)
+        
+        # MllamaForConditionalGeneration初期化のためのパラメータだけを残す
+        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
+        device_map = kwargs.pop("device_map", "auto")
         
         # 量子化設定
         load_in_8bit = kwargs.pop("load_in_8bit", False)
@@ -1053,32 +1059,29 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
                 bnb_4bit_quant_type="nf4"
             )
         
-        # まず親クラスを初期化
-        # エラー修正: ローカル変数を再定義する前に親クラスの初期化
+        # 親クラスを初期化 - SAM関連のパラメータは除外済み
         super(LISAForCausalLM, self).__init__(config)
         
-        # 以下の処理でfrom_pretrainedを使って重みを読み込み、適用する
-        # トップレベルのインポートを使用し、ローカル変数の再定義を避ける
+        # 事前学習済みモデルをロード
         pretrained_model = AutoModelForVision2Seq.from_pretrained(
             model_id, 
             config=config,
             device_map=device_map,
             torch_dtype=torch_dtype,
             quantization_config=quantization_config,
-            **kwargs
+            **kwargs  # 残りのパラメータ
         )
         
         # 事前学習済みモデルから重みをコピー
         pretrained_model_dict = pretrained_model.state_dict()
         
         # 現在のモデルに適用可能な重みだけをロード
-        # (サイズの不一致があると失敗するため)
         model_dict = self.state_dict()
         for name, param in pretrained_model_dict.items():
             if name in model_dict and model_dict[name].shape == param.shape:
                 model_dict[name].copy_(param)
         
-        # 事前学習済みモデルからプロセッサをコピー
+        # プロセッサを初期化
         try:
             from transformers import AutoProcessor
             self.processor = AutoProcessor.from_pretrained(model_id)
@@ -1086,19 +1089,17 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
             print(f"プロセッサの初期化エラー: {e}")
             self.processor = None
                 
-        # SAM初期化
-        vision_pretrained = kwargs.pop("vision_pretrained", None) if "vision_pretrained" in kwargs else None
-        if vision_pretrained:
+        # SAM初期化 - 保存しておいたSAM関連のパラメータを使用
+        if self.vision_pretrained:
             try:
                 from model.segment_anything import build_sam_vit_h
-                self.visual_model = build_sam_vit_h(checkpoint=vision_pretrained)
+                self.visual_model = build_sam_vit_h(checkpoint=self.vision_pretrained)
                 # SAMパラメータをfreeze
                 for param in self.visual_model.parameters():
                     param.requires_grad = False
                     
                 # マスクデコーダーは学習対象にする
-                train_mask_decoder = kwargs.pop("train_mask_decoder", True) if "train_mask_decoder" in kwargs else True
-                if train_mask_decoder and hasattr(self.visual_model, "mask_decoder"):
+                if self.train_mask_decoder and hasattr(self.visual_model, "mask_decoder"):
                     self.visual_model.mask_decoder.train()
                     for param in self.visual_model.mask_decoder.parameters():
                         param.requires_grad = True
@@ -1113,7 +1114,7 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
                     nn.Sequential(
                         nn.Linear(hidden_size, hidden_size),
                         nn.ReLU(inplace=True),
-                        nn.Linear(hidden_size, prompt_embed_dim),
+                        nn.Linear(hidden_size, self.out_dim),
                         nn.Dropout(0.0),
                     )
                 ])
