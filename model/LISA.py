@@ -249,7 +249,7 @@ class LisaModel(nn.Module):
             # プロセッサを初期化
             try:
                 print(f"プロセッサを初期化します: {model_id}")
-                self.processor = AutoProcessor.from_pretrained(model_id)
+            self.processor = AutoProcessor.from_pretrained(model_id)
                 print("プロセッサの初期化に成功しました")
             except Exception as e:
                 print(f"プロセッサの初期化中にエラーが発生しました: {e}")
@@ -268,7 +268,7 @@ class LisaModel(nn.Module):
         if sam_vision_encoder is not None:
             self.visual_model = sam_vision_encoder
             print("提供されたSAMビジョンエンコーダーを使用します")
-        else:
+            else:
             # SAMビジョンエンコーダーを構築
             try:
                 if vision_pretrained:
@@ -279,7 +279,7 @@ class LisaModel(nn.Module):
                 else:
                     print("警告: vision_pretrainedが指定されていないため、SAMビジョンエンコーダーを初期化していません")
                     self.visual_model = None
-            except Exception as e:
+                    except Exception as e:
                 print(f"SAMビジョンエンコーダーの初期化中にエラーが発生しました: {e}")
                 traceback.print_exc()
                 self.visual_model = None
@@ -360,7 +360,7 @@ class LisaModel(nn.Module):
         else:
             print("警告: processorが設定されていません")
             return None
-    
+
     def forward(self, **kwargs):
         """
         モデルの前方伝播。
@@ -418,7 +418,7 @@ class LisaModel(nn.Module):
 
         # プロセッサを取得
         try:
-            processor = self.get_processor()
+        processor = self.get_processor()
             if processor is None:
                 raise ValueError("processorが初期化されていません。model_forwardメソッドを実行できません。")
         except AttributeError as e:
@@ -433,11 +433,11 @@ class LisaModel(nn.Module):
                 print("プロセッサを使用して入力を処理します")
                 
                 # テキスト入力の準備
-                if isinstance(input_ids, torch.Tensor):
-                    if tokenizer is None:
+        if isinstance(input_ids, torch.Tensor):
+            if tokenizer is None:
                         raise ValueError("テンソル形式のinput_idsに対してtokenizerが必要です")
                     
-                    # トークンIDをテキストにデコード
+            # トークンIDをテキストにデコード
                     decoded_texts = tokenizer.batch_decode(input_ids, skip_special_tokens=False)
                     
                     # 各テキストに画像トークンが含まれているか確認し、なければ追加
@@ -445,11 +445,11 @@ class LisaModel(nn.Module):
                     for text in decoded_texts:
                         # 画像トークンがない場合は、テキストの先頭に追加
                         if "<|image|>" not in text:
-                            text = "<|image|> " + text
+                        text = "<|image|> " + text
                         processed_texts.append(text)
                     
                     text_input = processed_texts
-                else:
+                        else:
                     # すでに文字列または文字列のリストの場合
                     text_input = []
                     if isinstance(input_ids, str):
@@ -458,7 +458,7 @@ class LisaModel(nn.Module):
                     for text in input_ids:
                         if "<|image|>" not in text:
                             text = "<|image|> " + text
-                        text_input.append(text)
+                    text_input.append(text)
                 
                 # 画像入力の準備
                 images_for_processor = None
@@ -468,8 +468,8 @@ class LisaModel(nn.Module):
                         import numpy as np
                         
                         # 画像の形状を確認
-                        print(f"images_clip形状: {images_clip.shape}")
-                        
+            print(f"images_clip形状: {images_clip.shape}")
+            
                         # 6次元の場合の処理（特殊なケース）
                         if images_clip.dim() == 6:
                             print("6次元の画像テンソルを検出しました。形状を調整します。")
@@ -497,7 +497,7 @@ class LisaModel(nn.Module):
                                 img_np = np.clip(img_np, 0, 1)
                                 img_np = (img_np * 255).astype(np.uint8)
                                 images_for_processor.append(Image.fromarray(img_np))
-                        else:
+            else:
                             # 単一画像の場合
                             # BFloat16をfloat32に変換してからNumPy配列に変換
                             img_np = images_clip.to(torch.float32).permute(1, 2, 0).cpu().numpy()
@@ -524,7 +524,7 @@ class LisaModel(nn.Module):
                             print("テキスト数が足りないため、テキストを複製します")
                             text_input = text_input * (num_images // num_texts + 1)
                             text_input = text_input[:num_images]
-                        else:
+        else:
                             # テキスト数が多い場合は、ダミー画像を追加
                             print("画像数が足りないため、ダミー画像を追加します")
                             # ダミー画像を作成（黒い画像）
@@ -579,8 +579,8 @@ class LisaModel(nn.Module):
                             **processor_inputs,
                             output_hidden_states=True,
                             return_dict=True
-                        )
-                else:
+                )
+            else:
                     outputs = self.model(
                         **processor_inputs,
                         output_hidden_states=True,
@@ -716,17 +716,17 @@ class LisaModel(nn.Module):
         seg_token_offset = torch.cat(
             [torch.zeros(1, device=device, dtype=torch.long), seg_token_offset], dim=0
         )
-        
+
         # offsetがNoneでなければ使用
         if offset is not None:
-            seg_token_offset = seg_token_offset[offset]
+        seg_token_offset = seg_token_offset[offset]
 
         # 予測埋め込みを処理
         pred_embeddings_ = []
         for i in range(len(seg_token_offset) - 1):
             start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
             if start_i < end_i:  # 開始と終了が同じではないことを確認
-                pred_embeddings_.append(pred_embeddings[start_i:end_i])
+            pred_embeddings_.append(pred_embeddings[start_i:end_i])
             else:
                 print(f"警告: セグメントインデックス {i} の範囲が無効です (start={start_i}, end={end_i})")
                 # 空のエンベディングを追加（処理を続行するため）
@@ -771,43 +771,43 @@ class LisaModel(nn.Module):
                 raise AttributeError("visual_modelが見つかりません")
             
             # 各<SEG>トークンに対応するマスクを生成
-            for i in range(len(pred_embeddings)):
+        for i in range(len(pred_embeddings)):
                 try:
                     # バッチインデックスの調整
                     batch_idx = min(i, len(image_embeddings) - 1)
                     
                     # SAMのプロンプトエンコーダーにテキスト埋め込みを渡す
-                    (
-                        sparse_embeddings,
-                        dense_embeddings,
+            (
+                sparse_embeddings,
+                dense_embeddings,
                     ) = visual_model.prompt_encoder(
-                        points=None,
-                        boxes=None,
-                        masks=None,
-                        text_embeds=pred_embeddings[i].unsqueeze(1),
-                    )
-
-                    # データ型を合わせる
-                    sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
-                    
+                points=None,
+                boxes=None,
+                masks=None,
+                text_embeds=pred_embeddings[i].unsqueeze(1),
+            )
+            
+            # データ型を合わせる
+            sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
+            
                     # マスクデコーダーを使用してマスクを生成
                     low_res_masks, iou_predictions = visual_model.mask_decoder(
                         image_embeddings=image_embeddings[batch_idx].unsqueeze(0),
                         image_pe=visual_model.prompt_encoder.get_dense_pe(),
-                        sparse_prompt_embeddings=sparse_embeddings,
-                        dense_prompt_embeddings=dense_embeddings,
-                        multimask_output=multimask_output,
-                    )
-                    
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=multimask_output,
+            )
+            
                     # マスクの後処理
                     try:
                         # resize_listとlabel_listの両方がある場合
                         if resize_list is not None and i < len(resize_list) and label_list is not None and i < len(label_list):
                             pred_mask = visual_model.postprocess_masks(
-                                low_res_masks,
-                                input_size=resize_list[i],
-                                original_size=label_list[i].shape,
-                            )
+                low_res_masks,
+                input_size=resize_list[i],
+                original_size=label_list[i].shape,
+            )
                         # label_listからサイズを取得
                         elif label_list is not None and i < len(label_list):
                             original_size = label_list[i].shape
@@ -833,7 +833,7 @@ class LisaModel(nn.Module):
                         pred_mask = low_res_masks
                     
                     # マスクを追加（最初のマスクのみ使用）
-                    pred_masks.append(pred_mask[:, 0])
+            pred_masks.append(pred_mask[:, 0])
                     
                 except Exception as mask_e:
                     print(f"マスク生成中にエラーが発生しました: {mask_e}")
@@ -904,9 +904,9 @@ class LisaModel(nn.Module):
             try:
                 for batch_idx in range(min(len(pred_masks), len(gt_masks))):
                     try:
-                        gt_mask = gt_masks[batch_idx]
-                        pred_mask = pred_masks[batch_idx]
-                        
+            gt_mask = gt_masks[batch_idx]
+            pred_mask = pred_masks[batch_idx]
+
                         # 形状が一致するか確認
                         if gt_mask.shape[0] != pred_mask.shape[0]:
                             print(f"警告: バッチ{batch_idx}のマスク形状が一致しません。gt_mask: {gt_mask.shape}, pred_mask: {pred_mask.shape}")
@@ -934,7 +934,7 @@ class LisaModel(nn.Module):
                         
                         mask_bce_loss = mask_bce_loss + batch_bce
                         mask_dice_loss = mask_dice_loss + batch_dice
-                        num_masks += gt_mask.shape[0]
+            num_masks += gt_mask.shape[0]
                     except Exception as e:
                         print(f"バッチ{batch_idx}のマスク損失計算中にエラーが発生しました: {e}")
                         # このバッチをスキップ
@@ -946,7 +946,7 @@ class LisaModel(nn.Module):
         if num_masks > 0:
             mask_bce_loss = self.bce_loss_weight * mask_bce_loss / num_masks
             mask_dice_loss = self.dice_loss_weight * mask_dice_loss / num_masks
-            mask_loss = mask_bce_loss + mask_dice_loss
+        mask_loss = mask_bce_loss + mask_dice_loss
         else:
             # マスクがない場合は0を設定
             mask_loss = torch.tensor(0.0, device=device)
@@ -959,7 +959,7 @@ class LisaModel(nn.Module):
         
         # 合計損失の計算
         loss = ce_loss + mask_loss
-        
+
         # 損失のチェック
         if loss.item() == 0:
             print("警告: 合計損失が0になっています。これは勾配計算で問題が発生する可能性があります。")
@@ -976,13 +976,13 @@ class LisaModel(nn.Module):
                 "seg_token_counts": seg_token_counts,
             }
         else:
-            return {
-                "loss": loss,
-                "ce_loss": ce_loss,
-                "mask_bce_loss": mask_bce_loss,
-                "mask_dice_loss": mask_dice_loss,
-                "mask_loss": mask_loss,
-            }
+        return {
+            "loss": loss,
+            "ce_loss": ce_loss,
+            "mask_bce_loss": mask_bce_loss,
+            "mask_dice_loss": mask_dice_loss,
+            "mask_loss": mask_loss,
+        }
 
     def get_visual_embs(self, images):
         """
@@ -1001,12 +1001,12 @@ class LisaModel(nn.Module):
             raise ValueError("visual_modelが初期化されていません")
             
         # 画像をデバイスに移動
-        device = next(self.model.parameters()).device
+        device = next(self.parameters()).device
         if images.device != device:
             images = images.to(device)
             
         try:
-            with torch.no_grad():
+        with torch.no_grad():
                 # SAMイメージエンコーダを呼び出し
                 image_embeddings = self.visual_model.image_encoder(images)
                 
@@ -1059,19 +1059,18 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
                 bnb_4bit_quant_type="nf4"
             )
         
+        # 内部変数を初期化（無限再帰を防ぐため）
+        self._base_model_reference = None
+        
         # 親クラスを初期化 - SAM関連のパラメータは除外済み
         super(LISAForCausalLM, self).__init__(config)
-        
-        # オリジナルのLISAコードとの互換性のために、base_modelを設定
-        # train_ds.pyがmodel.modelにアクセスするため必要
-        self.base_model = None  # 後でプロパティを通じてアクセスできるようにする
         
         # 事前学習済みモデルをロード
         try:
             from transformers import AutoModelForVision2Seq
             print(f"base_modelを初期化: {model_id}")
-            # モデルを直接ロード
-            self.base_model = AutoModelForVision2Seq.from_pretrained(
+            # モデルを直接ロード - 参照を保存
+            self._base_model_reference = AutoModelForVision2Seq.from_pretrained(
                 model_id, 
                 config=config,
                 device_map=device_map,
@@ -1081,8 +1080,6 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
             )
             print("base_modelの初期化完了")
             
-            # 重みはコピーせず、base_modelを直接参照して使用する
-            # これによりstate_dictによる無限再帰を回避
         except Exception as e:
             print(f"ベースモデルのロード中にエラーが発生しました: {e}")
             import traceback
@@ -1133,15 +1130,18 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
                 raise
     
     @property
+    def base_model(self):
+        """base_modelを取得するプロパティ"""
+        return self._base_model_reference
+    
+    @property
     def model(self):
         """
         train_ds.pyとの互換性のためのプロパティ。
-        model.modelにアクセスするときにベースモデルを返します。
+        model.modelにアクセスするときにモデルプロキシを返します。
         """
         # オリジナルのLISAでは、model.modelがLisaModelインスタンスを参照していた
         # ここでは、base_modelを通じて事前学習済みの言語モデルにアクセスできるようにする
-        # ただし、base_model自体が持っているメソッドと属性だけではなく、
-        # selfが持っているメソッドや属性もアクセスできるようにする必要がある
         
         class ModelProxy:
             """
@@ -1150,9 +1150,19 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
             def __init__(self, lisa_model, base_model):
                 self.lisa_model = lisa_model  # LISAForCausalLMインスタンス
                 self.base_model = base_model  # AutoModelForVision2Seqインスタンス
+                # ModelProxyの内部辞書（_dict属性）を基本のProxyと同じに保つ
+                if hasattr(base_model, 'model'):
+                    self.model = base_model.model
+                else:
+                    # base_modelが.modelを持たない場合
+                    self.model = self  # 循環参照を作らないように注意
                 
             def __getattr__(self, name):
-                # 最初にbase_modelで属性を探す
+                # 最初にself.modelが自分自身でない場合に、その属性を探す
+                if hasattr(self, 'model') and self.model is not self and hasattr(self.model, name):
+                    return getattr(self.model, name)
+                
+                # 次にbase_modelで属性を探す
                 if self.base_model is not None and hasattr(self.base_model, name):
                     return getattr(self.base_model, name)
                 
@@ -1162,6 +1172,22 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
                     
                 # どちらにもなければAttributeError
                 raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+            
+            # 特に重要な属性へのアクセス方法を明示的に定義
+            @property
+            def embed_tokens(self):
+                """embed_tokens属性へのアクセス - train_ds.pyで使用"""
+                # base_model.modelにembed_tokensがある場合
+                if self.base_model is not None and hasattr(self.base_model, 'model') and hasattr(self.base_model.model, 'embed_tokens'):
+                    return self.base_model.model.embed_tokens
+                # base_modelに直接embed_tokensがある場合
+                elif self.base_model is not None and hasattr(self.base_model, 'embed_tokens'):
+                    return self.base_model.embed_tokens
+                # lisa_modelにembed_tokensがある場合
+                elif hasattr(self.lisa_model, 'embed_tokens'):
+                    return self.lisa_model.embed_tokens
+                # 見つからない場合は例外
+                raise AttributeError(f"'embed_tokens' attribute not found in model structure")
                 
             def to(self, device):
                 # toメソッドの特別な処理（train_ds.pyで使用）
@@ -1175,8 +1201,42 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
                 if self.base_model is not None and hasattr(self.base_model, "config"):
                     return self.base_model.config
                 return self.lisa_model.config
+                
+            def state_dict(self, *args, **kwargs):
+                """
+                モデルの状態辞書を取得します
+                ModelProxyを通じて安全に呼び出せるよう、_state_dictを使用
+                """
+                # 1. 現在のインスタンスのstate_dictメソッドを退避（無限再帰を防ぐ）
+                original_state_dict = getattr(self.__class__, 'state_dict', None)
+                setattr(self.__class__, 'state_dict', None)
+                
+                try:
+                    # 2. base_modelのstate_dictを取得
+                    if self.base_model is not None:
+                        return self.base_model.state_dict(*args, **kwargs)
+                    # 3. fallback: lisa_modelのstate_dictを返す
+                    if hasattr(self.lisa_model, '_state_dict'):
+                        return self.lisa_model._state_dict(*args, **kwargs)
+                    return {}  # 空の辞書を返すことで最低限の機能を提供
+                finally:
+                    # 4. 元のstate_dictメソッドを復元
+                    if original_state_dict is not None:
+                        setattr(self.__class__, 'state_dict', original_state_dict)
+            
+            def tie_weights(self):
+                """tie_weightsメソッドの特別な処理 - train_ds.pyで使用"""
+                if self.base_model is not None and hasattr(self.base_model, 'tie_weights'):
+                    return self.base_model.tie_weights()
+                return None
+                
+            def gradient_checkpointing_enable(self):
+                """gradient_checkpointing_enableメソッドの特別な処理 - train_ds.pyで使用"""
+                if self.base_model is not None and hasattr(self.base_model, 'gradient_checkpointing_enable'):
+                    return self.base_model.gradient_checkpointing_enable()
+                return None
         
-        return ModelProxy(self, self.base_model)
+        return ModelProxy(self, self._base_model_reference)
     
     def resize_token_embeddings(self, new_num_tokens):
         """
@@ -1249,7 +1309,61 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
         # 親クラスのtie_weightsメソッドを呼び出す
         super().tie_weights()
         print("親クラスのtie_weightsメソッドを呼び出しました")
+        
+    def _state_dict(self, *args, **kwargs):
+        """
+        モデルの状態辞書を取得します（無限再帰を防ぐための内部メソッド）
+        ModelProxyのstate_dictメソッドから呼び出されます
+        """
+        # 親クラスの実装を避け、通常のnn.Moduleとして処理
+        result = {}
+        
+        # モジュールと名前付きパラメータをstate_dictに追加
+        for name, module in self.named_modules():
+            if name == '':  # 自身は除外
+                continue
+            # ネストしたモジュールは、ドットで区切られた名前で処理
+            if '.' not in name and hasattr(module, 'state_dict'):
+                try:
+                    local_state = module.state_dict(*args, **kwargs)
+                    for key, param in local_state.items():
+                        result[name + '.' + key] = param
+                except Exception as e:
+                    print(f"モジュール {name} のstate_dict取得中にエラー: {e}")
+        
+        # 直接のパラメータを追加（サブモジュールに属さないもの）
+        for name, param in self.named_parameters(recurse=False):
+            result[name] = param.data.clone()
             
+        # バッファの追加
+        for name, buf in self.named_buffers(recurse=False):
+            result[name] = buf.clone()
+            
+        return result
+        
+    def state_dict(self, *args, **kwargs):
+        """
+        無限再帰を回避するためのstate_dictの実装
+        """
+        # 元のメソッドを保存
+        original_state_dict = super(LISAForCausalLM, self).state_dict
+        
+        try:
+            # 対応するモジュールのstate_dictを使用
+            if hasattr(self, '_state_dict'):
+                return self._state_dict(*args, **kwargs)
+            
+            # base_modelが存在する場合はその状態を使用
+            if hasattr(self, '_base_model_reference') and self._base_model_reference is not None:
+                return self._base_model_reference.state_dict(*args, **kwargs)
+                
+            # フォールバック: 親クラスのstate_dictを試す
+            return original_state_dict(*args, **kwargs)
+        except RecursionError:
+            # 再帰エラーが発生した場合は、最小限の状態辞書を返す
+            print("警告: state_dict取得中に再帰エラーが発生しました。最小限の状態を返します。")
+            return {}  # 空の辞書を返す
+
     def prepare_inputs_for_generation(
         self,
         input_ids,
@@ -1279,7 +1393,7 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
                 processor = self.get_processor()
                 if processor is not None:
                     # テンソル型かどうかで処理を分岐
-                    if isinstance(images, torch.Tensor):
+            if isinstance(images, torch.Tensor):
                         # PILイメージに変換
                         import numpy as np
                         from PIL import Image
