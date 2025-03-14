@@ -1062,6 +1062,10 @@ class LISAForCausalLM(MllamaForConditionalGeneration, GenerationMixin):
         # 親クラスを初期化 - SAM関連のパラメータは除外済み
         super(LISAForCausalLM, self).__init__(config)
         
+        # オリジナルLISAコードとの互換性のため、self.modelをselfへの参照として設定
+        # train_ds.pyなどで参照するmodel.modelのためのハック
+        self.model = self
+        
         # 事前学習済みモデルをロード
         pretrained_model = AutoModelForVision2Seq.from_pretrained(
             model_id, 
