@@ -43,8 +43,14 @@ def parse_args(args):
     parser.add_argument(
         "--vision-tower", default="meta-llama/Llama-3.2-11B-Vision-Instruct", type=str
     )
-    parser.add_argument("--load_in_8bit", action="store_true", default=False)
-    parser.add_argument("--load_in_4bit", action="store_true", default=False)
+    parser.add_argument("--load_in_8bit", action="store_true", default=False,
+                      help="Enable int8 quantization to reduce GPU memory usage")
+    parser.add_argument("--load_in_4bit", action="store_true", default=False,
+                      help="Enable int4 quantization to further reduce GPU memory usage")
+    parser.add_argument("--cpu_offload", action="store_true", default=False,
+                      help="Enable CPU offloading for ZeRO-3")
+    parser.add_argument("--zero_stage", type=int, default=3, choices=[1, 2, 3],
+                      help="ZeRO optimization stage (1, 2, or 3)")
 
     parser.add_argument(
         "--dataset", default="sem_seg||reason_seg", type=str,
@@ -202,7 +208,9 @@ def main(args):
         vision_pretrained=args.vision_pretrained,
         vision_tower=args.vision_tower,
         use_mm_start_end=args.use_mm_start_end,
-        # DeepSpeed環境ではdevice_mapは使用しない
+        # メモリ効率化オプション
+        load_in_8bit=args.load_in_8bit,  # 8bit量子化を有効化
+        # GPU OOM 回避のため、device_mapを初期化時にはNoneに設定
         device_map=None
     )
 
@@ -431,12 +439,26 @@ def main(args):
         },
         "gradient_clipping": 1.0,
         "zero_optimization": {
-            "stage": 2,  # ステージを2に下げて複雑さを軽減
+            "stage": args.zero_stage,
             "contiguous_gradients": True,
             "overlap_comm": True,
             "reduce_scatter": True,
             "reduce_bucket_size": 5e8,
-            "allgather_bucket_size": 5e8
+            "allgather_bucket_size": 5e8,
+            # CPU/GPUメモリの有効活用のためのオフロード設定
+            "offload_optimizer": {
+                "device": "cpu",
+                "pin_memory": True
+            },
+            "offload_param": {
+                "device": "cpu",
+                "pin_memory": True
+            },
+            # ZeRO-3固有の設定
+            "stage3_prefetch_bucket_size": 5e8,
+            "stage3_param_persistence_threshold": 1e6,
+            "stage3_max_live_parameters": 1e9,
+            "stage3_max_reuse_distance": 1e9
         },
         # JITコンパイル無効化
         "jit": {
@@ -452,6 +474,38 @@ def main(args):
             "debug": False
         }
     }
+    
+    # ZeROステージに基づいて設定を調整
+    ds_config["zero_optimization"]["stage"] = args.zero_stage
+    
+    # ZeRO-3固有の設定
+    if args.zero_stage == 3:
+        # ステージ3特有の設定を追加
+        ds_config["zero_optimization"]["stage3_prefetch_bucket_size"] = 5e8
+        ds_config["zero_optimization"]["stage3_param_persistence_threshold"] = 1e6
+        ds_config["zero_optimization"]["stage3_max_live_parameters"] = 1e9
+        ds_config["zero_optimization"]["stage3_max_reuse_distance"] = 1e9
+        
+        # CPU offloadはZeRO-3の場合のみ設定
+        if args.cpu_offload:
+            ds_config["zero_optimization"]["offload_optimizer"] = {
+                "device": "cpu",
+                "pin_memory": True
+            }
+            ds_config["zero_optimization"]["offload_param"] = {
+                "device": "cpu",
+                "pin_memory": True
+            }
+            print("CPU offloadを有効化しました - オプティマイザとパラメータをCPUメモリにオフロード")
+    else:
+        # ZeRO-1, ZeRO-2では不要な設定を削除
+        for key in ["stage3_prefetch_bucket_size", "stage3_param_persistence_threshold", 
+                    "stage3_max_live_parameters", "stage3_max_reuse_distance",
+                    "offload_optimizer", "offload_param"]:
+            if key in ds_config["zero_optimization"]:
+                del ds_config["zero_optimization"][key]
+        
+        print(f"ZeRO-{args.zero_stage}を有効化しました - CPUオフロードは無効")
     
     # DeepSpeedの初期化前に注意事項を表示
     print("DeepSpeedの初期化を開始します（meta tensorがある場合にエラーが発生する可能性があります）")
@@ -473,7 +527,97 @@ def main(args):
             config=ds_config,
         )
     except RuntimeError as e:
-        if "NCCL error" in str(e):
+        if "CUDA out of memory" in str(e):
+            print("\n" + "="*80)
+            print("CUDAメモリ不足エラーが発生しました。ZeRO-3のオフロード設定を最適化します。")
+            print("エラー詳細:", str(e))
+            print("="*80 + "\n")
+            
+            # より積極的なメモリオフロード設定
+            ds_config["zero_optimization"]["stage3_max_live_parameters"] = 1e8
+            ds_config["zero_optimization"]["stage3_max_reuse_distance"] = 1e8
+            ds_config["zero_optimization"]["stage3_prefetch_bucket_size"] = 1e7
+            ds_config["zero_optimization"]["stage3_param_persistence_threshold"] = 1e4
+            
+            # メモリ消費を抑えるためのバッチサイズ調整
+            ds_config["train_micro_batch_size_per_gpu"] = 1
+            
+            # オフロード設定の最適化
+            if "offload_optimizer" in ds_config["zero_optimization"]:
+                ds_config["zero_optimization"]["offload_optimizer"]["buffer_size"] = 1e8
+            if "offload_param" in ds_config["zero_optimization"]:
+                ds_config["zero_optimization"]["offload_param"]["buffer_size"] = 1e8
+                
+            print("修正したDeepSpeed設定:", json.dumps(ds_config, indent=2))
+            
+            # モデルをさらに圧縮
+            if not args.load_in_8bit:
+                print("8-bit量子化を有効にします")
+                from transformers import BitsAndBytesConfig
+                
+                # 既存のモデルを削除してメモリを解放
+                import gc
+                del model
+                gc.collect()
+                torch.cuda.empty_cache()
+                
+                # 8-bit量子化を使用して再初期化
+                model = LISAForCausalLM(
+                    model_id=args.version,
+                    torch_dtype=torch_dtype,
+                    low_cpu_mem_usage=True,
+                    train_mask_decoder=args.train_mask_decoder,
+                    out_dim=args.out_dim,
+                    ce_loss_weight=args.ce_loss_weight,
+                    dice_loss_weight=args.dice_loss_weight,
+                    bce_loss_weight=args.bce_loss_weight,
+                    seg_token_idx=args.seg_token_idx,
+                    vision_pretrained=args.vision_pretrained,
+                    vision_tower=args.vision_tower,
+                    use_mm_start_end=args.use_mm_start_end,
+                    load_in_8bit=True,
+                    device_map=None
+                )
+                
+                # 学習対象のパラメータを再設定
+                for n, p in model.named_parameters():
+                    if any([x in n for x in ["mask_decoder", "text_hidden_fcs"]]):
+                        print("n: ", n, "p.shape: ", p.shape)
+                        p.requires_grad = True
+                
+                # 埋め込みの調整
+                model.resize_token_embeddings(len(tokenizer))
+                if hasattr(model, "tie_weights"):
+                    model.tie_weights()
+                if hasattr(model.model, "tie_weights"):
+                    model.model.tie_weights()
+            
+            # 再試行
+            try:
+                model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
+                    model=model,
+                    model_parameters=model.parameters(),
+                    training_data=train_dataset,
+                    collate_fn=partial(
+                        collate_fn,
+                        tokenizer=tokenizer,
+                        conv_type=args.conv_type,
+                        use_mm_start_end=args.use_mm_start_end,
+                        local_rank=args.local_rank,
+                        processor=processor,
+                    ),
+                    config=ds_config,
+                )
+            except RuntimeError as e2:
+                if "CUDA out of memory" in str(e2):
+                    print("\n" + "="*80)
+                    print("依然としてCUDAメモリ不足エラーが発生しています。より小さいモデルを使用するか、ハードウェアをアップグレードしてください。")
+                    print("最終エラー詳細:", str(e2))
+                    print("="*80 + "\n")
+                    raise
+                else:
+                    raise
+        elif "NCCL error" in str(e):
             print("\n" + "="*80)
             print("NCCLエラーが発生しました。単一GPUモードにフォールバックします。")
             print("エラー詳細:", str(e))
@@ -482,17 +626,6 @@ def main(args):
             # 単一GPUモードの設定
             os.environ["CUDA_VISIBLE_DEVICES"] = str(args.local_rank)
             print(f"単一GPUモード: CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
-            
-            # Zero-3をZero-2に変更
-            ds_config["zero_optimization"]["stage"] = 2
-            if "offload_optimizer" in ds_config["zero_optimization"]:
-                del ds_config["zero_optimization"]["offload_optimizer"]
-            if "offload_param" in ds_config["zero_optimization"]:
-                del ds_config["zero_optimization"]["offload_param"]
-            if "stage3_prefetch_bucket_size" in ds_config["zero_optimization"]:
-                del ds_config["zero_optimization"]["stage3_prefetch_bucket_size"]
-            if "stage3_param_persistence_threshold" in ds_config["zero_optimization"]:
-                del ds_config["zero_optimization"]["stage3_param_persistence_threshold"]
             
             # 再試行
             model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
@@ -518,8 +651,7 @@ def main(args):
             # DeepSpeedのCUDA拡張コンパイルをスキップするための追加設定
             os.environ["DS_BUILD_OPS"] = "0"  # すべてのカスタム操作のビルドを無効化
             
-            # Zero-2の標準PyTorch最適化器を使用する設定
-            ds_config["zero_optimization"]["stage"] = 1  # ステージを1に下げる
+            # Zero-3の標準PyTorch最適化器を使用する設定
             ds_config["optimizer"]["type"] = "torch.optim.AdamW"  # 標準PyTorch最適化器を使用
             
             # planner無効化（速度は落ちるがCUDA拡張に依存しない）
